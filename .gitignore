@@ -6,3 +6,4 @@ venv/
 limpi.sqlite3
 limpi.sqlite3-*
 .pytest_cache/
+/old

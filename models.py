@@ -26,3 +26,13 @@ class GuildSettings:
     last_seen_post_id: str | None
     language: str
     max_posts_per_poll: int
+    auto_cleanup_enabled: bool
+    auto_cleanup_days: int
+
+
+@dataclass(frozen=True)
+class TrackedMessage:
+    guild_id: int
+    channel_id: int
+    message_id: int
+    sent_at: datetime
