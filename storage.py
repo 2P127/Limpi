@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from models import GuildSettings, NewsPost
+from models import GuildSettings, NewsPost, TrackedMessage
+
+
+DEFAULT_AUTO_CLEANUP_ENABLED = True
+DEFAULT_AUTO_CLEANUP_DAYS = 1
+MIN_CLEANUP_DAYS = 1
+MAX_CLEANUP_DAYS = 7
 
 
 class SQLiteStorage:
@@ -35,7 +41,9 @@ class SQLiteStorage:
                     enabled INTEGER NOT NULL DEFAULT 1,
                     last_seen_post_id TEXT,
                     language TEXT NOT NULL DEFAULT 'koreana',
-                    max_posts_per_poll INTEGER NOT NULL DEFAULT 10,
+                    max_posts_per_poll INTEGER NOT NULL DEFAULT 30,
+                    auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
+                    auto_cleanup_days INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -68,11 +76,32 @@ class SQLiteStorage:
                 )
                 """
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tracked_messages (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id, message_id)
+                )
+                """
+            )
             self._ensure_column("guild_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column(
                 "guild_settings",
                 "max_posts_per_poll",
-                "INTEGER NOT NULL DEFAULT 10",
+                "INTEGER NOT NULL DEFAULT 30",
+            )
+            self._ensure_column(
+                "guild_settings",
+                "auto_cleanup_enabled",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            self._ensure_column(
+                "guild_settings",
+                "auto_cleanup_days",
+                "INTEGER NOT NULL DEFAULT 1",
             )
             self._ensure_column("posts", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._connection.execute(
@@ -91,6 +120,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_seen_posts_post_id
                 ON guild_seen_posts(post_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tracked_messages_sent_at
+                ON tracked_messages(sent_at)
                 """
             )
             self._migrate_legacy_post_ids()
@@ -207,7 +242,9 @@ class SQLiteStorage:
                 enabled=True,
                 last_seen_post_id=None,
                 language="koreana",
-                max_posts_per_poll=10,
+                max_posts_per_poll=30,
+                auto_cleanup_enabled=DEFAULT_AUTO_CLEANUP_ENABLED,
+                auto_cleanup_days=DEFAULT_AUTO_CLEANUP_DAYS,
             )
 
         return self._row_to_settings(row)
@@ -230,6 +267,8 @@ class SQLiteStorage:
         enabled: bool | None = None,
         language: str | None = None,
         max_posts_per_poll: int | None = None,
+        auto_cleanup_enabled: bool | None = None,
+        auto_cleanup_days: int | None = None,
     ) -> GuildSettings:
         current = self.get_settings(guild_id)
         now = _now_iso()
@@ -246,6 +285,16 @@ class SQLiteStorage:
                 if max_posts_per_poll is not None
                 else current.max_posts_per_poll
             ),
+            auto_cleanup_enabled=(
+                auto_cleanup_enabled
+                if auto_cleanup_enabled is not None
+                else current.auto_cleanup_enabled
+            ),
+            auto_cleanup_days=(
+                auto_cleanup_days
+                if auto_cleanup_days is not None
+                else current.auto_cleanup_days
+            ),
         )
 
         with self._lock:
@@ -253,10 +302,10 @@ class SQLiteStorage:
                 """
                 INSERT INTO guild_settings (
                     guild_id, channel_id, role_id, post_format, enabled, language,
-                    max_posts_per_poll,
+                    max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
                     last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     role_id = excluded.role_id,
@@ -264,6 +313,8 @@ class SQLiteStorage:
                     enabled = excluded.enabled,
                     language = excluded.language,
                     max_posts_per_poll = excluded.max_posts_per_poll,
+                    auto_cleanup_enabled = excluded.auto_cleanup_enabled,
+                    auto_cleanup_days = excluded.auto_cleanup_days,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -274,6 +325,8 @@ class SQLiteStorage:
                     int(next_settings.enabled),
                     next_settings.language,
                     next_settings.max_posts_per_poll,
+                    int(next_settings.auto_cleanup_enabled),
+                    next_settings.auto_cleanup_days,
                     next_settings.last_seen_post_id,
                     now,
                     now,
@@ -290,10 +343,10 @@ class SQLiteStorage:
                 """
                 INSERT INTO guild_settings (
                     guild_id, channel_id, role_id, post_format, enabled, language,
-                    max_posts_per_poll,
+                    max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
                     last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, NULL, NULL, 'rich', 1, 'koreana', 10, NULL, ?, ?)
+                VALUES (?, NULL, NULL, 'rich', 1, 'koreana', 30, 1, 1, NULL, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     role_id = NULL,
                     updated_at = excluded.updated_at
@@ -311,10 +364,10 @@ class SQLiteStorage:
                 """
                 INSERT INTO guild_settings (
                     guild_id, channel_id, role_id, post_format, enabled, language,
-                    max_posts_per_poll,
+                    max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
                     last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, NULL, NULL, 'rich', 1, 'koreana', 10, ?, ?, ?)
+                VALUES (?, NULL, NULL, 'rich', 1, 'koreana', 30, 1, 1, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     last_seen_post_id = excluded.last_seen_post_id,
                     updated_at = excluded.updated_at
@@ -457,6 +510,25 @@ class SQLiteStorage:
 
         return self._row_to_post(row) if row else None
 
+    def get_latest_post(self, language: str | None = None) -> NewsPost | None:
+        params: tuple[object, ...]
+        if language:
+            sql = """
+                SELECT * FROM posts
+                WHERE language = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """
+            params = (language,)
+        else:
+            sql = "SELECT * FROM posts ORDER BY created_at DESC LIMIT 1"
+            params = ()
+
+        with self._lock:
+            row = self._connection.execute(sql, params).fetchone()
+
+        return self._row_to_post(row) if row else None
+
     def search_posts(
         self, query: str, limit: int = 25, language: str | None = None
     ) -> list[NewsPost]:
@@ -487,8 +559,54 @@ class SQLiteStorage:
         posts = [self._row_to_post(row) for row in rows]
         return _dedupe_posts_for_choices(posts, limit)
 
+    def add_tracked_message(
+        self, guild_id: int, channel_id: int, message_id: int
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO tracked_messages (guild_id, channel_id, message_id, sent_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, channel_id, message_id) DO UPDATE SET
+                    sent_at = excluded.sent_at
+                """,
+                (guild_id, channel_id, message_id, now),
+            )
+            self._connection.commit()
+
+    def list_tracked_messages(self) -> list[TrackedMessage]:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT guild_id, channel_id, message_id, sent_at FROM tracked_messages"
+            ).fetchall()
+        return [
+            TrackedMessage(
+                guild_id=int(row["guild_id"]),
+                channel_id=int(row["channel_id"]),
+                message_id=int(row["message_id"]),
+                sent_at=_datetime_from_iso(row["sent_at"]) or datetime.now(timezone.utc),
+            )
+            for row in rows
+        ]
+
+    def delete_tracked_message(
+        self, guild_id: int, channel_id: int, message_id: int
+    ) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                DELETE FROM tracked_messages
+                WHERE guild_id = ? AND channel_id = ? AND message_id = ?
+                """,
+                (guild_id, channel_id, message_id),
+            )
+            self._connection.commit()
+
     @staticmethod
     def _row_to_settings(row: sqlite3.Row) -> GuildSettings:
+        cleanup_days = int(row["auto_cleanup_days"] or DEFAULT_AUTO_CLEANUP_DAYS)
+        cleanup_days = max(MIN_CLEANUP_DAYS, min(MAX_CLEANUP_DAYS, cleanup_days))
         return GuildSettings(
             guild_id=int(row["guild_id"]),
             channel_id=_optional_int(row["channel_id"]),
@@ -497,7 +615,9 @@ class SQLiteStorage:
             enabled=bool(row["enabled"]),
             last_seen_post_id=row["last_seen_post_id"],
             language=str(row["language"] or "koreana"),
-            max_posts_per_poll=int(row["max_posts_per_poll"] or 10),
+            max_posts_per_poll=int(row["max_posts_per_poll"] or 30),
+            auto_cleanup_enabled=bool(row["auto_cleanup_enabled"]),
+            auto_cleanup_days=cleanup_days,
         )
 
     @staticmethod
