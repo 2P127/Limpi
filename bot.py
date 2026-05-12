@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import re
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -11,13 +14,20 @@ from discord.ext import commands, tasks
 
 from config import AppConfig
 from models import GuildSettings, NewsPost
-from storage import SQLiteStorage
+from storage import MAX_CLEANUP_DAYS, MIN_CLEANUP_DAYS, SQLiteStorage
 from steam_client import NewsSource, build_news_source
 
 
 POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
+NEWS_POST_LIMIT = 30
+ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
+BLOCKED_IMAGE_FRAGMENTS = (
+    "1dc5775f3444c32d11acb9d57c03232157739877",
+    "youtube_16x9_placeholder.gif",
+)
+EMBED_IMAGES_PER_MESSAGE = 10
 LANGUAGE_CHOICES = [
     app_commands.Choice(name="한국어", value="koreana"),
     app_commands.Choice(name="English", value="english"),
@@ -41,6 +51,7 @@ class LimpiBot(commands.Bot):
         self._cleared_connected_guild_commands = False
 
     async def setup_hook(self) -> None:
+        self.add_dynamic_items(ZipDownloadButton)
         if self.config.command_sync_mode == "global":
             synced = await self.tree.sync()
             LOGGER.info(
@@ -144,6 +155,35 @@ class LimpiBot(commands.Bot):
         self._synced_connected_guilds = True
 
 
+class ZipDownloadButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"limpi:zip:(?P<post_id>.+)",
+):
+    def __init__(self, post_id: str) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="이미지 ZIP 다운로드",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"{ZIP_CUSTOM_ID_PREFIX}{post_id}",
+                emoji="🗂️",
+            )
+        )
+        self.post_id = post_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):  # type: ignore[override]
+        return cls(match["post_id"])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog = interaction.client.get_cog("NewsCog")
+        if not isinstance(cog, NewsCog):
+            await interaction.response.send_message(
+                "지금은 다운로드를 처리할 수 없어요.", ephemeral=True
+            )
+            return
+        await cog.handle_zip_request(interaction, self.post_id)
+
+
 class NewsCog(commands.Cog):
     def __init__(
         self,
@@ -151,13 +191,16 @@ class NewsCog(commands.Cog):
         config: AppConfig,
         storage: SQLiteStorage,
         news_source: NewsSource | None,
+        session: aiohttp.ClientSession,
     ) -> None:
         self.bot = bot
         self.config = config
         self.storage = storage
         self.news_source = news_source
+        self.session = session
         self._poll_lock = asyncio.Lock()
         self._last_poll_at: datetime | None = None
+        self._startup_synced = False
 
     async def cog_load(self) -> None:
         if self.news_source is None:
@@ -165,9 +208,11 @@ class NewsCog(commands.Cog):
             return
 
         self.poll_news.start()
+        self.cleanup_messages.start()
 
     async def cog_unload(self) -> None:
         self.poll_news.cancel()
+        self.cleanup_messages.cancel()
 
     @tasks.loop(seconds=60)
     async def poll_news(self) -> None:
@@ -178,6 +223,7 @@ class NewsCog(commands.Cog):
                     return
                 self._last_poll_at = now
                 await self._poll_once()
+                self._startup_synced = True
             except Exception:
                 LOGGER.exception("News polling failed.")
 
@@ -185,14 +231,66 @@ class NewsCog(commands.Cog):
     async def before_poll_news(self) -> None:
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=15)
+    async def cleanup_messages(self) -> None:
+        try:
+            await self._cleanup_expired_messages()
+        except Exception:
+            LOGGER.exception("Tracked message cleanup failed.")
+
+    @cleanup_messages.before_loop
+    async def before_cleanup_messages(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def _cleanup_expired_messages(self) -> None:
+        now = datetime.now(timezone.utc)
+        tracked = self.storage.list_tracked_messages()
+        for entry in tracked:
+            settings = self.storage.get_settings(entry.guild_id)
+            if not settings.auto_cleanup_enabled:
+                self.storage.delete_tracked_message(
+                    entry.guild_id, entry.channel_id, entry.message_id
+                )
+                continue
+
+            sent_at = entry.sent_at
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            age = now - sent_at
+            if age < timedelta(days=settings.auto_cleanup_days):
+                continue
+
+            await self._delete_tracked_message(entry.guild_id, entry.channel_id, entry.message_id)
+
+    async def _delete_tracked_message(
+        self, guild_id: int, channel_id: int, message_id: int
+    ) -> None:
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden):
+                channel = None
+
+        if isinstance(channel, discord.abc.Messageable):
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.delete()
+            except (discord.NotFound, discord.Forbidden):
+                pass
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "Failed to delete tracked message %s in channel %s.", message_id, channel_id
+                )
+
+        self.storage.delete_tracked_message(guild_id, channel_id, message_id)
+
     async def _poll_once(self) -> int:
         if self.news_source is None:
             return 0
 
+        posts_by_language = await self._sync_global_news_cache()
         settings_by_language = self._settings_by_language()
-        posts_by_language = await self._sync_global_news_cache(
-            self._fetch_limits_by_language(settings_by_language)
-        )
 
         announced_count = 0
         for language, settings_list in settings_by_language.items():
@@ -201,7 +299,7 @@ class NewsCog(commands.Cog):
                 continue
 
             for settings in settings_list:
-                guild_posts = posts[: settings.max_posts_per_poll]
+                guild_posts = posts[:NEWS_POST_LIMIT]
                 if not guild_posts:
                     continue
                 newest_post_id = guild_posts[0].post_id
@@ -213,40 +311,20 @@ class NewsCog(commands.Cog):
 
         return announced_count
 
-    async def _sync_global_news_cache(
-        self, fetch_limits_by_language: dict[str, int]
-    ) -> dict[str, list[NewsPost]]:
+    async def _sync_global_news_cache(self) -> dict[str, list[NewsPost]]:
         if self.news_source is None:
             return {}
 
         posts_by_language: dict[str, list[NewsPost]] = {}
         all_posts: list[NewsPost] = []
-        for language, fetch_limit in fetch_limits_by_language.items():
-            posts = await self.news_source.fetch_recent_posts(language, limit=fetch_limit)
-            posts_by_language[language] = posts
-            all_posts.extend(posts)
+        for language in SYNC_LANGUAGES:
+            posts = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
+            posts_by_language[language] = posts[:NEWS_POST_LIMIT]
+            all_posts.extend(posts_by_language[language])
 
         if all_posts:
             self.storage.save_posts(all_posts)
         return posts_by_language
-
-    def _fetch_limits_by_language(
-        self, settings_by_language: dict[str, list[GuildSettings]]
-    ) -> dict[str, int]:
-        fetch_limits = {
-            language: self.config.max_posts_per_poll
-            for language in SYNC_LANGUAGES
-        }
-        for language, settings_list in settings_by_language.items():
-            settings_limit = max(
-                (settings.max_posts_per_poll for settings in settings_list),
-                default=self.config.max_posts_per_poll,
-            )
-            fetch_limits[language] = max(
-                fetch_limits.get(language, self.config.max_posts_per_poll),
-                settings_limit,
-            )
-        return fetch_limits
 
     def _settings_by_language(self) -> dict[str, list[GuildSettings]]:
         settings_by_language: dict[str, list[GuildSettings]] = {}
@@ -382,23 +460,145 @@ class NewsCog(commands.Cog):
         settings: GuildSettings,
         post: NewsPost,
     ) -> None:
-        mention = f"<@&{settings.role_id}>" if settings.role_id else None
+        await self._broadcast_post(channel, post, settings.role_id)
+
+    async def _broadcast_post(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+        role_id: int | None,
+    ) -> None:
+        mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
-            everyone=False, users=False, roles=bool(settings.role_id)
+            everyone=False, users=False, roles=bool(role_id)
         )
 
-        embeds = _embeds_for_post(post)
+        groups = _embed_groups_for_post(post)
+        view = _build_view_for_post(post)
+        first, *rest = groups if groups else ([],)
         await channel.send(
             content=mention,
-            embeds=embeds,
+            embeds=first,
             allowed_mentions=allowed_mentions,
+            view=view if view is not None else discord.utils.MISSING,
         )
+        for extra in rest:
+            await channel.send(
+                embeds=extra,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         youtube_content = _youtube_links_content(post)
         if youtube_content:
             await channel.send(
                 content=youtube_content,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+
+    async def _resolve_target_channel(
+        self,
+        explicit: discord.abc.Messageable | None,
+        fallback_channel_id: int | None,
+    ) -> discord.abc.Messageable | None:
+        if explicit is not None:
+            return explicit
+        if not fallback_channel_id:
+            return None
+        cached = self.bot.get_channel(fallback_channel_id)
+        if cached is None:
+            try:
+                cached = await self.bot.fetch_channel(fallback_channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                return None
+        return cached if isinstance(cached, discord.abc.Messageable) else None
+
+    async def handle_zip_request(
+        self, interaction: discord.Interaction, post_id: str
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        post = self.storage.get_post(post_id)
+        if post is None or not _filter_image_urls(post.image_urls):
+            await interaction.followup.send(
+                "이 게시물에는 이미지가 없어요.", ephemeral=True
+            )
+            return
+
+        try:
+            buffer, count = await self._build_image_zip(post)
+        except Exception:
+            LOGGER.exception("Failed to build image ZIP for post %s.", post_id)
+            await interaction.followup.send(
+                "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        if buffer is None or count == 0:
+            await interaction.followup.send(
+                "이미지를 다운로드하지 못했어요.", ephemeral=True
+            )
+            return
+
+        filename = _safe_zip_filename(post)
+        file = discord.File(buffer, filename=filename)
+        await interaction.followup.send(
+            f"이미지 {count}장을 압축했어요.",
+            file=file,
+            ephemeral=True,
+        )
+
+    async def _build_image_zip(self, post: NewsPost) -> tuple[io.BytesIO | None, int]:
+        buffer = io.BytesIO()
+        count = 0
+        used_names: set[str] = set()
+        urls = _filter_image_urls(post.image_urls)
+        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as archive:
+            for index, url in enumerate(urls):
+                data = await self._download_bytes(url)
+                if data is None:
+                    continue
+                png_bytes = _to_png_bytes(data)
+                if png_bytes is None:
+                    continue
+                name = _unique_zip_name(used_names, index, url)
+                archive.writestr(name, png_bytes)
+                count += 1
+
+        if count == 0:
+            return None, 0
+
+        buffer.seek(0)
+        return buffer, count
+
+    async def _download_bytes(self, url: str) -> bytes | None:
+        try:
+            async with self.session.get(url) as response:
+                if response.status >= 400:
+                    LOGGER.warning("Image download failed (%s): %s", response.status, url)
+                    return None
+                return await response.read()
+        except aiohttp.ClientError:
+            LOGGER.exception("Image download error: %s", url)
+            return None
+
+    async def run_startup_sync(self) -> None:
+        if self.news_source is None or self._startup_synced:
+            return
+        try:
+            await self._sync_global_news_cache()
+            self._startup_synced = True
+            LOGGER.info("Startup news sync completed (limit=%s).", NEWS_POST_LIMIT)
+        except Exception:
+            LOGGER.exception("Startup news sync failed.")
+
+    async def _track_manual_message(
+        self,
+        guild_id: int | None,
+        channel_id: int | None,
+        message: discord.Message | None,
+    ) -> None:
+        if guild_id is None or channel_id is None or message is None:
+            return
+        self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
     @app_commands.command(name="림피설정", description="림피 알림 채널, 역할, 언어를 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -408,16 +608,18 @@ class NewsCog(commands.Cog):
     @app_commands.rename(
         channel="채널",
         role="역할",
-        enabled="활성화",
+        enabled="자동알림",
         language="언어",
-        max_posts_per_poll="가져올개수",
+        auto_cleanup="자동삭제",
+        cleanup_days="자동삭제일수",
     )
     @app_commands.describe(
         channel="공지할 채널입니다. 비워두면 현재 채널을 사용합니다.",
         role="새 소식과 함께 핑할 역할입니다.",
-        enabled="알림을 켜거나 끕니다.",
+        enabled="새 게시물 자동 알림을 켜거나 끕니다.",
         language="Steam 뉴스 언어입니다.",
-        max_posts_per_poll="한 번 동기화할 최근 게시물 개수입니다. 5-100 사이로 입력합니다.",
+        auto_cleanup="조회한 소식 메시지를 일정 시간 뒤 자동으로 지울지 여부입니다.",
+        cleanup_days="자동 삭제까지의 유예 기간(일)입니다. 1~7 사이로 입력합니다.",
     )
     @app_commands.choices(
         language=LANGUAGE_CHOICES,
@@ -429,15 +631,16 @@ class NewsCog(commands.Cog):
         role: discord.Role | None = None,
         enabled: bool | None = None,
         language: app_commands.Choice[str] | None = None,
-        max_posts_per_poll: int | None = None,
+        auto_cleanup: bool | None = None,
+        cleanup_days: int | None = None,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
             return
 
-        if max_posts_per_poll is not None and not 5 <= max_posts_per_poll <= 100:
+        if cleanup_days is not None and not MIN_CLEANUP_DAYS <= cleanup_days <= MAX_CLEANUP_DAYS:
             await interaction.response.send_message(
-                "가져올 개수는 5부터 100 사이로 입력해주세요.",
+                f"자동 삭제 일수는 {MIN_CLEANUP_DAYS}부터 {MAX_CLEANUP_DAYS} 사이로 입력해주세요.",
                 ephemeral=True,
             )
             return
@@ -452,21 +655,23 @@ class NewsCog(commands.Cog):
             post_format=POST_FORMAT_RICH,
             enabled=enabled,
             language=language.value if language else None,
-            max_posts_per_poll=max_posts_per_poll,
+            auto_cleanup_enabled=auto_cleanup,
+            auto_cleanup_days=cleanup_days,
         )
         channel_text = f"<#{settings.channel_id}>" if settings.channel_id else "미설정"
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
         language_text = _language_label(settings.language)
-        max_posts_text = str(settings.max_posts_per_poll)
+        cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
         embed = discord.Embed(
             title="설정이 완료되었어요~!",
             description=(
                 f"채널: {channel_text}\n"
                 f"역할 핑: {role_text}\n"
-                f"알림: {enabled_text}\n"
+                f"새 게시물 자동 알림: {enabled_text}\n"
                 f"언어: {language_text}\n"
-                f"동기화 시 가져올 개수: {max_posts_text}"
+                f"조회 메시지 자동 삭제: {cleanup_text}\n"
+                f"자동 삭제 유예: {settings.auto_cleanup_days}일"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
         )
@@ -505,14 +710,16 @@ class NewsCog(commands.Cog):
         channel_text = f"<#{settings.channel_id}>" if settings.channel_id else "미설정"
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
+        cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
 
         await interaction.response.send_message(
             (
                 f"채널: {channel_text}\n"
                 f"역할 핑: {role_text}\n"
-                f"알림: {enabled_text}\n"
+                f"새 게시물 자동 알림: {enabled_text}\n"
                 f"언어: {_language_label(settings.language)}\n"
-                f"동기화 시 가져올 개수: {settings.max_posts_per_poll}\n"
+                f"조회 메시지 자동 삭제: {cleanup_text}\n"
+                f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
                 f"뉴스 소스: {source_status}"
             ),
             ephemeral=True,
@@ -525,7 +732,10 @@ class NewsCog(commands.Cog):
     @app_commands.rename(title="게시물")
     @app_commands.describe(title="게시물의 첫 번째 줄을 선택합니다.")
     async def previous_news(self, interaction: discord.Interaction, title: str) -> None:
-        post = self.storage.get_post_by_id_or_title(title)
+        language = self._interaction_language(interaction)
+        post = self.storage.get_post_by_id_or_title(title, language=language)
+        if post is None:
+            post = self.storage.get_post_by_id_or_title(title)
         if post is None:
             await interaction.response.send_message(
                 "아직 저장된 게시물을 찾지 못했어요. 림피가 자동 동기화한 뒤 다시 선택해 주세요.",
@@ -533,11 +743,25 @@ class NewsCog(commands.Cog):
             )
             return
 
-        await interaction.response.send_message(embeds=_embeds_for_post(post))
+        view = _build_view_for_post(post)
+        groups = _embed_groups_for_post(post)
+        first, *rest = groups if groups else ([],)
+        await interaction.response.send_message(
+            embeds=first,
+            view=view if view is not None else discord.utils.MISSING,
+            ephemeral=True,
+        )
+        for extra in rest:
+            await interaction.followup.send(
+                embeds=extra,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         youtube_content = _youtube_links_content(post)
         if youtube_content:
             await interaction.followup.send(
                 content=youtube_content,
+                ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -545,16 +769,222 @@ class NewsCog(commands.Cog):
     async def previous_news_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
+        language = self._interaction_language(interaction)
         posts = self.storage.search_posts(
             current,
             limit=25,
+            language=language,
         )
         return [
-            app_commands.Choice(name=_choice_name(post, include_language=True), value=post.post_id)
+            app_commands.Choice(name=_choice_name(post, include_language=False), value=post.post_id)
             for post in posts
         ]
 
-    @app_commands.command(name="소식동기화", description="한국어, 영어, 일본어 최근 Steam 뉴스를 저장합니다.")
+    @app_commands.command(name="최근소식보기", description="가장 최근 림버스 컴퍼니 소식을 즉시 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    async def recent_news(self, interaction: discord.Interaction) -> None:
+        language = self._interaction_language(interaction)
+        await interaction.response.defer(thinking=True)
+
+        post: NewsPost | None = None
+        if self.news_source is not None:
+            try:
+                fresh = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
+            except Exception:
+                LOGGER.exception("Fresh recent news fetch failed; falling back to cache.")
+                fresh = []
+            if fresh:
+                self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
+                post = fresh[0]
+
+        if post is None:
+            post = self.storage.get_latest_post(language)
+
+        if post is None:
+            await interaction.followup.send(
+                "아직 가져온 소식이 없어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        view = _build_view_for_post(post)
+        groups = _embed_groups_for_post(post)
+        first, *rest = groups if groups else ([],)
+        await interaction.followup.send(
+            embeds=first,
+            view=view if view is not None else discord.utils.MISSING,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            message = await interaction.original_response()
+        except discord.HTTPException:
+            message = None
+        await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
+
+        for extra in rest:
+            extra_message = await interaction.followup.send(
+                embeds=extra,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self._track_manual_message(
+                interaction.guild_id, interaction.channel_id, extra_message
+            )
+
+        youtube_content = _youtube_links_content(post)
+        if youtube_content:
+            yt_message = await interaction.followup.send(
+                content=youtube_content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self._track_manual_message(
+                interaction.guild_id, interaction.channel_id, yt_message
+            )
+
+    @app_commands.command(
+        name="소식보내기",
+        description="저장된 소식을 지정한 채널에 맨션과 함께 보냅니다.",
+    )
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(title="게시물", channel="채널", role="역할")
+    @app_commands.describe(
+        title="보낼 게시물을 선택합니다.",
+        channel="보낼 채널입니다. 비워두면 /림피설정에서 지정한 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /림피설정에서 지정한 역할을 사용합니다.",
+    )
+    async def send_news(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "서버 안에서만 사용할 수 있어요.", ephemeral=True
+            )
+            return
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        target = await self._resolve_target_channel(channel, settings.channel_id)
+        if target is None:
+            await interaction.response.send_message(
+                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /림피설정으로 채널을 설정해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        language = self._interaction_language(interaction)
+        post = self.storage.get_post_by_id_or_title(title, language=language)
+        if post is None:
+            post = self.storage.get_post_by_id_or_title(title)
+        if post is None:
+            await interaction.response.send_message(
+                "해당 게시물을 찾지 못했어요.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        role_id = role.id if role else settings.role_id
+        channel_id = getattr(target, "id", None)
+        where = f"<#{channel_id}>" if channel_id else "지정한 채널"
+
+        try:
+            await self._broadcast_post(target, post, role_id)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"{where}에 메시지를 보낼 권한이 없어요.", ephemeral=True
+            )
+            return
+        except discord.HTTPException:
+            LOGGER.exception("Manual news send failed.")
+            await interaction.followup.send(
+                "소식을 보내는 중 오류가 발생했어요.", ephemeral=True
+            )
+            return
+
+        await interaction.followup.send(
+            f"{where}에 소식을 보냈어요.", ephemeral=True
+        )
+
+    @send_news.autocomplete("title")
+    async def send_news_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        language = self._interaction_language(interaction)
+        posts = self.storage.search_posts(current, limit=25, language=language)
+        return [
+            app_commands.Choice(name=_choice_name(post, include_language=False), value=post.post_id)
+            for post in posts
+        ]
+
+    @app_commands.command(name="명령어", description="림피의 모든 명령어 사용법을 봅니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def list_commands(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="림피 명령어 안내",
+            color=discord.Color.from_rgb(179, 28, 28),
+            description="림버스 컴퍼니 스팀 뉴스를 가져오는 봇이에요.",
+        )
+        embed.add_field(
+            name="/림피설정",
+            value=(
+                "채널, 역할, 언어, 자동 알림, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
+                "서버에서만 사용 가능 (서버 관리 권한 필요)."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/림피상태",
+            value="현재 림피 설정과 뉴스 소스를 보여줍니다. (서버 전용)",
+            inline=False,
+        )
+        embed.add_field(
+            name="/림피역할해제",
+            value="새 소식 알림에 붙는 역할 핑을 제거합니다. (서버 전용)",
+            inline=False,
+        )
+        embed.add_field(
+            name="/서버동기화",
+            value="서버를 즉시 동기화합니다. (서버 전용)",
+            inline=False,
+        )
+        embed.add_field(
+            name="/최근소식보기",
+            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. (서버 전용)",
+            inline=False,
+        )
+        embed.add_field(
+            name="/소식보내기",
+            value=(
+                "저장된 소식을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
+                "채널·역할을 비우면 /림피설정 값을 사용합니다. (서버 관리 권한 필요)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/이전소식보기",
+            value=(
+                "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
+                "앱 설치로 어디서나 사용 가능, 본인만 보이게 응답돼요."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/명령어",
+            value="이 안내를 봅니다.",
+            inline=False,
+        )
+        embed.set_footer(text=f"한 번에 가져오는 소식 수: 최대 {NEWS_POST_LIMIT}개")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="서버동기화", description="Steam 뉴스 소스 + 디스코드 서버와 봇을 연동합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
@@ -570,11 +1000,8 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self._poll_lock:
             settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-            limit = settings.max_posts_per_poll if settings else self.config.max_posts_per_poll
             try:
-                posts_by_language = await self._sync_global_news_cache(
-                    {language: limit for language in SYNC_LANGUAGES}
-                )
+                posts_by_language = await self._sync_global_news_cache()
             except Exception:
                 LOGGER.exception("Manual Steam news sync failed.")
                 await interaction.followup.send(
@@ -602,14 +1029,28 @@ class NewsCog(commands.Cog):
             for language in SYNC_LANGUAGES
         )
         await interaction.followup.send(
-            f"최근 게시물을 저장했어요: {summary}",
+            f"서버와 동기화가 완료되었어요!",
             ephemeral=True,
         )
 
 
-def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
+def _filter_image_urls(urls: list[str]) -> list[str]:
+    return [
+        url
+        for url in urls
+        if url and not any(fragment in url for fragment in BLOCKED_IMAGE_FRAGMENTS)
+    ]
+
+
+def _image_embed(post: NewsPost, image_url: str) -> discord.Embed:
+    embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
+    embed.set_image(url=image_url)
+    return embed
+
+
+def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
     description = post.text[:4096] if post.text else post.url
-    embed = discord.Embed(
+    main = discord.Embed(
         title=post.title[:256],
         description=description,
         url=post.url,
@@ -617,21 +1058,49 @@ def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
         timestamp=post.created_at,
     )
     source_url = str(post.raw.get("source_url") or "https://store.steampowered.com/news/app/1973530")
-    embed.set_author(name=post.source_user, url=source_url)
-    embed.add_field(name="원문", value=f"[Steam에서 보기]({post.url})", inline=False)
+    main.set_author(name=post.source_user, url=source_url)
+    main.add_field(name="원문", value=f"[Steam에서 보기]({post.url})", inline=False)
     schedule_text = _schedule_text_for_post(post)
     if schedule_text:
-        embed.add_field(name="일정", value=schedule_text, inline=False)
-    if post.image_urls:
-        embed.set_image(url=post.image_urls[0])
+        main.add_field(name="일정", value=schedule_text, inline=False)
 
-    embeds = [embed]
-    for image_url in post.image_urls[1:4]:
-        image_embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
-        image_embed.set_image(url=image_url)
-        embeds.append(image_embed)
+    images = _filter_image_urls(post.image_urls)
+    if images:
+        main.set_image(url=images[0])
+    if len(images) > 4:
+        main.add_field(
+            name="이미지 안내",
+            value=(
+                "이미지 개수가 4개를 초과하여 임베드에는 표시되지 않지만 "
+                "이미지를 클릭하여 모든 이미지를 볼수 있습니다!"
+            ),
+            inline=False,
+        )
 
-    return embeds
+    first_group: list[discord.Embed] = [main]
+    for image_url in images[1:EMBED_IMAGES_PER_MESSAGE]:
+        first_group.append(_image_embed(post, image_url))
+
+    groups: list[list[discord.Embed]] = [first_group]
+    remaining = images[EMBED_IMAGES_PER_MESSAGE:]
+    while remaining:
+        chunk = remaining[:EMBED_IMAGES_PER_MESSAGE]
+        groups.append([_image_embed(post, url) for url in chunk])
+        remaining = remaining[EMBED_IMAGES_PER_MESSAGE:]
+    return groups
+
+
+def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
+    groups = _embed_groups_for_post(post)
+    return groups[0] if groups else []
+
+
+def _build_view_for_post(post: NewsPost) -> discord.ui.View | None:
+    if not _filter_image_urls(post.image_urls):
+        return None
+    view = discord.ui.View(timeout=None)
+    view.add_item(ZipDownloadButton(post.post_id))
+    return view
 
 
 def _language_label(language: str) -> str:
@@ -707,6 +1176,51 @@ def _post_language(post: NewsPost) -> str:
     return ""
 
 
+def _to_png_bytes(data: bytes) -> bytes | None:
+    try:
+        from PIL import Image
+    except ImportError:
+        LOGGER.warning("Pillow is not installed; saving raw image bytes without PNG conversion.")
+        return data
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.load()
+            if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
+                img = img.convert("RGBA")
+            output = io.BytesIO()
+            img.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+    except Exception:
+        LOGGER.exception("Failed to convert image to PNG; falling back to raw bytes.")
+        return data
+
+
+_UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def _unique_zip_name(used_names: set[str], index: int, url: str) -> str:
+    del url  # 이미지명은 순번 기반으로만 짓는다.
+    candidate = f"소식_이미지_({index + 1}).png"
+    counter = 2
+    while candidate in used_names:
+        candidate = f"소식_이미지_({index + 1}_{counter}).png"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def _safe_zip_filename(post: NewsPost) -> str:
+    title = (post.title or "").strip()
+    cleaned = _UNSAFE_FILENAME_RE.sub(" ", title).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = post.post_id
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rstrip()
+    return f"림버스_소식_({cleaned}).zip"
+
+
 async def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -719,12 +1233,15 @@ async def main() -> None:
         news_source = build_news_source(config, session)
         bot = LimpiBot(config)
 
+        cog = NewsCog(bot, config, storage, news_source, session)
+
         @bot.event
         async def on_ready() -> None:
             LOGGER.info("Logged in as %s (%s).", bot.user, bot.user.id if bot.user else "unknown")
             await bot.sync_connected_guild_commands()
+            await cog.run_startup_sync()
 
-        await bot.add_cog(NewsCog(bot, config, storage, news_source))
+        await bot.add_cog(cog)
         try:
             await bot.start(config.discord_token)
         finally:
