@@ -483,7 +483,10 @@ def _parse_json_object(value: object) -> dict:
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:
-    skipped_fragments = ("youtube_16x9_placeholder.gif",)
+    skipped_fragments = (
+        "youtube_16x9_placeholder.gif",
+        "1dc5775f3444c32d11acb9d57c03232157739877",
+    )
     clean_urls = [
         url
         for url in urls
