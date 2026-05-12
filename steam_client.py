@@ -354,10 +354,19 @@ def _steam_bbcode_to_text(value: str | None) -> str:
         value,
         flags=re.IGNORECASE,
     )
-    value = re.sub(r"\[url=([^\]]+)\](.*?)\[/url\]", r"\2 (\1)", value, flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"\[/?(?:b|i|u|h1|list|olist|quote|code|strike|spoiler)\]", "", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"\[url=([^\]]+)\](.*?)\[/url\]",
+        r"\2 (\1)",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[/?(?:b|i|u|h[1-6]|list|olist|quote|code|strike|spoiler|noparse|table|tr|th|td|center|left|right|indent|hr|url)(?:=[^\]]*)?\]",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
     value = re.sub(r"\[\*\]", "- ", value)
-    value = re.sub(r"\[[^\]]+\]", "", value)
     value = html.unescape(value)
     return "\n".join(line.strip() for line in value.splitlines() if line.strip())
 

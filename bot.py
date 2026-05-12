@@ -800,9 +800,14 @@ class NewsCog(commands.Cog):
     @app_commands.command(name="이전소식보기", description="저장된 림버스 컴퍼니 이전 소식을 다시 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(title="게시물")
-    @app_commands.describe(title="게시물의 첫 번째 줄을 선택합니다.")
-    async def previous_news(self, interaction: discord.Interaction, title: str) -> None:
+    @app_commands.rename(title="게시물", private="나만보기")
+    @app_commands.describe(
+        title="게시물의 첫 번째 줄을 선택합니다.",
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+    )
+    async def previous_news(
+        self, interaction: discord.Interaction, title: str, private: bool = True
+    ) -> None:
         language = self._interaction_language(interaction)
         post = self.storage.get_post_by_id_or_title(title, language=language)
         if post is None:
@@ -820,21 +825,37 @@ class NewsCog(commands.Cog):
         await interaction.response.send_message(
             embeds=first,
             view=view if view is not None else discord.utils.MISSING,
-            ephemeral=True,
+            ephemeral=private,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
+        if not private:
+            try:
+                message = await interaction.original_response()
+            except discord.HTTPException:
+                message = None
+            await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
+
         for extra in rest:
-            await interaction.followup.send(
+            extra_message = await interaction.followup.send(
                 embeds=extra,
-                ephemeral=True,
+                ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, extra_message
+                )
         youtube_content = _youtube_links_content(post)
         if youtube_content:
-            await interaction.followup.send(
+            yt_message = await interaction.followup.send(
                 content=youtube_content,
-                ephemeral=True,
+                ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, yt_message
+                )
 
     @previous_news.autocomplete("title")
     async def previous_news_autocomplete(
@@ -852,12 +873,13 @@ class NewsCog(commands.Cog):
         ]
 
     @app_commands.command(name="최근소식보기", description="가장 최근 림버스 컴퍼니 소식을 즉시 확인합니다.")
-    @app_commands.allowed_installs(guilds=True, users=False)
-    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    @app_commands.guild_only()
-    async def recent_news(self, interaction: discord.Interaction) -> None:
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(private="나만보기")
+    @app_commands.describe(private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.")
+    async def recent_news(self, interaction: discord.Interaction, private: bool = True) -> None:
         language = self._interaction_language(interaction)
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(ephemeral=private, thinking=True)
 
         post: NewsPost | None = None
         if self.news_source is not None:
@@ -886,32 +908,38 @@ class NewsCog(commands.Cog):
         await interaction.followup.send(
             embeds=first,
             view=view if view is not None else discord.utils.MISSING,
+            ephemeral=private,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        try:
-            message = await interaction.original_response()
-        except discord.HTTPException:
-            message = None
-        await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
+        if not private:
+            try:
+                message = await interaction.original_response()
+            except discord.HTTPException:
+                message = None
+            await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
 
         for extra in rest:
             extra_message = await interaction.followup.send(
                 embeds=extra,
+                ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            await self._track_manual_message(
-                interaction.guild_id, interaction.channel_id, extra_message
-            )
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, extra_message
+                )
 
         youtube_content = _youtube_links_content(post)
         if youtube_content:
             yt_message = await interaction.followup.send(
                 content=youtube_content,
+                ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            await self._track_manual_message(
-                interaction.guild_id, interaction.channel_id, yt_message
-            )
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, yt_message
+                )
 
     @app_commands.command(
         name="소식보내기",
@@ -1028,7 +1056,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/최근소식보기",
-            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. (서버 전용)",
+            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 기본은 나만보기입니다.",
             inline=False,
         )
         embed.add_field(
@@ -1043,7 +1071,7 @@ class NewsCog(commands.Cog):
             name="/이전소식보기",
             value=(
                 "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
-                "앱 설치로 어디서나 사용 가능, 본인만 보이게 응답돼요."
+                "서버와 앱 설치에서 모두 사용 가능하며, 기본은 나만보기입니다."
             ),
             inline=False,
         )
