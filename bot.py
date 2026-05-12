@@ -7,6 +7,7 @@ import re
 import zipfile
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -24,7 +25,8 @@ LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
-ZIP_IMAGE_CONCURRENCY = 5
+ZIP_IMAGE_CONCURRENCY = 10
+ZIP_CACHE_MAX_ITEMS = 8
 BLOCKED_IMAGE_FRAGMENTS = (
     "1dc5775f3444c32d11acb9d57c03232157739877",
     "youtube_16x9_placeholder.gif",
@@ -237,6 +239,7 @@ class NewsCog(commands.Cog):
         self.news_source = news_source
         self.session = session
         self._poll_lock = asyncio.Lock()
+        self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._last_poll_at: datetime | None = None
         self._startup_synced = False
 
@@ -561,7 +564,14 @@ class NewsCog(commands.Cog):
             return
 
         try:
-            buffer, count = await self._build_image_zip(post)
+            cached = self._zip_cache.get(post.post_id)
+            if cached is None:
+                buffer, count = await self._build_image_zip(post)
+                if buffer is not None and count > 0:
+                    self._cache_zip(post.post_id, buffer.getvalue(), count)
+            else:
+                zip_bytes, count = cached
+                buffer = io.BytesIO(zip_bytes)
         except Exception:
             LOGGER.exception("Failed to build image ZIP for post %s.", post_id)
             await interaction.followup.send(
@@ -601,9 +611,9 @@ class NewsCog(commands.Cog):
             for item in images:
                 if item is None:
                     continue
-                index, url, png_bytes = item
-                name = _unique_zip_name(used_names, index, url)
-                archive.writestr(name, png_bytes)
+                index, url, content_type, image_bytes = item
+                name = _unique_zip_name(used_names, index, url, content_type)
+                archive.writestr(name, image_bytes)
                 count += 1
 
         if count == 0:
@@ -614,28 +624,32 @@ class NewsCog(commands.Cog):
 
     async def _prepare_zip_image(
         self, semaphore: asyncio.Semaphore, index: int, url: str
-    ) -> tuple[int, str, bytes] | None:
+    ) -> tuple[int, str, str | None, bytes] | None:
         async with semaphore:
-            data = await self._download_bytes(url)
-            if data is None:
+            downloaded = await self._download_image(url)
+            if downloaded is None:
                 return None
 
-            png_bytes = await asyncio.to_thread(_to_png_bytes, data)
-            if png_bytes is None:
-                return None
+            data, content_type = downloaded
+            return index, url, content_type, data
 
-            return index, url, png_bytes
-
-    async def _download_bytes(self, url: str) -> bytes | None:
+    async def _download_image(self, url: str) -> tuple[bytes, str | None] | None:
         try:
             async with self.session.get(url) as response:
                 if response.status >= 400:
                     LOGGER.warning("Image download failed (%s): %s", response.status, url)
                     return None
-                return await response.read()
+                content_type = response.headers.get("Content-Type")
+                return await response.read(), content_type
         except aiohttp.ClientError:
             LOGGER.exception("Image download error: %s", url)
             return None
+
+    def _cache_zip(self, post_id: str, zip_bytes: bytes, count: int) -> None:
+        self._zip_cache[post_id] = (zip_bytes, count)
+        while len(self._zip_cache) > ZIP_CACHE_MAX_ITEMS:
+            oldest_post_id = next(iter(self._zip_cache))
+            self._zip_cache.pop(oldest_post_id, None)
 
     async def run_startup_sync(self) -> None:
         if self.news_source is None or self._startup_synced:
@@ -1233,38 +1247,43 @@ def _post_language(post: NewsPost) -> str:
     return ""
 
 
-def _to_png_bytes(data: bytes) -> bytes | None:
-    try:
-        from PIL import Image
-    except ImportError:
-        LOGGER.warning("Pillow is not installed; saving raw image bytes without PNG conversion.")
-        return data
-
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            img.load()
-            if img.mode not in ("RGB", "RGBA", "L", "LA", "P"):
-                img = img.convert("RGBA")
-            output = io.BytesIO()
-            img.save(output, format="PNG", optimize=True)
-            return output.getvalue()
-    except Exception:
-        LOGGER.exception("Failed to convert image to PNG; falling back to raw bytes.")
-        return data
-
-
 _UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 
 
-def _unique_zip_name(used_names: set[str], index: int, url: str) -> str:
-    del url  # 이미지명은 순번 기반으로만 짓는다.
-    candidate = f"소식_이미지_({index + 1}).png"
+def _unique_zip_name(
+    used_names: set[str], index: int, url: str, content_type: str | None
+) -> str:
+    extension = _image_file_extension(url, content_type)
+    candidate = f"소식_이미지_({index + 1}){extension}"
     counter = 2
     while candidate in used_names:
-        candidate = f"소식_이미지_({index + 1}_{counter}).png"
+        candidate = f"소식_이미지_({index + 1}_{counter}){extension}"
         counter += 1
     used_names.add(candidate)
     return candidate
+
+
+def _image_file_extension(url: str, content_type: str | None) -> str:
+    if content_type:
+        normalized = content_type.split(";", 1)[0].strip().lower()
+        if normalized == "image/jpeg":
+            return ".jpg"
+        if normalized == "image/png":
+            return ".png"
+        if normalized == "image/gif":
+            return ".gif"
+        if normalized == "image/webp":
+            return ".webp"
+        if normalized == "image/bmp":
+            return ".bmp"
+
+    suffix = urlparse(url).path.rsplit("/", 1)[-1].lower().rsplit(".", 1)
+    if len(suffix) == 2:
+        extension = f".{suffix[1]}"
+        if extension in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+            return ".jpg" if extension == ".jpeg" else extension
+
+    return ".img"
 
 
 def _safe_zip_filename(post: NewsPost) -> str:
