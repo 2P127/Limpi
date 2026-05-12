@@ -27,11 +27,15 @@ NEWS_POST_LIMIT = 30
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
 ZIP_CACHE_MAX_ITEMS = 8
+IMAGE_CACHE_MAX_ITEMS = 128
 BLOCKED_IMAGE_FRAGMENTS = (
     "1dc5775f3444c32d11acb9d57c03232157739877",
+    "62e63adbc551470064256668df2ba6cae5138cad",
     "youtube_16x9_placeholder.gif",
 )
-EMBED_IMAGES_PER_MESSAGE = 10
+EMBEDS_PER_MESSAGE = 10
+EMBED_DESCRIPTION_LIMIT = 4096
+FILES_PER_MESSAGE = 10
 LANGUAGE_CHOICES = [
     app_commands.Choice(name="한국어", value="koreana"),
     app_commands.Choice(name="English", value="english"),
@@ -92,25 +96,21 @@ class LimpiBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(ZipDownloadButton)
-        if self.config.command_sync_mode == "global":
-            synced = await self.tree.sync()
-            LOGGER.info(
-                "Synced %s global commands. Connected guild command duplicates will be cleaned on ready.",
-                len(synced),
-            )
-            return
+        synced = await self.tree.sync()
+        LOGGER.info(
+            "Synced %s global commands for guild and user app installs.",
+            len(synced),
+        )
 
         if self.config.command_guild_id:
             guild = discord.Object(id=self.config.command_guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            LOGGER.info("Synced %s commands to guild %s.", len(synced), guild.id)
-            await self.clear_global_command_duplicates()
-        else:
+            self.tree.clear_commands(guild=guild)
+            guild_synced = await self.tree.sync(guild=guild)
             LOGGER.info(
-                "Skipping global command sync. Commands will be synced to connected guilds on ready."
+                "Cleared %s guild-scoped commands from %s; global commands stay active.",
+                len(guild_synced),
+                guild.id,
             )
-            await self.clear_global_command_duplicates()
 
     async def clear_global_command_duplicates(self) -> None:
         if self._cleared_global_commands:
@@ -162,36 +162,7 @@ class LimpiBot(commands.Bot):
         self._cleared_connected_guild_commands = True
 
     async def sync_connected_guild_commands(self) -> None:
-        if self.config.command_sync_mode == "global":
-            await self.clear_connected_guild_command_duplicates()
-            return
-
-        if self.config.command_guild_id or self._synced_connected_guilds:
-            if self.config.command_guild_id:
-                await self.clear_global_command_duplicates()
-            return
-
-        if not self.guilds:
-            LOGGER.warning("No connected guilds are available for guild command sync.")
-            return
-
-        command_names = ", ".join(command.name for command in self.tree.get_commands())
-        for guild in self.guilds:
-            guild_object = discord.Object(id=guild.id)
-            try:
-                self.tree.copy_global_to(guild=guild_object)
-                synced = await self.tree.sync(guild=guild_object)
-                LOGGER.info(
-                    "Synced %s guild commands to %s (%s): %s",
-                    len(synced),
-                    guild.name,
-                    guild.id,
-                    command_names,
-                )
-            except discord.HTTPException:
-                LOGGER.exception("Failed to sync guild commands to %s (%s).", guild.name, guild.id)
-
-        await self.clear_global_command_duplicates()
+        await self.clear_connected_guild_command_duplicates()
         self._synced_connected_guilds = True
 
 
@@ -240,6 +211,7 @@ class NewsCog(commands.Cog):
         self.session = session
         self._poll_lock = asyncio.Lock()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
+        self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._last_poll_at: datetime | None = None
         self._startup_synced = False
 
@@ -374,9 +346,35 @@ class NewsCog(commands.Cog):
             settings_by_language.setdefault(language, []).append(settings)
         return settings_by_language
 
+    def _interaction_uses_user_install(self, interaction: discord.Interaction) -> bool:
+        owners = getattr(interaction, "_integration_owners", {}) or {}
+        return 1 in owners
+
+    def _interaction_user_values(
+        self, interaction: discord.Interaction
+    ) -> tuple[int, str, str | None]:
+        user = interaction.user
+        user_id = int(user.id)
+        username = getattr(user, "name", None) or str(user)
+        nickname = getattr(user, "nick", None)
+        if not nickname:
+            nickname = getattr(user, "global_name", None) or getattr(user, "display_name", None)
+        if nickname == username:
+            nickname = None
+        return user_id, username, nickname
+
+    def _remember_interaction_user(self, interaction: discord.Interaction) -> None:
+        user_id, username, nickname = self._interaction_user_values(interaction)
+        self.storage.upsert_user_settings(
+            user_id,
+            username=username,
+            nickname=nickname,
+        )
+
     def _interaction_language(self, interaction: discord.Interaction) -> str:
-        if interaction.guild_id is None:
-            return self.config.steam_language
+        if interaction.guild_id is None or self._interaction_uses_user_install(interaction):
+            self._remember_interaction_user(interaction)
+            return self.storage.get_user_settings(interaction.user.id).language
         return self.storage.get_settings(interaction.guild_id).language
 
     def _should_poll_now(self, now: datetime) -> bool:
@@ -413,7 +411,7 @@ class NewsCog(commands.Cog):
             try:
                 channel = await self.bot.fetch_channel(settings.channel_id)
             except (discord.Forbidden, discord.NotFound):
-                LOGGER.warning(
+                LOGGER.debug(
                     "Cannot access configured channel %s for guild %s.",
                     settings.channel_id,
                     settings.guild_id,
@@ -421,7 +419,7 @@ class NewsCog(commands.Cog):
                 return 0
 
         if not isinstance(channel, discord.abc.Messageable):
-            LOGGER.warning("Configured channel %s is not messageable.", settings.channel_id)
+            LOGGER.debug("Configured channel %s is not messageable.", settings.channel_id)
             return 0
 
         new_posts = self._new_posts_for_guild(settings, posts)
@@ -511,11 +509,14 @@ class NewsCog(commands.Cog):
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
-            everyone=False, users=False, roles=bool(role_id)
+            everyone=False,
+            users=False,
+            roles=[discord.Object(id=role_id)] if role_id else False,
         )
 
         groups = _embed_groups_for_post(post)
         view = _build_view_for_post(post)
+
         first, *rest = groups if groups else ([],)
         await channel.send(
             content=mention,
@@ -523,17 +524,74 @@ class NewsCog(commands.Cog):
             allowed_mentions=allowed_mentions,
             view=view if view is not None else discord.utils.MISSING,
         )
-        for extra in rest:
+
+        for extra_embeds in rest:
             await channel.send(
-                embeds=extra,
+                embeds=extra_embeds,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+
         youtube_content = _youtube_links_content(post)
         if youtube_content:
             await channel.send(
                 content=youtube_content,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+        self._schedule_channel_image_messages(channel, post)
+
+    async def _send_news_post_followups(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        *,
+        private: bool,
+    ) -> list[discord.Message | None]:
+        sent_messages: list[discord.Message | None] = []
+        groups = _embed_groups_for_post(post)
+        view = _build_view_for_post(post)
+        first, *rest = groups if groups else ([],)
+
+        sent_messages.append(
+            await interaction.followup.send(
+                embeds=first,
+                view=view if view is not None else discord.utils.MISSING,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+        )
+
+        for extra_embeds in rest:
+            sent_messages.append(
+                await interaction.followup.send(
+                    embeds=extra_embeds,
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            )
+
+        youtube_content = _youtube_links_content(post)
+        if youtube_content:
+            sent_messages.append(
+                await interaction.followup.send(
+                    content=youtube_content,
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            )
+
+        if private:
+            self._schedule_interaction_image_followups(interaction, post, private=True)
+        elif isinstance(interaction.channel, discord.abc.Messageable):
+            self._schedule_channel_image_messages(
+                interaction.channel,
+                post,
+                track_guild_id=interaction.guild_id,
+                track_channel_id=interaction.channel_id,
+            )
+        return sent_messages
 
     async def _resolve_target_channel(
         self,
@@ -633,17 +691,137 @@ class NewsCog(commands.Cog):
             data, content_type = downloaded
             return index, url, content_type, data
 
+    def _schedule_channel_image_messages(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+        *,
+        track_guild_id: int | None = None,
+        track_channel_id: int | None = None,
+    ) -> None:
+        if not _filter_image_urls(post.image_urls):
+            return
+
+        task = asyncio.create_task(
+            self._send_channel_image_messages(
+                channel,
+                post,
+                track_guild_id=track_guild_id,
+                track_channel_id=track_channel_id,
+            )
+        )
+        task.add_done_callback(self._log_background_task_result)
+
+    def _schedule_interaction_image_followups(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        *,
+        private: bool,
+    ) -> None:
+        if not _filter_image_urls(post.image_urls):
+            return
+
+        task = asyncio.create_task(
+            self._send_interaction_image_followups(interaction, post, private=private)
+        )
+        task.add_done_callback(self._log_background_task_result)
+
+    async def _send_channel_image_messages(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+        *,
+        track_guild_id: int | None = None,
+        track_channel_id: int | None = None,
+    ) -> None:
+        for file_batch in await self._image_file_batches_for_post(post):
+            message = await channel.send(
+                files=file_batch,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self._track_manual_message(track_guild_id, track_channel_id, message)
+
+    async def _send_interaction_image_followups(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        *,
+        private: bool,
+    ) -> None:
+        for file_batch in await self._image_file_batches_for_post(post):
+            message = await interaction.followup.send(
+                files=file_batch,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id,
+                    interaction.channel_id,
+                    message,
+                )
+
+    @staticmethod
+    def _log_background_task_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            LOGGER.exception("Background image attachment send failed.")
+
+    async def _image_file_batches_for_post(self, post: NewsPost) -> list[list[discord.File]]:
+        urls = _filter_image_urls(post.image_urls)
+        if not urls:
+            return []
+
+        semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
+        tasks = [
+            asyncio.create_task(self._prepare_zip_image(semaphore, index, url))
+            for index, url in enumerate(urls)
+        ]
+        images = await asyncio.gather(*tasks)
+
+        used_names: set[str] = set()
+        files: list[discord.File] = []
+        for item in images:
+            if item is None:
+                continue
+
+            index, url, content_type, image_bytes = item
+            filename = _unique_zip_name(used_names, index, url, content_type)
+            files.append(discord.File(io.BytesIO(image_bytes), filename=filename))
+
+        return [
+            files[index : index + FILES_PER_MESSAGE]
+            for index in range(0, len(files), FILES_PER_MESSAGE)
+        ]
+
     async def _download_image(self, url: str) -> tuple[bytes, str | None] | None:
+        cached = self._image_cache.get(url)
+        if cached is not None:
+            return cached
+
         try:
             async with self.session.get(url) as response:
                 if response.status >= 400:
                     LOGGER.warning("Image download failed (%s): %s", response.status, url)
                     return None
                 content_type = response.headers.get("Content-Type")
-                return await response.read(), content_type
+                data = await response.read()
+                self._cache_image(url, data, content_type)
+                return data, content_type
         except aiohttp.ClientError:
             LOGGER.exception("Image download error: %s", url)
             return None
+
+    def _cache_image(self, url: str, data: bytes, content_type: str | None) -> None:
+        self._image_cache[url] = (data, content_type)
+        while len(self._image_cache) > IMAGE_CACHE_MAX_ITEMS:
+            oldest_url = next(iter(self._image_cache))
+            self._image_cache.pop(oldest_url, None)
 
     def _cache_zip(self, post_id: str, zip_bytes: bytes, count: int) -> None:
         self._zip_cache[post_id] = (zip_bytes, count)
@@ -671,7 +849,7 @@ class NewsCog(commands.Cog):
             return
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
-    @app_commands.command(name="림피설정", description="림피 알림 채널, 역할, 언어를 설정합니다.")
+    @app_commands.command(name="림피서버설정", description="서버의 림피 알림 채널, 역할, 언어를 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
@@ -753,6 +931,34 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    @app_commands.command(name="림피유저설정", description="앱에서 사용할 림피 개인 언어를 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(language="언어")
+    @app_commands.describe(language="앱으로 사용하는 /최근소식보기, /이전소식보기의 표시 언어입니다.")
+    @app_commands.choices(language=LANGUAGE_CHOICES)
+    async def configure_user(
+        self,
+        interaction: discord.Interaction,
+        language: app_commands.Choice[str],
+    ) -> None:
+        user_id, username, nickname = self._interaction_user_values(interaction)
+        settings = self.storage.update_user_language(
+            user_id,
+            username=username,
+            nickname=nickname,
+            language=language.value,
+        )
+
+        await interaction.response.send_message(
+            (
+                f"개인 언어를 {_language_label(settings.language)}로 설정했어요.\n"
+                "앱으로 사용하는 /최근소식보기와 /이전소식보기에서 이 언어를 사용할게요."
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @app_commands.command(name="림피역할해제", description="새 소식 알림의 역할 핑을 제거합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -819,42 +1025,16 @@ class NewsCog(commands.Cog):
             )
             return
 
-        view = _build_view_for_post(post)
-        groups = _embed_groups_for_post(post)
-        first, *rest = groups if groups else ([],)
-        await interaction.response.send_message(
-            embeds=first,
-            view=view if view is not None else discord.utils.MISSING,
-            ephemeral=private,
-            allowed_mentions=discord.AllowedMentions.none(),
+        await interaction.response.defer(ephemeral=private, thinking=True)
+        sent_messages = await self._send_news_post_followups(
+            interaction,
+            post,
+            private=private,
         )
         if not private:
-            try:
-                message = await interaction.original_response()
-            except discord.HTTPException:
-                message = None
-            await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
-
-        for extra in rest:
-            extra_message = await interaction.followup.send(
-                embeds=extra,
-                ephemeral=private,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            if not private:
+            for message in sent_messages:
                 await self._track_manual_message(
-                    interaction.guild_id, interaction.channel_id, extra_message
-                )
-        youtube_content = _youtube_links_content(post)
-        if youtube_content:
-            yt_message = await interaction.followup.send(
-                content=youtube_content,
-                ephemeral=private,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            if not private:
-                await self._track_manual_message(
-                    interaction.guild_id, interaction.channel_id, yt_message
+                    interaction.guild_id, interaction.channel_id, message
                 )
 
     @previous_news.autocomplete("title")
@@ -902,43 +1082,15 @@ class NewsCog(commands.Cog):
             )
             return
 
-        view = _build_view_for_post(post)
-        groups = _embed_groups_for_post(post)
-        first, *rest = groups if groups else ([],)
-        await interaction.followup.send(
-            embeds=first,
-            view=view if view is not None else discord.utils.MISSING,
-            ephemeral=private,
-            allowed_mentions=discord.AllowedMentions.none(),
+        sent_messages = await self._send_news_post_followups(
+            interaction,
+            post,
+            private=private,
         )
         if not private:
-            try:
-                message = await interaction.original_response()
-            except discord.HTTPException:
-                message = None
-            await self._track_manual_message(interaction.guild_id, interaction.channel_id, message)
-
-        for extra in rest:
-            extra_message = await interaction.followup.send(
-                embeds=extra,
-                ephemeral=private,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            if not private:
+            for message in sent_messages:
                 await self._track_manual_message(
-                    interaction.guild_id, interaction.channel_id, extra_message
-                )
-
-        youtube_content = _youtube_links_content(post)
-        if youtube_content:
-            yt_message = await interaction.followup.send(
-                content=youtube_content,
-                ephemeral=private,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            if not private:
-                await self._track_manual_message(
-                    interaction.guild_id, interaction.channel_id, yt_message
+                    interaction.guild_id, interaction.channel_id, message
                 )
 
     @app_commands.command(
@@ -952,8 +1104,8 @@ class NewsCog(commands.Cog):
     @app_commands.rename(title="게시물", channel="채널", role="역할")
     @app_commands.describe(
         title="보낼 게시물을 선택합니다.",
-        channel="보낼 채널입니다. 비워두면 /림피설정에서 지정한 채널을 사용합니다.",
-        role="함께 핑할 역할입니다. 비워두면 /림피설정에서 지정한 역할을 사용합니다.",
+        channel="보낼 채널입니다. 비워두면 /림피서버설정에서 지정한 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /림피서버설정에서 지정한 역할을 사용합니다.",
     )
     async def send_news(
         self,
@@ -972,7 +1124,7 @@ class NewsCog(commands.Cog):
         target = await self._resolve_target_channel(channel, settings.channel_id)
         if target is None:
             await interaction.response.send_message(
-                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /림피설정으로 채널을 설정해주세요.",
+                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /림피서버설정으로 채널을 설정해주세요.",
                 ephemeral=True,
             )
             return
@@ -1032,11 +1184,16 @@ class NewsCog(commands.Cog):
             description="림버스 컴퍼니 스팀 뉴스를 가져오는 봇이에요.",
         )
         embed.add_field(
-            name="/림피설정",
+            name="/림피서버설정",
             value=(
                 "채널, 역할, 언어, 자동 알림, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
                 "서버에서만 사용 가능 (서버 관리 권한 필요)."
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/림피유저설정",
+            value="앱으로 사용할 때의 개인 언어를 설정합니다.",
             inline=False,
         )
         embed.add_field(
@@ -1063,7 +1220,7 @@ class NewsCog(commands.Cog):
             name="/소식보내기",
             value=(
                 "저장된 소식을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
-                "채널·역할을 비우면 /림피설정 값을 사용합니다. (서버 관리 권한 필요)"
+                "채널·역할을 비우면 /림피서버설정 값을 사용합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
@@ -1141,17 +1298,43 @@ def _filter_image_urls(urls: list[str]) -> list[str]:
     ]
 
 
-def _image_embed(post: NewsPost, image_url: str) -> discord.Embed:
-    embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
-    embed.set_image(url=image_url)
-    return embed
+def _split_message_content(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+    for line in text.splitlines():
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current = line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
-def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
-    description = post.text[:4096] if post.text else post.url
+def _embed_groups_for_post(
+    post: NewsPost,
+) -> list[list[discord.Embed]]:
+    text_chunks = _split_message_content(
+        (post.text or post.url).strip(),
+        EMBED_DESCRIPTION_LIMIT,
+    )
+    if not text_chunks:
+        text_chunks = [post.url]
+
     main = discord.Embed(
         title=post.title[:256],
-        description=description,
+        description=text_chunks[0],
         url=post.url,
         color=discord.Color.from_rgb(179, 28, 28),
         timestamp=post.created_at,
@@ -1163,30 +1346,22 @@ def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
     if schedule_text:
         main.add_field(name="일정", value=schedule_text, inline=False)
 
-    images = _filter_image_urls(post.image_urls)
-    if images:
-        main.set_image(url=images[0])
-    if len(images) > 4:
-        main.add_field(
-            name="이미지 안내",
-            value=(
-                "이미지 개수가 4개를 초과하여 임베드에는 표시되지 않지만 "
-                "이미지를 클릭하여 모든 이미지를 볼수 있습니다!"
-            ),
-            inline=False,
+    embeds: list[discord.Embed] = [main]
+    for index, chunk in enumerate(text_chunks[1:], start=2):
+        embeds.append(
+            discord.Embed(
+                title=f"{post.title[:240]} ({index})",
+                description=chunk,
+                url=post.url,
+                color=discord.Color.from_rgb(179, 28, 28),
+                timestamp=post.created_at,
+            )
         )
 
-    first_group: list[discord.Embed] = [main]
-    for image_url in images[1:EMBED_IMAGES_PER_MESSAGE]:
-        first_group.append(_image_embed(post, image_url))
-
-    groups: list[list[discord.Embed]] = [first_group]
-    remaining = images[EMBED_IMAGES_PER_MESSAGE:]
-    while remaining:
-        chunk = remaining[:EMBED_IMAGES_PER_MESSAGE]
-        groups.append([_image_embed(post, url) for url in chunk])
-        remaining = remaining[EMBED_IMAGES_PER_MESSAGE:]
-    return groups
+    return [
+        embeds[index : index + EMBEDS_PER_MESSAGE]
+        for index in range(0, len(embeds), EMBEDS_PER_MESSAGE)
+    ]
 
 
 def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:

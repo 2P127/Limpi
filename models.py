@@ -31,6 +31,16 @@ class GuildSettings:
 
 
 @dataclass(frozen=True)
+class UserSettings:
+    user_id: int
+    username: str
+    nickname: str | None
+    language: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
 class TrackedMessage:
     guild_id: int
     channel_id: int

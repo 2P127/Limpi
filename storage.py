@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from models import GuildSettings, NewsPost, TrackedMessage
+from models import GuildSettings, NewsPost, TrackedMessage, UserSettings
 
 
 DEFAULT_AUTO_CLEANUP_ENABLED = True
@@ -87,6 +87,18 @@ class SQLiteStorage:
                 )
                 """
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    nickname TEXT,
+                    language TEXT NOT NULL DEFAULT 'koreana',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
             self._ensure_column("guild_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column(
                 "guild_settings",
@@ -104,6 +116,9 @@ class SQLiteStorage:
                 "INTEGER NOT NULL DEFAULT 1",
             )
             self._ensure_column("posts", "language", "TEXT NOT NULL DEFAULT 'koreana'")
+            self._ensure_column("user_settings", "username", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("user_settings", "nickname", "TEXT")
+            self._ensure_column("user_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)"
             )
@@ -126,6 +141,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_tracked_messages_sent_at
                 ON tracked_messages(sent_at)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_user_settings_updated_at
+                ON user_settings(updated_at)
                 """
             )
             self._migrate_legacy_post_ids()
@@ -256,6 +277,70 @@ class SQLiteStorage:
             ).fetchall()
 
         return [self._row_to_settings(row) for row in rows]
+
+    def get_user_settings(self, user_id: int) -> UserSettings:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM user_settings WHERE user_id = ?", (user_id,)
+            ).fetchone()
+
+        if row is None:
+            return UserSettings(
+                user_id=user_id,
+                username="",
+                nickname=None,
+                language="koreana",
+                created_at=None,
+                updated_at=None,
+            )
+
+        return self._row_to_user_settings(row)
+
+    def upsert_user_settings(
+        self,
+        user_id: int,
+        *,
+        username: str,
+        nickname: str | None,
+        language: str | None = None,
+    ) -> UserSettings:
+        current = self.get_user_settings(user_id)
+        now = _now_iso()
+        next_language = language if language is not None else current.language
+
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO user_settings (
+                    user_id, username, nickname, language, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    nickname = excluded.nickname,
+                    language = excluded.language,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, username, nickname, next_language, now, now),
+            )
+            self._connection.commit()
+
+        return self.get_user_settings(user_id)
+
+    def update_user_language(
+        self,
+        user_id: int,
+        *,
+        username: str,
+        nickname: str | None,
+        language: str,
+    ) -> UserSettings:
+        return self.upsert_user_settings(
+            user_id,
+            username=username,
+            nickname=nickname,
+            language=language,
+        )
 
     def update_settings(
         self,
@@ -618,6 +703,17 @@ class SQLiteStorage:
             max_posts_per_poll=int(row["max_posts_per_poll"] or 30),
             auto_cleanup_enabled=bool(row["auto_cleanup_enabled"]),
             auto_cleanup_days=cleanup_days,
+        )
+
+    @staticmethod
+    def _row_to_user_settings(row: sqlite3.Row) -> UserSettings:
+        return UserSettings(
+            user_id=int(row["user_id"]),
+            username=str(row["username"] or ""),
+            nickname=str(row["nickname"]) if row["nickname"] is not None else None,
+            language=str(row["language"] or "koreana"),
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
         )
 
     @staticmethod

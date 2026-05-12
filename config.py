@@ -164,7 +164,7 @@ class AppConfig:
                 "HIGH_FREQUENCY_POLL_INTERVAL_SECONDS", 60, minimum=60
             ),
             high_frequency_weekdays=_get_weekdays(
-                "HIGH_FREQUENCY_POLL_DAYS", (0, 1, 3)
+                "HIGH_FREQUENCY_POLL_DAYS", (0, 1, 2, 3, 4, 5, 6)
             ),
             high_frequency_start_hour=_get_int("HIGH_FREQUENCY_START_HOUR", 18, minimum=0),
             high_frequency_end_hour=_get_int("HIGH_FREQUENCY_END_HOUR", 20, minimum=1),
