@@ -23,6 +23,7 @@ LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
+ZIP_IMAGE_CONCURRENCY = 5
 BLOCKED_IMAGE_FRAGMENTS = (
     "1dc5775f3444c32d11acb9d57c03232157739877",
     "youtube_16x9_placeholder.gif",
@@ -551,14 +552,19 @@ class NewsCog(commands.Cog):
         count = 0
         used_names: set[str] = set()
         urls = _filter_image_urls(post.image_urls)
+        semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
+
+        tasks = [
+            asyncio.create_task(self._prepare_zip_image(semaphore, index, url))
+            for index, url in enumerate(urls)
+        ]
+        images = await asyncio.gather(*tasks)
+
         with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as archive:
-            for index, url in enumerate(urls):
-                data = await self._download_bytes(url)
-                if data is None:
+            for item in images:
+                if item is None:
                     continue
-                png_bytes = _to_png_bytes(data)
-                if png_bytes is None:
-                    continue
+                index, url, png_bytes = item
                 name = _unique_zip_name(used_names, index, url)
                 archive.writestr(name, png_bytes)
                 count += 1
@@ -568,6 +574,20 @@ class NewsCog(commands.Cog):
 
         buffer.seek(0)
         return buffer, count
+
+    async def _prepare_zip_image(
+        self, semaphore: asyncio.Semaphore, index: int, url: str
+    ) -> tuple[int, str, bytes] | None:
+        async with semaphore:
+            data = await self._download_bytes(url)
+            if data is None:
+                return None
+
+            png_bytes = await asyncio.to_thread(_to_png_bytes, data)
+            if png_bytes is None:
+                return None
+
+            return index, url, png_bytes
 
     async def _download_bytes(self, url: str) -> bytes | None:
         try:
