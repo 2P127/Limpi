@@ -6,6 +6,7 @@ import logging
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
+from time import perf_counter
 
 import aiohttp
 import discord
@@ -42,10 +43,46 @@ LANGUAGE_LABELS = {
 SYNC_LANGUAGES = ("koreana", "english", "japanese")
 
 
+class LoggingCommandTree(app_commands.CommandTree):
+    async def _call(self, interaction: discord.Interaction) -> None:
+        if interaction.type is not discord.InteractionType.application_command:
+            await super()._call(interaction)
+            return
+
+        started_at = perf_counter()
+        data = interaction.data if isinstance(interaction.data, dict) else {}
+        command_name = str(data.get("name") or "unknown")
+        status = "completed"
+
+        try:
+            await super()._call(interaction)
+            if interaction.command is not None:
+                command_name = interaction.command.qualified_name
+            if interaction.command_failed:
+                status = "failed"
+        except Exception:
+            status = "errored"
+            raise
+        finally:
+            elapsed = perf_counter() - started_at
+            user = interaction.user
+            guild = interaction.guild
+            LOGGER.info(
+                "Command %s by %s (%s) in guild %s (%s) %s in %.3fs.",
+                command_name,
+                user,
+                user.id,
+                guild.name if guild else "DM",
+                interaction.guild_id or "DM",
+                status,
+                elapsed,
+            )
+
+
 class LimpiBot(commands.Bot):
     def __init__(self, config: AppConfig) -> None:
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents)
+        super().__init__(command_prefix="!", intents=intents, tree_cls=LoggingCommandTree)
         self.config = config
         self._synced_connected_guilds = False
         self._cleared_global_commands = False

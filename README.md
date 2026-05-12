@@ -1,8 +1,8 @@
 # 림.컴 소식 봇 림피(Limpi)!
 
-![GitHub Repo stars](https://img.shields.io/github/stars/2P127/Limpi.git?style=flat-square)
-![GitHub forks](https://img.shields.io/github/forks/2P127/Limpi.git?style=flat-square)
-![GitHub watchers](https://img.shields.io/github/watchers/2P127/Limpi.git?style=flat-square)
+[![GitHub stars](https://img.shields.io/github/stars/2P127/Limpi?style=flat-square&logo=github)](https://github.com/2P127/Limpi)
+[![GitHub forks](https://img.shields.io/github/forks/2P127/Limpi?style=flat-square&logo=github)](https://github.com/2P127/Limpi/forks)
+[![GitHub watchers](https://img.shields.io/github/watchers/2P127/Limpi?style=flat-square&logo=github)](https://github.com/2P127/Limpi/watchers)
 
 ## 명령어
 
