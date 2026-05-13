@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from models import GuildSettings, NewsPost, ProjectMoonDrawing, TrackedMessage, UserSettings
+from models import GuildSettings, NewsPost, TrackedMessage, UserSettings
 
 
 DEFAULT_AUTO_CLEANUP_ENABLED = True
@@ -101,19 +101,6 @@ class SQLiteStorage:
                 )
                 """
             )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS project_moon_drawings (
-                    drawing_id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    image_urls TEXT NOT NULL DEFAULT '[]',
-                    created_at TEXT,
-                    raw_json TEXT NOT NULL DEFAULT '{}',
-                    saved_at TEXT NOT NULL
-                )
-                """
-            )
             self._ensure_column("guild_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column(
                 "guild_settings",
@@ -167,12 +154,6 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_user_settings_updated_at
                 ON user_settings(updated_at)
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_project_moon_drawings_created_at
-                ON project_moon_drawings(created_at DESC)
                 """
             )
             self._migrate_legacy_post_ids()
@@ -679,92 +660,6 @@ class SQLiteStorage:
         posts = [self._row_to_post(row) for row in rows]
         return _dedupe_posts_for_choices(posts, limit)
 
-    def save_project_moon_drawings(
-        self, drawings: Iterable[ProjectMoonDrawing]
-    ) -> int:
-        saved = 0
-        now = _now_iso()
-        with self._lock:
-            for drawing in drawings:
-                cursor = self._connection.execute(
-                    """
-                    INSERT INTO project_moon_drawings (
-                        drawing_id, title, url, image_urls, created_at, raw_json, saved_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(drawing_id) DO UPDATE SET
-                        title = excluded.title,
-                        url = excluded.url,
-                        image_urls = excluded.image_urls,
-                        created_at = excluded.created_at,
-                        raw_json = excluded.raw_json,
-                        saved_at = excluded.saved_at
-                    """,
-                    (
-                        drawing.drawing_id,
-                        drawing.title,
-                        drawing.url,
-                        json.dumps(drawing.image_urls, ensure_ascii=False),
-                        _datetime_to_iso(drawing.created_at),
-                        json.dumps(drawing.raw, ensure_ascii=False),
-                        now,
-                    ),
-                )
-                if cursor.rowcount:
-                    saved += 1
-            self._connection.commit()
-
-        return saved
-
-    def get_project_moon_drawing(
-        self, drawing_id: str
-    ) -> ProjectMoonDrawing | None:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM project_moon_drawings WHERE drawing_id = ?",
-                (drawing_id,),
-            ).fetchone()
-
-        return self._row_to_project_moon_drawing(row) if row else None
-
-    def list_project_moon_drawings(self, limit: int = 100) -> list[ProjectMoonDrawing]:
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT * FROM project_moon_drawings
-                ORDER BY created_at DESC, saved_at DESC
-                LIMIT ?
-                """,
-                (limit,),
-            ).fetchall()
-
-        return [self._row_to_project_moon_drawing(row) for row in rows]
-
-    def search_project_moon_drawings(
-        self, query: str, limit: int = 25
-    ) -> list[ProjectMoonDrawing]:
-        query = query.strip()
-        if query:
-            sql = """
-                SELECT * FROM project_moon_drawings
-                WHERE title LIKE ? OR drawing_id LIKE ?
-                ORDER BY created_at DESC, saved_at DESC
-                LIMIT ?
-            """
-            params: tuple[object, ...] = (f"%{query}%", f"%{query}%", limit)
-        else:
-            sql = """
-                SELECT * FROM project_moon_drawings
-                ORDER BY created_at DESC, saved_at DESC
-                LIMIT ?
-            """
-            params = (limit,)
-
-        with self._lock:
-            rows = self._connection.execute(sql, params).fetchall()
-
-        return [self._row_to_project_moon_drawing(row) for row in rows]
-
     def add_tracked_message(
         self, guild_id: int, channel_id: int, message_id: int
     ) -> None:
@@ -851,17 +746,6 @@ class SQLiteStorage:
             title=str(row["title"]),
             created_at=_datetime_from_iso(row["created_at"]),
             image_urls=json.loads(row["image_urls"]),
-            raw=json.loads(row["raw_json"]),
-        )
-
-    @staticmethod
-    def _row_to_project_moon_drawing(row: sqlite3.Row) -> ProjectMoonDrawing:
-        return ProjectMoonDrawing(
-            drawing_id=str(row["drawing_id"]),
-            title=str(row["title"]),
-            url=str(row["url"]),
-            image_urls=json.loads(row["image_urls"]),
-            created_at=_datetime_from_iso(row["created_at"]),
             raw=json.loads(row["raw_json"]),
         )
 

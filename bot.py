@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-import random
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -17,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import AppConfig
-from models import GuildSettings, NewsPost, ProjectMoonDrawing
+from models import GuildSettings, NewsPost
 from storage import MAX_CLEANUP_DAYS, MIN_CLEANUP_DAYS, SQLiteStorage
 from steam_client import NewsSource, build_news_source
 
@@ -27,7 +26,6 @@ LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
-PROJECT_MOON_DRAWINGS_PATH = Path(__file__).resolve().parent / "data" / "pm_drawings.json"
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
 ZIP_CACHE_MAX_ITEMS = 8
@@ -297,7 +295,6 @@ class NewsCog(commands.Cog):
         self._startup_synced = False
 
     async def cog_load(self) -> None:
-        self._sync_project_moon_drawings_from_file()
         if self.news_source is None:
             LOGGER.warning("News polling is disabled because no Steam news source is configured.")
             return
@@ -308,33 +305,6 @@ class NewsCog(commands.Cog):
     async def cog_unload(self) -> None:
         self.poll_news.cancel()
         self.cleanup_messages.cancel()
-
-    def _sync_project_moon_drawings_from_file(self) -> int:
-        if not PROJECT_MOON_DRAWINGS_PATH.exists():
-            return 0
-
-        try:
-            data = json.loads(PROJECT_MOON_DRAWINGS_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            LOGGER.exception("Failed to load Project Moon drawings from %s.", PROJECT_MOON_DRAWINGS_PATH)
-            return 0
-
-        if not isinstance(data, list):
-            LOGGER.warning("Project Moon drawings file must contain a JSON array.")
-            return 0
-
-        drawings: list[ProjectMoonDrawing] = []
-        for item in data:
-            drawing = _project_moon_drawing_from_raw(item)
-            if drawing is not None:
-                drawings.append(drawing)
-
-        if not drawings:
-            return 0
-
-        saved = self.storage.save_project_moon_drawings(drawings)
-        LOGGER.info("Loaded %s Project Moon drawings from %s.", saved, PROJECT_MOON_DRAWINGS_PATH)
-        return saved
 
     @tasks.loop(seconds=60)
     async def poll_news(self) -> None:
@@ -1613,61 +1583,6 @@ class NewsCog(commands.Cog):
             for post in posts
         ]
 
-    @app_commands.command(name="프문그림보기", description="프로젝트문 공식 계정의 그림만 골라 봅니다.")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(drawing="그림", private="나만보기")
-    @app_commands.describe(
-        drawing="비워두면 등록된 그림 중 하나를 랜덤으로 보여줍니다.",
-        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
-    )
-    async def project_moon_drawing(
-        self,
-        interaction: discord.Interaction,
-        drawing: str | None = None,
-        private: bool = True,
-    ) -> None:
-        self._sync_project_moon_drawings_from_file()
-
-        selected = self.storage.get_project_moon_drawing(drawing) if drawing else None
-        if selected is None and drawing:
-            matches = self.storage.search_project_moon_drawings(drawing, limit=1)
-            selected = matches[0] if matches else None
-        if selected is None and not drawing:
-            drawings = self.storage.list_project_moon_drawings(limit=200)
-            selected = random.choice(drawings) if drawings else None
-
-        if selected is None:
-            await interaction.response.send_message(
-                (
-                    "아직 등록된 프문 그림이 없어요.\n"
-                    "`data/pm_drawings.json`에 그림 URL과 이미지 URL을 추가한 뒤 다시 시도해주세요."
-                ),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        await interaction.response.send_message(
-            embeds=_project_moon_drawing_embeds(selected),
-            ephemeral=private,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @project_moon_drawing.autocomplete("drawing")
-    async def project_moon_drawing_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        self._sync_project_moon_drawings_from_file()
-        drawings = self.storage.search_project_moon_drawings(current, limit=25)
-        return [
-            app_commands.Choice(
-                name=_project_moon_drawing_choice_name(drawing),
-                value=drawing.drawing_id,
-            )
-            for drawing in drawings
-        ]
-
     @app_commands.command(name="명령어", description="림피의 모든 명령어 사용법을 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -1714,7 +1629,7 @@ class NewsCog(commands.Cog):
             name="/소식보내기",
             value=(
                 "저장된 소식을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
-                "채널·역할을 비우면 /봇서버설정 값을 사용합니다. (서버 관리 권한 필요)"
+                "채널·역할을 비우면 /서버설정 값을 사용합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
@@ -1724,11 +1639,6 @@ class NewsCog(commands.Cog):
                 "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
                 "서버와 앱 설치에서 모두 사용 가능하며, 기본은 나만보기입니다."
             ),
-            inline=False,
-        )
-        embed.add_field(
-            name="/프문그림보기",
-            value="등록된 프로젝트문 공식 그림만 랜덤 또는 선택해서 봅니다.",
             inline=False,
         )
         embed.add_field(
@@ -1874,54 +1784,6 @@ def _image_embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
         embeds[index : index + EMBEDS_PER_MESSAGE]
         for index in range(0, len(embeds), EMBEDS_PER_MESSAGE)
     ]
-
-
-def _project_moon_drawing_from_raw(raw: object) -> ProjectMoonDrawing | None:
-    if not isinstance(raw, dict):
-        return None
-
-    drawing_id = str(raw.get("id") or raw.get("drawing_id") or "").strip()
-    url = str(raw.get("url") or "").strip()
-    title = str(raw.get("title") or drawing_id or "Project Moon Drawing").strip()
-    image_urls = [
-        str(url).strip()
-        for url in raw.get("image_urls", [])
-        if str(url).strip()
-    ] if isinstance(raw.get("image_urls"), list) else []
-    created_at = _datetime_from_iso(raw.get("created_at"))
-
-    if not drawing_id or not url or not image_urls:
-        return None
-
-    return ProjectMoonDrawing(
-        drawing_id=drawing_id,
-        title=title,
-        url=url,
-        image_urls=image_urls,
-        created_at=created_at,
-        raw=dict(raw),
-    )
-
-
-def _project_moon_drawing_embeds(drawing: ProjectMoonDrawing) -> list[discord.Embed]:
-    embeds: list[discord.Embed] = []
-    for index, image_url in enumerate(drawing.image_urls, start=1):
-        embed = discord.Embed(
-            title=drawing.title[:256],
-            url=drawing.url,
-            color=discord.Color.from_rgb(179, 28, 28),
-            timestamp=drawing.created_at,
-        )
-        if index == 1:
-            embed.set_author(name="Project Moon Official")
-            embed.add_field(name="원문", value=f"[X에서 보기]({drawing.url})", inline=False)
-        embed.set_image(url=image_url)
-        embeds.append(embed)
-    return embeds[:EMBEDS_PER_MESSAGE]
-
-
-def _project_moon_drawing_choice_name(drawing: ProjectMoonDrawing) -> str:
-    return _truncate_choice_name(drawing.title or drawing.drawing_id)
 
 
 def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
