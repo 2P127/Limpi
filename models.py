@@ -17,6 +17,16 @@ class NewsPost:
 
 
 @dataclass(frozen=True)
+class ProjectMoonDrawing:
+    drawing_id: str
+    title: str
+    url: str
+    image_urls: list[str]
+    created_at: datetime | None
+    raw: dict
+
+
+@dataclass(frozen=True)
 class GuildSettings:
     guild_id: int
     channel_id: int | None
@@ -28,6 +38,7 @@ class GuildSettings:
     max_posts_per_poll: int
     auto_cleanup_enabled: bool
     auto_cleanup_days: int
+    image_delivery: str
 
 
 @dataclass(frozen=True)

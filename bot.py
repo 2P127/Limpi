@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from time import perf_counter
 from urllib.parse import urlparse
 
@@ -15,7 +17,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import AppConfig
-from models import GuildSettings, NewsPost
+from models import GuildSettings, NewsPost, ProjectMoonDrawing
 from storage import MAX_CLEANUP_DAYS, MIN_CLEANUP_DAYS, SQLiteStorage
 from steam_client import NewsSource, build_news_source
 
@@ -24,10 +26,13 @@ POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
+USER_COMMAND_COOLDOWN_SECONDS = 3.0
+PROJECT_MOON_DRAWINGS_PATH = Path(__file__).resolve().parent / "data" / "pm_drawings.json"
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
 ZIP_CACHE_MAX_ITEMS = 8
 IMAGE_CACHE_MAX_ITEMS = 128
+IMAGE_CACHE_WARM_POST_LIMIT = 5
 BLOCKED_IMAGE_FRAGMENTS = (
     "1dc5775f3444c32d11acb9d57c03232157739877",
     "62e63adbc551470064256668df2ba6cae5138cad",
@@ -41,6 +46,12 @@ LANGUAGE_CHOICES = [
     app_commands.Choice(name="English", value="english"),
     app_commands.Choice(name="日本語", value="japanese"),
 ]
+IMAGE_DELIVERY_FILES = "files"
+IMAGE_DELIVERY_EMBEDS = "embeds"
+IMAGE_DELIVERY_CHOICES = [
+    app_commands.Choice(name="첨부파일", value=IMAGE_DELIVERY_FILES),
+    app_commands.Choice(name="임베드", value=IMAGE_DELIVERY_EMBEDS),
+]
 LANGUAGE_LABELS = {
     "koreana": "한국어",
     "english": "English",
@@ -50,6 +61,10 @@ SYNC_LANGUAGES = ("koreana", "english", "japanese")
 
 
 class LoggingCommandTree(app_commands.CommandTree):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._user_command_cooldowns: dict[int, float] = {}
+
     async def _call(self, interaction: discord.Interaction) -> None:
         if interaction.type is not discord.InteractionType.application_command:
             await super()._call(interaction)
@@ -59,6 +74,22 @@ class LoggingCommandTree(app_commands.CommandTree):
         data = interaction.data if isinstance(interaction.data, dict) else {}
         command_name = str(data.get("name") or "unknown")
         status = "completed"
+        now = perf_counter()
+        user_id = interaction.user.id
+        last_used_at = self._user_command_cooldowns.get(user_id)
+        if last_used_at is not None:
+            remaining = USER_COMMAND_COOLDOWN_SECONDS - (now - last_used_at)
+            if remaining > 0:
+                status = "cooldown"
+                await interaction.response.send_message(
+                    f"명령어는 3초에 한 번만 사용할 수 있어요. {remaining:.1f}초 뒤 다시 시도해주세요.",
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+
+        self._user_command_cooldowns[user_id] = now
+        self._prune_user_command_cooldowns(now)
 
         try:
             await super()._call(interaction)
@@ -83,6 +114,19 @@ class LoggingCommandTree(app_commands.CommandTree):
                 status,
                 elapsed,
             )
+
+    def _prune_user_command_cooldowns(self, now: float) -> None:
+        if len(self._user_command_cooldowns) < 1000:
+            return
+
+        stale_before = now - (USER_COMMAND_COOLDOWN_SECONDS * 10)
+        stale_user_ids = [
+            user_id
+            for user_id, last_used_at in self._user_command_cooldowns.items()
+            if last_used_at < stale_before
+        ]
+        for user_id in stale_user_ids:
+            self._user_command_cooldowns.pop(user_id, None)
 
 
 class LimpiBot(commands.Bot):
@@ -195,6 +239,43 @@ class ZipDownloadButton(
         await cog.handle_zip_request(interaction, self.post_id)
 
 
+class ExternalNewsSendConfirmView(discord.ui.View):
+    def __init__(self, author_id: int) -> None:
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.confirmed: bool | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+
+        await interaction.response.send_message(
+            "이 확인 버튼은 명령어를 실행한 사람만 누를 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="네!", style=discord.ButtonStyle.danger)
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.confirmed = True
+        await interaction.response.defer()
+        self.stop()
+
+    @discord.ui.button(label="아니요...생각해볼깨요", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.confirmed = False
+        await interaction.response.defer()
+        self.stop()
+
+
 class NewsCog(commands.Cog):
     def __init__(
         self,
@@ -216,6 +297,7 @@ class NewsCog(commands.Cog):
         self._startup_synced = False
 
     async def cog_load(self) -> None:
+        self._sync_project_moon_drawings_from_file()
         if self.news_source is None:
             LOGGER.warning("News polling is disabled because no Steam news source is configured.")
             return
@@ -226,6 +308,33 @@ class NewsCog(commands.Cog):
     async def cog_unload(self) -> None:
         self.poll_news.cancel()
         self.cleanup_messages.cancel()
+
+    def _sync_project_moon_drawings_from_file(self) -> int:
+        if not PROJECT_MOON_DRAWINGS_PATH.exists():
+            return 0
+
+        try:
+            data = json.loads(PROJECT_MOON_DRAWINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.exception("Failed to load Project Moon drawings from %s.", PROJECT_MOON_DRAWINGS_PATH)
+            return 0
+
+        if not isinstance(data, list):
+            LOGGER.warning("Project Moon drawings file must contain a JSON array.")
+            return 0
+
+        drawings: list[ProjectMoonDrawing] = []
+        for item in data:
+            drawing = _project_moon_drawing_from_raw(item)
+            if drawing is not None:
+                drawings.append(drawing)
+
+        if not drawings:
+            return 0
+
+        saved = self.storage.save_project_moon_drawings(drawings)
+        LOGGER.info("Loaded %s Project Moon drawings from %s.", saved, PROJECT_MOON_DRAWINGS_PATH)
+        return saved
 
     @tasks.loop(seconds=60)
     async def poll_news(self) -> None:
@@ -337,6 +446,7 @@ class NewsCog(commands.Cog):
 
         if all_posts:
             self.storage.save_posts(all_posts)
+            self._schedule_image_cache_warmup(all_posts)
         return posts_by_language
 
     def _settings_by_language(self) -> dict[str, list[GuildSettings]]:
@@ -349,6 +459,58 @@ class NewsCog(commands.Cog):
     def _interaction_uses_user_install(self, interaction: discord.Interaction) -> bool:
         owners = getattr(interaction, "_integration_owners", {}) or {}
         return 1 in owners
+
+    def _bot_is_missing_from_interaction_guild(
+        self, interaction: discord.Interaction
+    ) -> bool:
+        return interaction.guild_id is not None and self.bot.get_guild(interaction.guild_id) is None
+
+    def _requires_external_news_send_confirmation(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        return interaction.guild_id is None or self._bot_is_missing_from_interaction_guild(interaction)
+
+    async def _confirm_external_news_send(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if not self._requires_external_news_send_confirmation(interaction):
+            return True
+
+        embed = discord.Embed(
+            title="정말 봇이 없는 서버(DM)에서 이 소식을 보내시겠습니까?",
+            description="당사자가 불편해 할 수도 있으니 생각하고 결정해주세요!",
+            color=discord.Color.from_rgb(179, 28, 28),
+        )
+        view = ExternalNewsSendConfirmView(interaction.user.id)
+        await interaction.response.send_message(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        await view.wait()
+        if view.confirmed:
+            await interaction.edit_original_response(
+                content="소식을 보낼게요.",
+                embed=None,
+                view=None,
+            )
+            return True
+
+        message = (
+            "소식 보내기를 취소했어요."
+            if view.confirmed is False
+            else "시간이 지나 소식 보내기를 취소했어요."
+        )
+        await interaction.edit_original_response(
+            content=message,
+            embed=None,
+            view=None,
+        )
+        return False
 
     def _interaction_user_values(
         self, interaction: discord.Interaction
@@ -376,6 +538,11 @@ class NewsCog(commands.Cog):
             self._remember_interaction_user(interaction)
             return self.storage.get_user_settings(interaction.user.id).language
         return self.storage.get_settings(interaction.guild_id).language
+
+    def _interaction_image_delivery(self, interaction: discord.Interaction) -> str:
+        if interaction.guild_id is None or self._interaction_uses_user_install(interaction):
+            return IMAGE_DELIVERY_FILES
+        return self.storage.get_settings(interaction.guild_id).image_delivery
 
     def _should_poll_now(self, now: datetime) -> bool:
         if self._last_poll_at is None:
@@ -499,13 +666,20 @@ class NewsCog(commands.Cog):
         settings: GuildSettings,
         post: NewsPost,
     ) -> None:
-        await self._broadcast_post(channel, post, settings.role_id)
+        await self._broadcast_post(
+            channel,
+            post,
+            settings.role_id,
+            image_delivery=settings.image_delivery,
+        )
 
     async def _broadcast_post(
         self,
         channel: discord.abc.Messageable,
         post: NewsPost,
         role_id: int | None,
+        *,
+        image_delivery: str = IMAGE_DELIVERY_FILES,
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -515,14 +689,17 @@ class NewsCog(commands.Cog):
         )
 
         groups = _embed_groups_for_post(post)
-        view = _build_view_for_post(post)
+        file_batches_task = (
+            self._start_image_file_batches_task(post)
+            if image_delivery == IMAGE_DELIVERY_FILES
+            else None
+        )
 
         first, *rest = groups if groups else ([],)
         await channel.send(
             content=mention,
             embeds=first,
             allowed_mentions=allowed_mentions,
-            view=view if view is not None else discord.utils.MISSING,
         )
 
         for extra_embeds in rest:
@@ -537,7 +714,14 @@ class NewsCog(commands.Cog):
                 content=youtube_content,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-        self._schedule_channel_image_messages(channel, post)
+        if image_delivery == IMAGE_DELIVERY_EMBEDS:
+            self._schedule_channel_image_embed_messages(channel, post)
+        else:
+            self._schedule_channel_image_messages(
+                channel,
+                post,
+                file_batches_task=file_batches_task,
+            )
 
     async def _send_news_post_followups(
         self,
@@ -548,13 +732,19 @@ class NewsCog(commands.Cog):
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
         groups = _embed_groups_for_post(post)
-        view = _build_view_for_post(post)
         first, *rest = groups if groups else ([],)
+        image_delivery = self._interaction_image_delivery(interaction)
+        use_image_embeds = (
+            self._bot_is_missing_from_interaction_guild(interaction)
+            or image_delivery == IMAGE_DELIVERY_EMBEDS
+        )
+        file_batches_task = (
+            None if use_image_embeds else self._start_image_file_batches_task(post)
+        )
 
         sent_messages.append(
             await interaction.followup.send(
                 embeds=first,
-                view=view if view is not None else discord.utils.MISSING,
                 ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
                 wait=True,
@@ -582,14 +772,42 @@ class NewsCog(commands.Cog):
                 )
             )
 
-        if private:
-            self._schedule_interaction_image_followups(interaction, post, private=True)
+        if self._bot_is_missing_from_interaction_guild(interaction):
+            self._schedule_interaction_image_embed_followups(
+                interaction,
+                post,
+                private=private,
+            )
+        elif image_delivery == IMAGE_DELIVERY_EMBEDS and private:
+            self._schedule_interaction_image_embed_followups(
+                interaction,
+                post,
+                private=True,
+            )
+        elif image_delivery == IMAGE_DELIVERY_EMBEDS and isinstance(
+            interaction.channel,
+            discord.abc.Messageable,
+        ):
+            self._schedule_channel_image_embed_messages(
+                interaction.channel,
+                post,
+                track_guild_id=interaction.guild_id,
+                track_channel_id=interaction.channel_id,
+            )
+        elif private:
+            self._schedule_interaction_image_followups(
+                interaction,
+                post,
+                private=True,
+                file_batches_task=file_batches_task,
+            )
         elif isinstance(interaction.channel, discord.abc.Messageable):
             self._schedule_channel_image_messages(
                 interaction.channel,
                 post,
                 track_guild_id=interaction.guild_id,
                 track_channel_id=interaction.channel_id,
+                file_batches_task=file_batches_task,
             )
         return sent_messages
 
@@ -698,6 +916,7 @@ class NewsCog(commands.Cog):
         *,
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
+        file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
     ) -> None:
         if not _filter_image_urls(post.image_urls):
             return
@@ -708,6 +927,7 @@ class NewsCog(commands.Cog):
                 post,
                 track_guild_id=track_guild_id,
                 track_channel_id=track_channel_id,
+                file_batches_task=file_batches_task,
             )
         )
         task.add_done_callback(self._log_background_task_result)
@@ -718,12 +938,54 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         private: bool,
+        file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
     ) -> None:
         if not _filter_image_urls(post.image_urls):
             return
 
         task = asyncio.create_task(
-            self._send_interaction_image_followups(interaction, post, private=private)
+            self._send_interaction_image_followups(
+                interaction,
+                post,
+                private=private,
+                file_batches_task=file_batches_task,
+            )
+        )
+        task.add_done_callback(self._log_background_task_result)
+
+    def _schedule_interaction_image_embed_followups(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        *,
+        private: bool,
+    ) -> None:
+        if not _filter_image_urls(post.image_urls):
+            return
+
+        task = asyncio.create_task(
+            self._send_interaction_image_embed_followups(interaction, post, private=private)
+        )
+        task.add_done_callback(self._log_background_task_result)
+
+    def _schedule_channel_image_embed_messages(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+        *,
+        track_guild_id: int | None = None,
+        track_channel_id: int | None = None,
+    ) -> None:
+        if not _filter_image_urls(post.image_urls):
+            return
+
+        task = asyncio.create_task(
+            self._send_channel_image_embed_messages(
+                channel,
+                post,
+                track_guild_id=track_guild_id,
+                track_channel_id=track_channel_id,
+            )
         )
         task.add_done_callback(self._log_background_task_result)
 
@@ -734,13 +996,77 @@ class NewsCog(commands.Cog):
         *,
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
+        file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
     ) -> None:
-        for file_batch in await self._image_file_batches_for_post(post):
-            message = await channel.send(
-                files=file_batch,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        target = await self._resolve_background_channel(channel, track_channel_id)
+        if target is None:
+            LOGGER.debug("Skipping image attachments because the target channel is unavailable.")
+            return
+
+        for file_batch in await self._resolve_image_file_batches(post, file_batches_task):
+            try:
+                message = await target.send(
+                    files=file_batch,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.debug(
+                    "Skipping image attachments because channel %s is no longer accessible.",
+                    track_channel_id or getattr(target, "id", "unknown"),
+                )
+                return
             await self._track_manual_message(track_guild_id, track_channel_id, message)
+
+    async def _send_channel_image_embed_messages(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+        *,
+        track_guild_id: int | None = None,
+        track_channel_id: int | None = None,
+    ) -> None:
+        target = await self._resolve_background_channel(channel, track_channel_id)
+        if target is None:
+            LOGGER.debug("Skipping image embeds because the target channel is unavailable.")
+            return
+
+        view = _build_view_for_post(post)
+        for index, embed_batch in enumerate(_image_embed_groups_for_post(post)):
+            try:
+                message = await target.send(
+                    embeds=embed_batch,
+                    view=(
+                        view
+                        if index == 0 and view is not None
+                        else discord.utils.MISSING
+                    ),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.debug(
+                    "Skipping image embeds because channel %s is no longer accessible.",
+                    track_channel_id or getattr(target, "id", "unknown"),
+                )
+                return
+            await self._track_manual_message(track_guild_id, track_channel_id, message)
+
+    async def _resolve_background_channel(
+        self,
+        channel: discord.abc.Messageable,
+        channel_id: int | None,
+    ) -> discord.abc.Messageable | None:
+        if channel_id is None:
+            return channel
+
+        cached = self.bot.get_channel(channel_id)
+        if isinstance(cached, discord.abc.Messageable):
+            return cached
+
+        try:
+            fetched = await self.bot.fetch_channel(channel_id)
+        except (discord.Forbidden, discord.NotFound):
+            return None
+        return fetched if isinstance(fetched, discord.abc.Messageable) else None
 
     async def _send_interaction_image_followups(
         self,
@@ -748,14 +1074,50 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         private: bool,
+        file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
     ) -> None:
-        for file_batch in await self._image_file_batches_for_post(post):
-            message = await interaction.followup.send(
-                files=file_batch,
-                ephemeral=private,
-                allowed_mentions=discord.AllowedMentions.none(),
-                wait=True,
-            )
+        for file_batch in await self._resolve_image_file_batches(post, file_batches_task):
+            try:
+                message = await interaction.followup.send(
+                    files=file_batch,
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.debug("Skipping image followups because the interaction is no longer accessible.")
+                return
+            if not private:
+                await self._track_manual_message(
+                    interaction.guild_id,
+                    interaction.channel_id,
+                    message,
+                )
+
+    async def _send_interaction_image_embed_followups(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        *,
+        private: bool,
+    ) -> None:
+        view = _build_view_for_post(post)
+        for index, embed_batch in enumerate(_image_embed_groups_for_post(post)):
+            try:
+                message = await interaction.followup.send(
+                    embeds=embed_batch,
+                    view=(
+                        view
+                        if index == 0 and view is not None
+                        else discord.utils.MISSING
+                    ),
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.debug("Skipping image embed followups because the interaction is no longer accessible.")
+                return
             if not private:
                 await self._track_manual_message(
                     interaction.guild_id,
@@ -770,7 +1132,61 @@ class NewsCog(commands.Cog):
         except asyncio.CancelledError:
             pass
         except Exception:
-            LOGGER.exception("Background image attachment send failed.")
+            LOGGER.exception("Background image send failed.")
+
+    def _start_image_file_batches_task(
+        self, post: NewsPost
+    ) -> asyncio.Task[list[list[discord.File]]] | None:
+        if not _filter_image_urls(post.image_urls):
+            return None
+        task = asyncio.create_task(self._image_file_batches_for_post(post))
+        task.add_done_callback(self._log_image_prefetch_task_result)
+        return task
+
+    @staticmethod
+    def _log_image_prefetch_task_result(
+        task: asyncio.Task[list[list[discord.File]]],
+    ) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    async def _resolve_image_file_batches(
+        self,
+        post: NewsPost,
+        file_batches_task: asyncio.Task[list[list[discord.File]]] | None,
+    ) -> list[list[discord.File]]:
+        if file_batches_task is not None:
+            return await file_batches_task
+        return await self._image_file_batches_for_post(post)
+
+    def _schedule_image_cache_warmup(self, posts: list[NewsPost]) -> None:
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        for post in posts[: IMAGE_CACHE_WARM_POST_LIMIT * len(SYNC_LANGUAGES)]:
+            for url in _filter_image_urls(post.image_urls):
+                if url in seen_urls or url in self._image_cache:
+                    continue
+                seen_urls.add(url)
+                urls.append(url)
+
+        if not urls:
+            return
+
+        task = asyncio.create_task(self._warm_image_cache(urls))
+        task.add_done_callback(self._log_background_task_result)
+
+    async def _warm_image_cache(self, urls: list[str]) -> None:
+        semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
+
+        async def warm_one(url: str) -> None:
+            async with semaphore:
+                await self._download_image(url)
+
+        await asyncio.gather(*(warm_one(url) for url in urls))
 
     async def _image_file_batches_for_post(self, post: NewsPost) -> list[list[discord.File]]:
         urls = _filter_image_urls(post.image_urls)
@@ -849,7 +1265,7 @@ class NewsCog(commands.Cog):
             return
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
-    @app_commands.command(name="림피서버설정", description="서버의 림피 알림 채널, 역할, 언어를 설정합니다.")
+    @app_commands.command(name="서버설정", description="서버의 봇 알림 채널, 역할, 언어를 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
@@ -861,6 +1277,7 @@ class NewsCog(commands.Cog):
         language="언어",
         auto_cleanup="자동삭제",
         cleanup_days="자동삭제일수",
+        image_delivery="이미지전송",
     )
     @app_commands.describe(
         channel="공지할 채널입니다. 비워두면 현재 채널을 사용합니다.",
@@ -869,9 +1286,11 @@ class NewsCog(commands.Cog):
         language="Steam 뉴스 언어입니다.",
         auto_cleanup="조회한 소식 메시지를 일정 시간 뒤 자동으로 지울지 여부입니다.",
         cleanup_days="자동 삭제까지의 유예 기간(일)입니다. 1~7 사이로 입력합니다.",
+        image_delivery="소식 이미지 전송 방식입니다.",
     )
     @app_commands.choices(
         language=LANGUAGE_CHOICES,
+        image_delivery=IMAGE_DELIVERY_CHOICES,
     )
     async def configure(
         self,
@@ -882,6 +1301,7 @@ class NewsCog(commands.Cog):
         language: app_commands.Choice[str] | None = None,
         auto_cleanup: bool | None = None,
         cleanup_days: int | None = None,
+        image_delivery: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
@@ -906,12 +1326,14 @@ class NewsCog(commands.Cog):
             language=language.value if language else None,
             auto_cleanup_enabled=auto_cleanup,
             auto_cleanup_days=cleanup_days,
+            image_delivery=image_delivery.value if image_delivery else None,
         )
         channel_text = f"<#{settings.channel_id}>" if settings.channel_id else "미설정"
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
         language_text = _language_label(settings.language)
         cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
+        image_delivery_text = _image_delivery_label(settings.image_delivery)
         embed = discord.Embed(
             title="설정이 완료되었어요~!",
             description=(
@@ -920,7 +1342,8 @@ class NewsCog(commands.Cog):
                 f"새 게시물 자동 알림: {enabled_text}\n"
                 f"언어: {language_text}\n"
                 f"조회 메시지 자동 삭제: {cleanup_text}\n"
-                f"자동 삭제 유예: {settings.auto_cleanup_days}일"
+                f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
+                f"이미지 전송: {image_delivery_text}"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
         )
@@ -931,7 +1354,7 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="림피유저설정", description="앱에서 사용할 림피 개인 언어를 설정합니다.")
+    @app_commands.command(name="유저설정", description="앱에서 사용할 봇 개인 언어를 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.rename(language="언어")
@@ -959,7 +1382,7 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="림피역할해제", description="새 소식 알림의 역할 핑을 제거합니다.")
+    @app_commands.command(name="역할핑해제", description="새 소식 알림의 역할 핑을 제거합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
@@ -972,7 +1395,7 @@ class NewsCog(commands.Cog):
         self.storage.clear_role(interaction.guild_id)
         await interaction.response.send_message("역할 핑을 제거했어요.", ephemeral=True)
 
-    @app_commands.command(name="림피상태", description="현재 림피 알림 설정을 확인합니다.")
+    @app_commands.command(name="서버설정상태", description="현재 림피 봇의 알림 설정을 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
@@ -988,6 +1411,7 @@ class NewsCog(commands.Cog):
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
         cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
+        image_delivery_text = _image_delivery_label(settings.image_delivery)
 
         await interaction.response.send_message(
             (
@@ -997,6 +1421,7 @@ class NewsCog(commands.Cog):
                 f"언어: {_language_label(settings.language)}\n"
                 f"조회 메시지 자동 삭제: {cleanup_text}\n"
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
+                f"이미지 전송: {image_delivery_text}\n"
                 f"뉴스 소스: {source_status}"
             ),
             ephemeral=True,
@@ -1025,7 +1450,11 @@ class NewsCog(commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=private, thinking=True)
+        if not await self._confirm_external_news_send(interaction):
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private, thinking=True)
         sent_messages = await self._send_news_post_followups(
             interaction,
             post,
@@ -1059,7 +1488,11 @@ class NewsCog(commands.Cog):
     @app_commands.describe(private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.")
     async def recent_news(self, interaction: discord.Interaction, private: bool = True) -> None:
         language = self._interaction_language(interaction)
-        await interaction.response.defer(ephemeral=private, thinking=True)
+        if not await self._confirm_external_news_send(interaction):
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private, thinking=True)
 
         post: NewsPost | None = None
         if self.news_source is not None:
@@ -1070,6 +1503,7 @@ class NewsCog(commands.Cog):
                 fresh = []
             if fresh:
                 self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
+                self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
                 post = fresh[0]
 
         if post is None:
@@ -1104,8 +1538,8 @@ class NewsCog(commands.Cog):
     @app_commands.rename(title="게시물", channel="채널", role="역할")
     @app_commands.describe(
         title="보낼 게시물을 선택합니다.",
-        channel="보낼 채널입니다. 비워두면 /림피서버설정에서 지정한 채널을 사용합니다.",
-        role="함께 핑할 역할입니다. 비워두면 /림피서버설정에서 지정한 역할을 사용합니다.",
+        channel="보낼 채널입니다. 비워두면 /서버설정에서 지정한 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
     )
     async def send_news(
         self,
@@ -1124,7 +1558,7 @@ class NewsCog(commands.Cog):
         target = await self._resolve_target_channel(channel, settings.channel_id)
         if target is None:
             await interaction.response.send_message(
-                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /림피서버설정으로 채널을 설정해주세요.",
+                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /서버설정으로 채널을 설정해주세요.",
                 ephemeral=True,
             )
             return
@@ -1146,7 +1580,12 @@ class NewsCog(commands.Cog):
         where = f"<#{channel_id}>" if channel_id else "지정한 채널"
 
         try:
-            await self._broadcast_post(target, post, role_id)
+            await self._broadcast_post(
+                target,
+                post,
+                role_id,
+                image_delivery=settings.image_delivery,
+            )
         except discord.Forbidden:
             await interaction.followup.send(
                 f"{where}에 메시지를 보낼 권한이 없어요.", ephemeral=True
@@ -1174,6 +1613,61 @@ class NewsCog(commands.Cog):
             for post in posts
         ]
 
+    @app_commands.command(name="프문그림보기", description="프로젝트문 공식 계정의 그림만 골라 봅니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(drawing="그림", private="나만보기")
+    @app_commands.describe(
+        drawing="비워두면 등록된 그림 중 하나를 랜덤으로 보여줍니다.",
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+    )
+    async def project_moon_drawing(
+        self,
+        interaction: discord.Interaction,
+        drawing: str | None = None,
+        private: bool = True,
+    ) -> None:
+        self._sync_project_moon_drawings_from_file()
+
+        selected = self.storage.get_project_moon_drawing(drawing) if drawing else None
+        if selected is None and drawing:
+            matches = self.storage.search_project_moon_drawings(drawing, limit=1)
+            selected = matches[0] if matches else None
+        if selected is None and not drawing:
+            drawings = self.storage.list_project_moon_drawings(limit=200)
+            selected = random.choice(drawings) if drawings else None
+
+        if selected is None:
+            await interaction.response.send_message(
+                (
+                    "아직 등록된 프문 그림이 없어요.\n"
+                    "`data/pm_drawings.json`에 그림 URL과 이미지 URL을 추가한 뒤 다시 시도해주세요."
+                ),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await interaction.response.send_message(
+            embeds=_project_moon_drawing_embeds(selected),
+            ephemeral=private,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @project_moon_drawing.autocomplete("drawing")
+    async def project_moon_drawing_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        self._sync_project_moon_drawings_from_file()
+        drawings = self.storage.search_project_moon_drawings(current, limit=25)
+        return [
+            app_commands.Choice(
+                name=_project_moon_drawing_choice_name(drawing),
+                value=drawing.drawing_id,
+            )
+            for drawing in drawings
+        ]
+
     @app_commands.command(name="명령어", description="림피의 모든 명령어 사용법을 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -1184,25 +1678,25 @@ class NewsCog(commands.Cog):
             description="림버스 컴퍼니 스팀 뉴스를 가져오는 봇이에요.",
         )
         embed.add_field(
-            name="/림피서버설정",
+            name="/서버설정",
             value=(
-                "채널, 역할, 언어, 자동 알림, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
+                "채널, 역할, 언어, 이미지 전송, 자동 알림, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
                 "서버에서만 사용 가능 (서버 관리 권한 필요)."
             ),
             inline=False,
         )
         embed.add_field(
-            name="/림피유저설정",
+            name="/유저설정",
             value="앱으로 사용할 때의 개인 언어를 설정합니다.",
             inline=False,
         )
         embed.add_field(
-            name="/림피상태",
-            value="현재 림피 설정과 뉴스 소스를 보여줍니다. (서버 전용)",
+            name="/서버설정상태",
+            value="현재 봇 서버 설정과 뉴스 소스를 보여줍니다. (서버 전용)",
             inline=False,
         )
         embed.add_field(
-            name="/림피역할해제",
+            name="/역할핑해제",
             value="새 소식 알림에 붙는 역할 핑을 제거합니다. (서버 전용)",
             inline=False,
         )
@@ -1220,7 +1714,7 @@ class NewsCog(commands.Cog):
             name="/소식보내기",
             value=(
                 "저장된 소식을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
-                "채널·역할을 비우면 /림피서버설정 값을 사용합니다. (서버 관리 권한 필요)"
+                "채널·역할을 비우면 /봇서버설정 값을 사용합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
@@ -1230,6 +1724,11 @@ class NewsCog(commands.Cog):
                 "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
                 "서버와 앱 설치에서 모두 사용 가능하며, 기본은 나만보기입니다."
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/프문그림보기",
+            value="등록된 프로젝트문 공식 그림만 랜덤 또는 선택해서 봅니다.",
             inline=False,
         )
         embed.add_field(
@@ -1364,6 +1863,67 @@ def _embed_groups_for_post(
     ]
 
 
+def _image_embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
+    embeds: list[discord.Embed] = []
+    for image_url in _filter_image_urls(post.image_urls):
+        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
+        embed.set_image(url=image_url)
+        embeds.append(embed)
+
+    return [
+        embeds[index : index + EMBEDS_PER_MESSAGE]
+        for index in range(0, len(embeds), EMBEDS_PER_MESSAGE)
+    ]
+
+
+def _project_moon_drawing_from_raw(raw: object) -> ProjectMoonDrawing | None:
+    if not isinstance(raw, dict):
+        return None
+
+    drawing_id = str(raw.get("id") or raw.get("drawing_id") or "").strip()
+    url = str(raw.get("url") or "").strip()
+    title = str(raw.get("title") or drawing_id or "Project Moon Drawing").strip()
+    image_urls = [
+        str(url).strip()
+        for url in raw.get("image_urls", [])
+        if str(url).strip()
+    ] if isinstance(raw.get("image_urls"), list) else []
+    created_at = _datetime_from_iso(raw.get("created_at"))
+
+    if not drawing_id or not url or not image_urls:
+        return None
+
+    return ProjectMoonDrawing(
+        drawing_id=drawing_id,
+        title=title,
+        url=url,
+        image_urls=image_urls,
+        created_at=created_at,
+        raw=dict(raw),
+    )
+
+
+def _project_moon_drawing_embeds(drawing: ProjectMoonDrawing) -> list[discord.Embed]:
+    embeds: list[discord.Embed] = []
+    for index, image_url in enumerate(drawing.image_urls, start=1):
+        embed = discord.Embed(
+            title=drawing.title[:256],
+            url=drawing.url,
+            color=discord.Color.from_rgb(179, 28, 28),
+            timestamp=drawing.created_at,
+        )
+        if index == 1:
+            embed.set_author(name="Project Moon Official")
+            embed.add_field(name="원문", value=f"[X에서 보기]({drawing.url})", inline=False)
+        embed.set_image(url=image_url)
+        embeds.append(embed)
+    return embeds[:EMBEDS_PER_MESSAGE]
+
+
+def _project_moon_drawing_choice_name(drawing: ProjectMoonDrawing) -> str:
+    return _truncate_choice_name(drawing.title or drawing.drawing_id)
+
+
 def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
     groups = _embed_groups_for_post(post)
     return groups[0] if groups else []
@@ -1379,6 +1939,12 @@ def _build_view_for_post(post: NewsPost) -> discord.ui.View | None:
 
 def _language_label(language: str) -> str:
     return LANGUAGE_LABELS.get(language, language)
+
+
+def _image_delivery_label(image_delivery: str) -> str:
+    if image_delivery == IMAGE_DELIVERY_EMBEDS:
+        return "임베드"
+    return "첨부파일"
 
 
 def _youtube_links_content(post: NewsPost) -> str | None:
