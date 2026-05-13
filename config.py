@@ -45,7 +45,16 @@ def _load_dotenv_if_available() -> None:
     except ImportError:
         return
 
-    load_dotenv()
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        # Frozen exe: prefer .env next to the exe (user can override), fall back to bundled copy
+        exe_dir = os.path.dirname(_sys.executable)
+        env_path = os.path.join(exe_dir, ".env")
+        if not os.path.exists(env_path):
+            env_path = os.path.join(getattr(_sys, "_MEIPASS", exe_dir), ".env")
+        load_dotenv(dotenv_path=env_path)
+    else:
+        load_dotenv()
 
 
 def _get_bool(name: str, default: bool) -> bool:

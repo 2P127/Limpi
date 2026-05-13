@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import io
 import logging
+import logging.handlers
+import os
+import sys
 import re
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -29,7 +33,10 @@ USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
 ZIP_CACHE_MAX_ITEMS = 8
-IMAGE_CACHE_MAX_ITEMS = 128
+# 메모리 풋프린트 제한: 큰 이미지가 캐시를 점령하지 못하게 항목 수 + 총 바이트 + 항목당 상한을 둡니다.
+IMAGE_CACHE_MAX_ITEMS = 64
+IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024   # 누적 64 MB 상한
+IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024  # 항목당 4 MB 초과 시 캐시하지 않음
 IMAGE_CACHE_WARM_POST_LIMIT = 5
 BLOCKED_IMAGE_FRAGMENTS = (
     "1dc5775f3444c32d11acb9d57c03232157739877",
@@ -293,8 +300,10 @@ class NewsCog(commands.Cog):
         self._poll_lock = asyncio.Lock()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
+        self._image_cache_bytes: int = 0
         self._last_poll_at: datetime | None = None
         self._startup_synced = False
+        self._in_high_frequency_window: bool = False
 
     async def cog_load(self) -> None:
         if self.news_source is None:
@@ -313,6 +322,18 @@ class NewsCog(commands.Cog):
         async with self._poll_lock:
             try:
                 now = datetime.now(timezone.utc)
+                currently_in_window = self._is_high_frequency_window(now)
+                if currently_in_window and not self._in_high_frequency_window:
+                    LOGGER.info(
+                        "뉴스 고빈도 추적 시작 (KST %s시~%s시, 요일 필터: %s).",
+                        self.config.high_frequency_start_hour,
+                        self.config.high_frequency_end_hour,
+                        self.config.high_frequency_weekdays,
+                    )
+                elif not currently_in_window and self._in_high_frequency_window:
+                    LOGGER.info("뉴스 고빈도 추적 종료.")
+                self._in_high_frequency_window = currently_in_window
+
                 if not self._should_poll_now(now):
                     return
                 self._last_poll_at = now
@@ -331,6 +352,11 @@ class NewsCog(commands.Cog):
             await self._cleanup_expired_messages()
         except Exception:
             LOGGER.exception("Tracked message cleanup failed.")
+        # 장시간 가동 시 cyclic GC가 잘 안 도는 큰 객체(이미지 바이트 등)를 회수해
+        # RSS가 우상향하는 현상을 막습니다.
+        collected = gc.collect()
+        if collected:
+            LOGGER.debug("gc.collect 정리 객체 수: %s", collected)
 
     @cleanup_messages.before_loop
     async def before_cleanup_messages(self) -> None:
@@ -575,6 +601,7 @@ class NewsCog(commands.Cog):
         for post in new_posts:
             await self._send_news_post(channel, settings, post)
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
+            LOGGER.info("새 뉴스 공지 (guild %s): %s", settings.guild_id, post.title)
             announced += 1
 
         self.storage.mark_posts_seen(
@@ -1259,6 +1286,8 @@ class NewsCog(commands.Cog):
     async def _download_image(self, url: str) -> tuple[bytes, str | None] | None:
         cached = self._image_cache.get(url)
         if cached is not None:
+            # Hit: dict 끝으로 재삽입해 LRU 신선도 갱신 (Python dict는 삽입 순서 보존).
+            self._image_cache[url] = self._image_cache.pop(url)
             return cached
 
         try:
@@ -1275,10 +1304,23 @@ class NewsCog(commands.Cog):
             return None
 
     def _cache_image(self, url: str, data: bytes, content_type: str | None) -> None:
+        size = len(data)
+        # 단발성 거대 이미지가 캐시를 폭발시키지 않도록 항목당 상한 통과 못하면 스킵.
+        if size > IMAGE_CACHE_MAX_ITEM_BYTES:
+            return
+        prev = self._image_cache.pop(url, None)
+        if prev is not None:
+            self._image_cache_bytes -= len(prev[0])
         self._image_cache[url] = (data, content_type)
-        while len(self._image_cache) > IMAGE_CACHE_MAX_ITEMS:
-            oldest_url = next(iter(self._image_cache))
+        self._image_cache_bytes += size
+        # 항목 수 또는 누적 바이트 중 하나라도 초과하면 가장 오래된 항목부터 evict (LRU).
+        while self._image_cache and (
+            len(self._image_cache) > IMAGE_CACHE_MAX_ITEMS
+            or self._image_cache_bytes > IMAGE_CACHE_MAX_BYTES
+        ):
+            oldest_url, (oldest_data, _) = next(iter(self._image_cache.items()))
             self._image_cache.pop(oldest_url, None)
+            self._image_cache_bytes -= len(oldest_data)
 
     def _cache_zip(self, post_id: str, zip_bytes: bytes, count: int) -> None:
         self._zip_cache[post_id] = (zip_bytes, count)
@@ -2035,10 +2077,41 @@ def _safe_zip_filename(post: NewsPost) -> str:
 
 
 async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    _log_dir = os.path.join(_base, "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _now = datetime.now()
+    _log_file = os.path.join(
+        _log_dir,
+        f"limpi_{_now.strftime('%Y-%m-%d')}-{_now.hour}_{_now.strftime('%M_%S')}.log",
     )
+    _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _file_handler = logging.FileHandler(_log_file, encoding="utf-8")
+    _file_handler.setFormatter(_fmt)
+    import io as _io
+    _stdout_stream = (
+        _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+        if hasattr(sys.stdout, "buffer")
+        else sys.stdout
+    )
+    _console_handler = logging.StreamHandler(_stdout_stream)
+    _console_handler.setFormatter(_fmt)
+    logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
+
+    # 10062 = Discord interaction expired before bot responded — harmless, suppress noise.
+    # Covers both autocomplete timeouts and commands where defer() races the 3-second window.
+    # exc_info holds the actual exception; getMessage() only has the headline.
+    class _DropExpiredInteraction(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.exc_info:
+                exc = record.exc_info[1]
+                original = getattr(exc, "original", exc)
+                if isinstance(original, discord.errors.NotFound) and original.code == 10062:
+                    return False
+            return "10062" not in record.getMessage()
+
+    logging.getLogger("discord.app_commands.tree").addFilter(_DropExpiredInteraction())
+    logging.getLogger("discord.client").addFilter(_DropExpiredInteraction())
     config = AppConfig.from_env()
     storage = SQLiteStorage(config.database_path)
 
