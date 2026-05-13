@@ -37,6 +37,8 @@ BLOCKED_IMAGE_FRAGMENTS = (
     "youtube_16x9_placeholder.gif",
 )
 EMBEDS_PER_MESSAGE = 10
+# 이미지 전용 임베드를 한 메시지에 많이 넣으면 디스코드가 격자로 붙여 레이아웃이 깨집니다.
+IMAGE_ONLY_EMBEDS_PER_MESSAGE = 4
 EMBED_DESCRIPTION_LIMIT = 4096
 FILES_PER_MESSAGE = 10
 LANGUAGE_CHOICES = [
@@ -511,7 +513,8 @@ class NewsCog(commands.Cog):
 
     def _interaction_image_delivery(self, interaction: discord.Interaction) -> str:
         if interaction.guild_id is None or self._interaction_uses_user_install(interaction):
-            return IMAGE_DELIVERY_FILES
+            # DM·유저 앱에서는 외부 URL 임베드가 첨부 파일보다 안정적으로 표시됩니다.
+            return IMAGE_DELIVERY_EMBEDS
         return self.storage.get_settings(interaction.guild_id).image_delivery
 
     def _should_poll_now(self, now: datetime) -> bool:
@@ -658,17 +661,24 @@ class NewsCog(commands.Cog):
             roles=[discord.Object(id=role_id)] if role_id else False,
         )
 
-        groups = _embed_groups_for_post(post)
+        standalone_urls = _standalone_image_urls(post, attach_images=True)
+        groups = _embed_groups_for_post(post, attach_images=True)
         file_batches_task = (
-            self._start_image_file_batches_task(post)
+            self._start_image_file_batches_task(post, urls=standalone_urls)
             if image_delivery == IMAGE_DELIVERY_FILES
             else None
         )
 
         first, *rest = groups if groups else ([],)
+        news_view = (
+            _build_view_for_post(post)
+            if _filter_image_urls(post.image_urls)
+            else discord.utils.MISSING
+        )
         await channel.send(
             content=mention,
             embeds=first,
+            view=news_view,
             allowed_mentions=allowed_mentions,
         )
 
@@ -685,12 +695,15 @@ class NewsCog(commands.Cog):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         if image_delivery == IMAGE_DELIVERY_EMBEDS:
-            self._schedule_channel_image_embed_messages(channel, post)
+            self._schedule_channel_image_embed_messages(
+                channel, post, image_urls=standalone_urls
+            )
         else:
             self._schedule_channel_image_messages(
                 channel,
                 post,
                 file_batches_task=file_batches_task,
+                image_urls=standalone_urls,
             )
 
     async def _send_news_post_followups(
@@ -699,9 +712,11 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         private: bool,
+        attach_photos: bool = True,
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
-        groups = _embed_groups_for_post(post)
+        standalone_urls = _standalone_image_urls(post, attach_images=attach_photos)
+        groups = _embed_groups_for_post(post, attach_images=attach_photos)
         first, *rest = groups if groups else ([],)
         image_delivery = self._interaction_image_delivery(interaction)
         use_image_embeds = (
@@ -709,13 +724,21 @@ class NewsCog(commands.Cog):
             or image_delivery == IMAGE_DELIVERY_EMBEDS
         )
         file_batches_task = (
-            None if use_image_embeds else self._start_image_file_batches_task(post)
+            None
+            if use_image_embeds
+            else self._start_image_file_batches_task(post, urls=standalone_urls)
         )
 
+        news_view = (
+            _build_view_for_post(post)
+            if attach_photos and _filter_image_urls(post.image_urls)
+            else discord.utils.MISSING
+        )
         sent_messages.append(
             await interaction.followup.send(
                 embeds=first,
                 ephemeral=private,
+                view=news_view,
                 allowed_mentions=discord.AllowedMentions.none(),
                 wait=True,
             )
@@ -747,12 +770,14 @@ class NewsCog(commands.Cog):
                 interaction,
                 post,
                 private=private,
+                image_urls=standalone_urls,
             )
         elif image_delivery == IMAGE_DELIVERY_EMBEDS and private:
             self._schedule_interaction_image_embed_followups(
                 interaction,
                 post,
                 private=True,
+                image_urls=standalone_urls,
             )
         elif image_delivery == IMAGE_DELIVERY_EMBEDS and isinstance(
             interaction.channel,
@@ -763,6 +788,7 @@ class NewsCog(commands.Cog):
                 post,
                 track_guild_id=interaction.guild_id,
                 track_channel_id=interaction.channel_id,
+                image_urls=standalone_urls,
             )
         elif private:
             self._schedule_interaction_image_followups(
@@ -770,6 +796,7 @@ class NewsCog(commands.Cog):
                 post,
                 private=True,
                 file_batches_task=file_batches_task,
+                image_urls=standalone_urls,
             )
         elif isinstance(interaction.channel, discord.abc.Messageable):
             self._schedule_channel_image_messages(
@@ -778,6 +805,7 @@ class NewsCog(commands.Cog):
                 track_guild_id=interaction.guild_id,
                 track_channel_id=interaction.channel_id,
                 file_batches_task=file_batches_task,
+                image_urls=standalone_urls,
             )
         return sent_messages
 
@@ -887,8 +915,14 @@ class NewsCog(commands.Cog):
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
         file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
-        if not _filter_image_urls(post.image_urls):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        if not urls and file_batches_task is None:
             return
 
         task = asyncio.create_task(
@@ -898,6 +932,7 @@ class NewsCog(commands.Cog):
                 track_guild_id=track_guild_id,
                 track_channel_id=track_channel_id,
                 file_batches_task=file_batches_task,
+                image_urls=urls,
             )
         )
         task.add_done_callback(self._log_background_task_result)
@@ -909,8 +944,14 @@ class NewsCog(commands.Cog):
         *,
         private: bool,
         file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
-        if not _filter_image_urls(post.image_urls):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        if not urls and file_batches_task is None:
             return
 
         task = asyncio.create_task(
@@ -919,6 +960,7 @@ class NewsCog(commands.Cog):
                 post,
                 private=private,
                 file_batches_task=file_batches_task,
+                image_urls=urls,
             )
         )
         task.add_done_callback(self._log_background_task_result)
@@ -929,12 +971,20 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         private: bool,
+        image_urls: list[str] | None = None,
     ) -> None:
-        if not _filter_image_urls(post.image_urls):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        if not urls:
             return
 
         task = asyncio.create_task(
-            self._send_interaction_image_embed_followups(interaction, post, private=private)
+            self._send_interaction_image_embed_followups(
+                interaction, post, private=private, image_urls=urls
+            )
         )
         task.add_done_callback(self._log_background_task_result)
 
@@ -945,8 +995,14 @@ class NewsCog(commands.Cog):
         *,
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
-        if not _filter_image_urls(post.image_urls):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        if not urls:
             return
 
         task = asyncio.create_task(
@@ -955,6 +1011,7 @@ class NewsCog(commands.Cog):
                 post,
                 track_guild_id=track_guild_id,
                 track_channel_id=track_channel_id,
+                image_urls=urls,
             )
         )
         task.add_done_callback(self._log_background_task_result)
@@ -967,13 +1024,16 @@ class NewsCog(commands.Cog):
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
         file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
         target = await self._resolve_background_channel(channel, track_channel_id)
         if target is None:
             LOGGER.debug("Skipping image attachments because the target channel is unavailable.")
             return
 
-        for file_batch in await self._resolve_image_file_batches(post, file_batches_task):
+        for file_batch in await self._resolve_image_file_batches(
+            post, file_batches_task, urls=image_urls
+        ):
             try:
                 message = await target.send(
                     files=file_batch,
@@ -994,22 +1054,22 @@ class NewsCog(commands.Cog):
         *,
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
         target = await self._resolve_background_channel(channel, track_channel_id)
         if target is None:
             LOGGER.debug("Skipping image embeds because the target channel is unavailable.")
             return
 
-        view = _build_view_for_post(post)
-        for index, embed_batch in enumerate(_image_embed_groups_for_post(post)):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        for embed_batch in _image_embed_batches_from_urls(urls, post):
             try:
                 message = await target.send(
                     embeds=embed_batch,
-                    view=(
-                        view
-                        if index == 0 and view is not None
-                        else discord.utils.MISSING
-                    ),
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             except (discord.Forbidden, discord.NotFound):
@@ -1045,8 +1105,11 @@ class NewsCog(commands.Cog):
         *,
         private: bool,
         file_batches_task: asyncio.Task[list[list[discord.File]]] | None = None,
+        image_urls: list[str] | None = None,
     ) -> None:
-        for file_batch in await self._resolve_image_file_batches(post, file_batches_task):
+        for file_batch in await self._resolve_image_file_batches(
+            post, file_batches_task, urls=image_urls
+        ):
             try:
                 message = await interaction.followup.send(
                     files=file_batch,
@@ -1070,17 +1133,17 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         private: bool,
+        image_urls: list[str] | None = None,
     ) -> None:
-        view = _build_view_for_post(post)
-        for index, embed_batch in enumerate(_image_embed_groups_for_post(post)):
+        urls = (
+            image_urls
+            if image_urls is not None
+            else _filter_image_urls(post.image_urls)
+        )
+        for embed_batch in _image_embed_batches_from_urls(urls, post):
             try:
                 message = await interaction.followup.send(
                     embeds=embed_batch,
-                    view=(
-                        view
-                        if index == 0 and view is not None
-                        else discord.utils.MISSING
-                    ),
                     ephemeral=private,
                     allowed_mentions=discord.AllowedMentions.none(),
                     wait=True,
@@ -1105,11 +1168,15 @@ class NewsCog(commands.Cog):
             LOGGER.exception("Background image send failed.")
 
     def _start_image_file_batches_task(
-        self, post: NewsPost
+        self,
+        post: NewsPost,
+        *,
+        urls: list[str] | None = None,
     ) -> asyncio.Task[list[list[discord.File]]] | None:
-        if not _filter_image_urls(post.image_urls):
+        use_urls = urls if urls is not None else _filter_image_urls(post.image_urls)
+        if not use_urls:
             return None
-        task = asyncio.create_task(self._image_file_batches_for_post(post))
+        task = asyncio.create_task(self._image_file_batches_for_post(post, urls=use_urls))
         task.add_done_callback(self._log_image_prefetch_task_result)
         return task
 
@@ -1128,10 +1195,12 @@ class NewsCog(commands.Cog):
         self,
         post: NewsPost,
         file_batches_task: asyncio.Task[list[list[discord.File]]] | None,
+        *,
+        urls: list[str] | None = None,
     ) -> list[list[discord.File]]:
         if file_batches_task is not None:
             return await file_batches_task
-        return await self._image_file_batches_for_post(post)
+        return await self._image_file_batches_for_post(post, urls=urls)
 
     def _schedule_image_cache_warmup(self, posts: list[NewsPost]) -> None:
         urls: list[str] = []
@@ -1158,15 +1227,17 @@ class NewsCog(commands.Cog):
 
         await asyncio.gather(*(warm_one(url) for url in urls))
 
-    async def _image_file_batches_for_post(self, post: NewsPost) -> list[list[discord.File]]:
-        urls = _filter_image_urls(post.image_urls)
-        if not urls:
+    async def _image_file_batches_for_post(
+        self, post: NewsPost, *, urls: list[str] | None = None
+    ) -> list[list[discord.File]]:
+        resolved = urls if urls is not None else _filter_image_urls(post.image_urls)
+        if not resolved:
             return []
 
         semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
         tasks = [
             asyncio.create_task(self._prepare_zip_image(semaphore, index, url))
-            for index, url in enumerate(urls)
+            for index, url in enumerate(resolved)
         ]
         images = await asyncio.gather(*tasks)
 
@@ -1401,13 +1472,18 @@ class NewsCog(commands.Cog):
     @app_commands.command(name="이전소식보기", description="저장된 림버스 컴퍼니 이전 소식을 다시 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(title="게시물", private="나만보기")
+    @app_commands.rename(title="게시물", private="나만보기", attach_photos="사진첨부")
     @app_commands.describe(
         title="게시물의 첫 번째 줄을 선택합니다.",
         private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+        attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
     )
     async def previous_news(
-        self, interaction: discord.Interaction, title: str, private: bool = True
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        private: bool = True,
+        attach_photos: bool = True,
     ) -> None:
         language = self._interaction_language(interaction)
         post = self.storage.get_post_by_id_or_title(title, language=language)
@@ -1429,6 +1505,7 @@ class NewsCog(commands.Cog):
             interaction,
             post,
             private=private,
+            attach_photos=attach_photos,
         )
         if not private:
             for message in sent_messages:
@@ -1454,9 +1531,17 @@ class NewsCog(commands.Cog):
     @app_commands.command(name="최근소식보기", description="가장 최근 림버스 컴퍼니 소식을 즉시 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(private="나만보기")
-    @app_commands.describe(private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.")
-    async def recent_news(self, interaction: discord.Interaction, private: bool = True) -> None:
+    @app_commands.rename(private="나만보기", attach_photos="사진첨부")
+    @app_commands.describe(
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+        attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
+    )
+    async def recent_news(
+        self,
+        interaction: discord.Interaction,
+        private: bool = True,
+        attach_photos: bool = True,
+    ) -> None:
         language = self._interaction_language(interaction)
         if not await self._confirm_external_news_send(interaction):
             return
@@ -1490,6 +1575,7 @@ class NewsCog(commands.Cog):
             interaction,
             post,
             private=private,
+            attach_photos=attach_photos,
         )
         if not private:
             for message in sent_messages:
@@ -1622,7 +1708,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/최근소식보기",
-            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 기본은 나만보기입니다.",
+            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 나만보기·사진 첨부 옵션을 쓸 수 있어요.",
             inline=False,
         )
         embed.add_field(
@@ -1637,7 +1723,7 @@ class NewsCog(commands.Cog):
             name="/이전소식보기",
             value=(
                 "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
-                "서버와 앱 설치에서 모두 사용 가능하며, 기본은 나만보기입니다."
+                "서버와 앱 설치에서 모두 사용 가능하며, 나만보기·사진 첨부 옵션을 쓸 수 있어요."
             ),
             inline=False,
         )
@@ -1707,6 +1793,31 @@ def _filter_image_urls(urls: list[str]) -> list[str]:
     ]
 
 
+def _standalone_image_urls(post: NewsPost, *, attach_images: bool) -> list[str]:
+    urls = _filter_image_urls(post.image_urls)
+    if not attach_images or not urls:
+        return []
+    # 이미지가 2장 이상이면 본문에는 사진을 넣지 않고 전부 아래쪽 전용 메시지로 보냅니다.
+    if len(urls) >= 2:
+        return list(urls)
+    return []
+
+
+def _image_embed_batches_from_urls(
+    image_urls: list[str], post: NewsPost
+) -> list[list[discord.Embed]]:
+    embeds: list[discord.Embed] = []
+    for image_url in image_urls:
+        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
+        embed.set_image(url=image_url)
+        embeds.append(embed)
+
+    return [
+        embeds[index : index + IMAGE_ONLY_EMBEDS_PER_MESSAGE]
+        for index in range(0, len(embeds), IMAGE_ONLY_EMBEDS_PER_MESSAGE)
+    ]
+
+
 def _split_message_content(text: str, limit: int) -> list[str]:
     chunks: list[str] = []
     current = ""
@@ -1733,6 +1844,8 @@ def _split_message_content(text: str, limit: int) -> list[str]:
 
 def _embed_groups_for_post(
     post: NewsPost,
+    *,
+    attach_images: bool = True,
 ) -> list[list[discord.Embed]]:
     text_chunks = _split_message_content(
         (post.text or post.url).strip(),
@@ -1755,6 +1868,12 @@ def _embed_groups_for_post(
     if schedule_text:
         main.add_field(name="일정", value=schedule_text, inline=False)
 
+    if attach_images:
+        urls = _filter_image_urls(post.image_urls)
+        # 2장 이상이면 본문은 텍스트만 두고, 이미지는 전용 메시지(메시지당 2임베드)로 보냅니다.
+        if len(urls) == 1:
+            main.set_image(url=urls[0])
+
     embeds: list[discord.Embed] = [main]
     for index, chunk in enumerate(text_chunks[1:], start=2):
         embeds.append(
@@ -1773,21 +1892,8 @@ def _embed_groups_for_post(
     ]
 
 
-def _image_embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
-    embeds: list[discord.Embed] = []
-    for image_url in _filter_image_urls(post.image_urls):
-        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
-        embed.set_image(url=image_url)
-        embeds.append(embed)
-
-    return [
-        embeds[index : index + EMBEDS_PER_MESSAGE]
-        for index in range(0, len(embeds), EMBEDS_PER_MESSAGE)
-    ]
-
-
 def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
-    groups = _embed_groups_for_post(post)
+    groups = _embed_groups_for_post(post, attach_images=True)
     return groups[0] if groups else []
 
 
