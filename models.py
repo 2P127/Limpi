@@ -29,6 +29,11 @@ class GuildSettings:
     auto_cleanup_enabled: bool
     auto_cleanup_days: int
     image_delivery: str
+    public_news_lookup_allowed: bool
+    missed_news_recovery_enabled: bool
+    maintenance_notifications_enabled: bool
+    last_maintenance_start_notice: str | None
+    last_maintenance_update_notice: str | None
 
 
 @dataclass(frozen=True)
@@ -37,6 +42,7 @@ class UserSettings:
     username: str
     nickname: str | None
     language: str
+    image_delivery: str | None  # None = 서버 기본값 사용
     created_at: datetime | None
     updated_at: datetime | None
 

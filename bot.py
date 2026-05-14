@@ -48,6 +48,12 @@ EMBEDS_PER_MESSAGE = 10
 IMAGE_ONLY_EMBEDS_PER_MESSAGE = 4
 EMBED_DESCRIPTION_LIMIT = 4096
 FILES_PER_MESSAGE = 10
+BOOLEAN_TRUE = "true"
+BOOLEAN_FALSE = "false"
+BOOLEAN_CHOICES = [
+    app_commands.Choice(name="허용", value=BOOLEAN_TRUE),
+    app_commands.Choice(name="비허용", value=BOOLEAN_FALSE),
+]
 LANGUAGE_CHOICES = [
     app_commands.Choice(name="한국어", value="koreana"),
     app_commands.Choice(name="English", value="english"),
@@ -144,6 +150,7 @@ class LimpiBot(commands.Bot):
         self._synced_connected_guilds = False
         self._cleared_global_commands = False
         self._cleared_connected_guild_commands = False
+        self._logged_startup_summary = False
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(ZipDownloadButton)
@@ -317,6 +324,70 @@ class NewsCog(commands.Cog):
         self.poll_news.cancel()
         self.cleanup_messages.cancel()
 
+    def log_startup_summary(self) -> None:
+        connected_guild_ids = {guild.id for guild in self.bot.guilds}
+        LOGGER.info(
+            "Connected guild summary: count=%s guilds=%s",
+            len(self.bot.guilds),
+            ", ".join(
+                f"{guild.name} ({guild.id})"
+                for guild in sorted(self.bot.guilds, key=lambda item: item.id)
+            )
+            or "none",
+        )
+
+        settings_list = self.storage.list_settings()
+        notification_settings = [
+            settings
+            for settings in settings_list
+            if settings.channel_id
+            and (settings.enabled or settings.maintenance_notifications_enabled)
+        ]
+        LOGGER.info(
+            "Notification settings summary: configured_guilds=%s active_targets=%s",
+            len(settings_list),
+            len(notification_settings),
+        )
+
+        for settings in notification_settings:
+            guild = self.bot.get_guild(settings.guild_id)
+            guild_name = guild.name if guild else "not connected"
+            channel = self.bot.get_channel(settings.channel_id) if settings.channel_id else None
+            channel_name = getattr(channel, "name", None) or "unknown"
+            role_name = "none"
+            if guild is not None and settings.role_id is not None:
+                role = guild.get_role(settings.role_id)
+                role_name = role.name if role else "unknown"
+
+            LOGGER.info(
+                "Notification target: guild=%s (%s), connected=%s, "
+                "news_enabled=%s, missed_recovery_enabled=%s, maintenance_enabled=%s, "
+                "channel=%s (%s), role=%s (%s), language=%s, image_delivery=%s",
+                guild_name,
+                settings.guild_id,
+                settings.guild_id in connected_guild_ids,
+                settings.enabled,
+                settings.missed_news_recovery_enabled,
+                settings.maintenance_notifications_enabled,
+                channel_name,
+                settings.channel_id,
+                role_name,
+                settings.role_id or "none",
+                settings.language,
+                settings.image_delivery,
+            )
+
+        orphan_settings = [
+            settings
+            for settings in settings_list
+            if settings.guild_id not in connected_guild_ids
+        ]
+        if orphan_settings:
+            LOGGER.warning(
+                "Stored settings exist for guilds where the bot is not connected: %s",
+                ", ".join(str(settings.guild_id) for settings in orphan_settings),
+            )
+
     @tasks.loop(seconds=60)
     async def poll_news(self) -> None:
         async with self._poll_lock:
@@ -450,6 +521,14 @@ class NewsCog(commands.Cog):
     def _settings_by_language(self) -> dict[str, list[GuildSettings]]:
         settings_by_language: dict[str, list[GuildSettings]] = {}
         for settings in self.storage.list_settings():
+            if self.bot.get_guild(settings.guild_id) is None:
+                LOGGER.debug(
+                    "News auto-send settings skipped because the bot is not connected "
+                    "to the configured guild (guild_id=%s, channel_id=%s).",
+                    settings.guild_id,
+                    settings.channel_id or "none",
+                )
+                continue
             language = settings.language or self.config.steam_language
             settings_by_language.setdefault(language, []).append(settings)
         return settings_by_language
@@ -571,21 +650,57 @@ class NewsCog(commands.Cog):
     async def _process_guild(self, settings: GuildSettings, posts: list[NewsPost]) -> int:
         if not settings.channel_id or not settings.enabled:
             return 0
+        if self.bot.get_guild(settings.guild_id) is None:
+            LOGGER.debug(
+                "News auto-send skipped because the bot is not connected to the guild "
+                "(guild_id=%s, channel_id=%s).",
+                settings.guild_id,
+                settings.channel_id,
+            )
+            return 0
 
         channel = self.bot.get_channel(settings.channel_id)
         if channel is None:
             try:
                 channel = await self.bot.fetch_channel(settings.channel_id)
-            except (discord.Forbidden, discord.NotFound):
-                LOGGER.debug(
-                    "Cannot access configured channel %s for guild %s.",
-                    settings.channel_id,
+            except discord.Forbidden as exc:
+                LOGGER.warning(
+                    "News auto-send skipped: missing access to configured channel "
+                    "(guild_id=%s, channel_id=%s, discord_code=%s). "
+                    "Check channel/category permissions for View Channel and Send Messages.",
                     settings.guild_id,
+                    settings.channel_id,
+                    getattr(exc, "code", None),
+                )
+                return 0
+            except discord.NotFound as exc:
+                LOGGER.warning(
+                    "News auto-send skipped: configured channel was not found "
+                    "(guild_id=%s, channel_id=%s, discord_code=%s). Re-run server settings.",
+                    settings.guild_id,
+                    settings.channel_id,
+                    getattr(exc, "code", None),
+                )
+                return 0
+            except discord.HTTPException as exc:
+                LOGGER.exception(
+                    "News auto-send skipped: failed to fetch configured channel "
+                    "(guild_id=%s, channel_id=%s, discord_status=%s, discord_code=%s).",
+                    settings.guild_id,
+                    settings.channel_id,
+                    getattr(exc, "status", None),
+                    getattr(exc, "code", None),
                 )
                 return 0
 
         if not isinstance(channel, discord.abc.Messageable):
-            LOGGER.debug("Configured channel %s is not messageable.", settings.channel_id)
+            LOGGER.warning(
+                "News auto-send skipped: configured channel is not messageable "
+                "(guild_id=%s, channel_id=%s, channel_type=%s).",
+                settings.guild_id,
+                settings.channel_id,
+                type(channel).__name__,
+            )
             return 0
 
         new_posts = self._new_posts_for_guild(settings, posts)
@@ -598,17 +713,45 @@ class NewsCog(commands.Cog):
             return 0
 
         announced = 0
+        failed_post_ids: set[str] = set()
         for post in new_posts:
-            await self._send_news_post(channel, settings, post)
+            sent = await self._send_news_post(channel, settings, post)
+            if not sent:
+                failed_post_ids.add(post.post_id)
+                LOGGER.warning(
+                    "News auto-send failed "
+                    "(guild_id=%s, channel_id=%s, post_id=%s, title=%r, "
+                    "missed_recovery_enabled=%s).",
+                    settings.guild_id,
+                    settings.channel_id,
+                    post.post_id,
+                    post.title,
+                    settings.missed_news_recovery_enabled,
+                )
+                continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
             LOGGER.info("새 뉴스 공지 (guild %s): %s", settings.guild_id, post.title)
             announced += 1
 
+        if failed_post_ids and not settings.missed_news_recovery_enabled:
+            LOGGER.warning(
+                "Missed news recovery is disabled; failed posts will be marked as seen "
+                "and skipped on future automatic polls (guild_id=%s, channel_id=%s, post_ids=%s).",
+                settings.guild_id,
+                settings.channel_id,
+                ", ".join(sorted(failed_post_ids)),
+            )
+        seen_posts = [
+            post.post_id
+            for post in posts
+            if not settings.missed_news_recovery_enabled or post.post_id not in failed_post_ids
+        ]
         self.storage.mark_posts_seen(
             settings.guild_id,
-            (post.post_id for post in posts),
+            seen_posts,
         )
-        self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
+        if not failed_post_ids or not settings.missed_news_recovery_enabled:
+            self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
         return announced
 
     def _new_posts_for_guild(
@@ -665,13 +808,66 @@ class NewsCog(commands.Cog):
         channel: discord.abc.Messageable,
         settings: GuildSettings,
         post: NewsPost,
-    ) -> None:
-        await self._broadcast_post(
-            channel,
-            post,
-            settings.role_id,
-            image_delivery=settings.image_delivery,
-        )
+    ) -> bool:
+        channel_id = getattr(channel, "id", settings.channel_id)
+        try:
+            await self._broadcast_post(
+                channel,
+                post,
+                settings.role_id,
+                image_delivery=settings.image_delivery,
+            )
+            return True
+        except discord.Forbidden as exc:
+            LOGGER.warning(
+                "News auto-send forbidden: Discord rejected message send "
+                "(guild_id=%s, channel_id=%s, role_id=%s, post_id=%s, title=%r, "
+                "discord_code=%s). Check channel/category overrides for the bot role.",
+                settings.guild_id,
+                channel_id,
+                settings.role_id,
+                post.post_id,
+                post.title,
+                getattr(exc, "code", None),
+            )
+            return False
+        except discord.NotFound as exc:
+            LOGGER.warning(
+                "News auto-send target disappeared "
+                "(guild_id=%s, channel_id=%s, post_id=%s, title=%r, discord_code=%s). "
+                "Re-run server settings.",
+                settings.guild_id,
+                channel_id,
+                post.post_id,
+                post.title,
+                getattr(exc, "code", None),
+            )
+            return False
+        except discord.HTTPException as exc:
+            LOGGER.exception(
+                "News auto-send HTTP error "
+                "(guild_id=%s, channel_id=%s, role_id=%s, post_id=%s, title=%r, "
+                "discord_status=%s, discord_code=%s).",
+                settings.guild_id,
+                channel_id,
+                settings.role_id,
+                post.post_id,
+                post.title,
+                getattr(exc, "status", None),
+                getattr(exc, "code", None),
+            )
+            return False
+        except Exception:
+            LOGGER.exception(
+                "Unexpected news auto-send error "
+                "(guild_id=%s, channel_id=%s, role_id=%s, post_id=%s, title=%r).",
+                settings.guild_id,
+                channel_id,
+                settings.role_id,
+                post.post_id,
+                post.title,
+            )
+            return False
 
     async def _broadcast_post(
         self,
@@ -1374,15 +1570,17 @@ class NewsCog(commands.Cog):
     @app_commands.choices(
         language=LANGUAGE_CHOICES,
         image_delivery=IMAGE_DELIVERY_CHOICES,
+        enabled=BOOLEAN_CHOICES,
+        auto_cleanup=BOOLEAN_CHOICES,
     )
     async def configure(
         self,
         interaction: discord.Interaction,
         channel: discord.TextChannel | None = None,
         role: discord.Role | None = None,
-        enabled: bool | None = None,
+        enabled: app_commands.Choice[str] | None = None,
         language: app_commands.Choice[str] | None = None,
-        auto_cleanup: bool | None = None,
+        auto_cleanup: app_commands.Choice[str] | None = None,
         cleanup_days: int | None = None,
         image_delivery: app_commands.Choice[str] | None = None,
     ) -> None:
@@ -1405,9 +1603,9 @@ class NewsCog(commands.Cog):
             channel_id=channel.id if channel else None,
             role_id=role.id if role else None,
             post_format=POST_FORMAT_RICH,
-            enabled=enabled,
+            enabled=_choice_bool(enabled),
             language=language.value if language else None,
-            auto_cleanup_enabled=auto_cleanup,
+            auto_cleanup_enabled=_choice_bool(auto_cleanup),
             auto_cleanup_days=cleanup_days,
             image_delivery=image_delivery.value if image_delivery else None,
         )
@@ -1433,6 +1631,38 @@ class NewsCog(commands.Cog):
 
         await interaction.response.send_message(
             embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="누락소식설정", description="자동 발송 실패로 누락된 소식을 다음 폴링 때 다시 보낼지 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(enabled="허용")
+    @app_commands.describe(
+        enabled="허용하면 권한 오류나 일시 오류로 못 보낸 새 소식을 다음 자동 확인 때 다시 시도합니다.",
+    )
+    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    async def configure_missed_news_recovery(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        settings = self.storage.update_settings(
+            interaction.guild_id,
+            missed_news_recovery_enabled=_choice_bool(enabled, False),
+        )
+        await interaction.response.send_message(
+            (
+                f"누락 소식 자동 재시도: {_bool_label(settings.missed_news_recovery_enabled)}\n"
+                "허용 상태에서는 자동 발송에 실패한 새 소식을 본 것으로 처리하지 않고 다음 확인 때 다시 보냅니다."
+            ),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -1520,13 +1750,16 @@ class NewsCog(commands.Cog):
         private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
         attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
     )
+    @app_commands.choices(private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
     async def previous_news(
         self,
         interaction: discord.Interaction,
         title: str,
-        private: bool = True,
-        attach_photos: bool = True,
+        private: app_commands.Choice[str] | None = None,
+        attach_photos: app_commands.Choice[str] | None = None,
     ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        attach_photos_value = bool(_choice_bool(attach_photos, True))
         language = self._interaction_language(interaction)
         post = self.storage.get_post_by_id_or_title(title, language=language)
         if post is None:
@@ -1542,14 +1775,14 @@ class NewsCog(commands.Cog):
             return
 
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=private, thinking=True)
+            await interaction.response.defer(ephemeral=private_value, thinking=True)
         sent_messages = await self._send_news_post_followups(
             interaction,
             post,
-            private=private,
-            attach_photos=attach_photos,
+            private=private_value,
+            attach_photos=attach_photos_value,
         )
-        if not private:
+        if not private_value:
             for message in sent_messages:
                 await self._track_manual_message(
                     interaction.guild_id, interaction.channel_id, message
@@ -1578,18 +1811,21 @@ class NewsCog(commands.Cog):
         private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
         attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
     )
+    @app_commands.choices(private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
     async def recent_news(
         self,
         interaction: discord.Interaction,
-        private: bool = True,
-        attach_photos: bool = True,
+        private: app_commands.Choice[str] | None = None,
+        attach_photos: app_commands.Choice[str] | None = None,
     ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        attach_photos_value = bool(_choice_bool(attach_photos, True))
         language = self._interaction_language(interaction)
         if not await self._confirm_external_news_send(interaction):
             return
 
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=private, thinking=True)
+            await interaction.response.defer(ephemeral=private_value, thinking=True)
 
         post: NewsPost | None = None
         if self.news_source is not None:
@@ -1616,10 +1852,10 @@ class NewsCog(commands.Cog):
         sent_messages = await self._send_news_post_followups(
             interaction,
             post,
-            private=private,
-            attach_photos=attach_photos,
+            private=private_value,
+            attach_photos=attach_photos_value,
         )
-        if not private:
+        if not private_value:
             for message in sent_messages:
                 await self._track_manual_message(
                     interaction.guild_id, interaction.channel_id, message
@@ -1718,13 +1954,22 @@ class NewsCog(commands.Cog):
         embed = discord.Embed(
             title="림피 명령어 안내",
             color=discord.Color.from_rgb(179, 28, 28),
-            description="림버스 컴퍼니 스팀 뉴스를 가져오는 봇이에요.",
+            description="**림피는 림버스 컴퍼니 스팀 뉴스를 가져와 디스코드에 보내주는 봇이에요!**",
         )
         embed.add_field(
             name="/서버설정",
             value=(
                 "채널, 역할, 언어, 이미지 전송, 자동 알림, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
+                "자동 알림·자동 삭제 같은 선택 옵션은 `허용`/`비허용`으로 고릅니다.\n"
                 "서버에서만 사용 가능 (서버 관리 권한 필요)."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/누락소식설정",
+            value=(
+                "권한 오류나 일시 오류로 자동 발송에 실패한 새 소식을 다음 확인 때 다시 보낼지 설정합니다.\n"
+                "`허용` 상태에서는 실패한 새 소식을 본 것으로 처리하지 않아 자동 재시도합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
@@ -1750,7 +1995,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/최근소식보기",
-            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 나만보기·사진 첨부 옵션을 쓸 수 있어요.",
+            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 나만보기·사진 첨부 옵션은 `허용`/`비허용`으로 고릅니다.",
             inline=False,
         )
         embed.add_field(
@@ -1765,7 +2010,7 @@ class NewsCog(commands.Cog):
             name="/이전소식보기",
             value=(
                 "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
-                "서버와 앱 설치에서 모두 사용 가능하며, 나만보기·사진 첨부 옵션을 쓸 수 있어요."
+                "서버와 앱 설치에서 모두 사용 가능하며, 나만보기·사진 첨부 옵션은 `허용`/`비허용`으로 고릅니다."
             ),
             inline=False,
         )
@@ -1957,6 +2202,16 @@ def _image_delivery_label(image_delivery: str) -> str:
     return "첨부파일"
 
 
+def _choice_bool(choice: app_commands.Choice[str] | None, default: bool | None = None) -> bool | None:
+    if choice is None:
+        return default
+    return choice.value == BOOLEAN_TRUE
+
+
+def _bool_label(value: bool) -> str:
+    return "허용" if value else "비허용"
+
+
 def _youtube_links_content(post: NewsPost) -> str | None:
     links = _youtube_urls_for_post(post)[:3]
     return "\n".join(links) if links else None
@@ -2124,8 +2379,46 @@ async def main() -> None:
         @bot.event
         async def on_ready() -> None:
             LOGGER.info("Logged in as %s (%s).", bot.user, bot.user.id if bot.user else "unknown")
+            if not bot._logged_startup_summary:
+                cog.log_startup_summary()
+                bot._logged_startup_summary = True
             await bot.sync_connected_guild_commands()
             await cog.run_startup_sync()
+
+        @bot.event
+        async def on_guild_join(guild: discord.Guild) -> None:
+            LOGGER.info(
+                "Joined guild: name=%s, guild_id=%s, owner_id=%s, member_count=%s",
+                guild.name,
+                guild.id,
+                guild.owner_id,
+                guild.member_count,
+            )
+
+            settings = storage.get_settings(guild.id)
+            if settings.channel_id:
+                channel = bot.get_channel(settings.channel_id) if settings.channel_id else None
+                channel_name = getattr(channel, "name", None) or "unknown"
+                role = guild.get_role(settings.role_id) if settings.role_id else None
+                LOGGER.info(
+                    "Joined guild has stored settings: guild=%s (%s), news_enabled=%s, "
+                    "maintenance_enabled=%s, channel=%s (%s), role=%s (%s), language=%s",
+                    guild.name,
+                    guild.id,
+                    settings.enabled,
+                    settings.maintenance_notifications_enabled,
+                    channel_name,
+                    settings.channel_id or "none",
+                    role.name if role else "none",
+                    settings.role_id or "none",
+                    settings.language,
+                )
+            else:
+                LOGGER.info(
+                    "Joined guild has no notification channel configured yet: guild=%s (%s)",
+                    guild.name,
+                    guild.id,
+                )
 
         await bot.add_cog(cog)
         try:
