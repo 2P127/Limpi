@@ -14,3 +14,4 @@ dist/
 build/
 *.spec
 limpi.ico
+AGENTS.md

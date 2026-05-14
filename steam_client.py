@@ -157,12 +157,16 @@ class SteamNewsSource:
         post_url = self._event_url(gid, clan_steam_id, language)
         youtube_urls = _extract_youtube_urls(body)
         image_urls = _extract_steam_bbcode_image_urls(body, clan_id)
+        thumbnail_url = _localized_event_image_url(
+            json_data,
+            clan_id,
+            language,
+            "localized_capsule_image",
+        )
         is_video_only = bool(youtube_urls) and not image_urls
-        if not is_video_only:
-            image_urls.extend(_localized_event_image_urls(json_data, clan_id, language))
         image_urls = _dedupe_urls(image_urls)
 
-        text = _steam_bbcode_to_text(body)
+        text = format_steam_news_for_discord(body)
         if not text:
             text = title
 
@@ -176,6 +180,7 @@ class SteamNewsSource:
             "ends_at": event.get("rtime32_end_time"),
             "youtube_urls": youtube_urls,
             "is_video_only": is_video_only,
+            "thumbnail_url": thumbnail_url,
         }
         return NewsPost(
             post_id=_language_post_id(language, gid),
@@ -203,7 +208,7 @@ class SteamNewsSource:
             youtube_urls = _extract_youtube_urls(description_html)
             is_video_only = bool(youtube_urls) and not image_urls
             image_urls = _dedupe_urls(image_urls)
-            text = _html_to_text(description_html)
+            text = format_steam_news_for_discord(description_html)
             if not text:
                 text = title
 
@@ -329,24 +334,64 @@ def _find_text(element: ElementTree.Element, name: str) -> str | None:
     return child.text.strip()
 
 
-def _html_to_text(value: str | None) -> str:
+def format_steam_news_for_discord(value: str | None) -> str:
     if not value:
         return ""
 
     value = html.unescape(value)
-    value = re.sub(r"<(script|style|iframe)\b[^>]*>.*?</\1>", "", value, flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
-    value = re.sub(r"</p\s*>", "\n", value, flags=re.IGNORECASE)
+    value = _html_to_discord_markdown(value)
+    value = _steam_bbcode_to_discord_markdown(value)
+    value = html.unescape(value)
+    return _normalize_discord_markdown(value)
+
+
+def _html_to_discord_markdown(value: str) -> str:
+    value = re.sub(
+        r"<(script|style|iframe)\b[^>]*>.*?</\1>",
+        "",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     value = re.sub(r"<img\b[^>]*>", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"<br\s*/?>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"</(?:p|div|section|article|blockquote)\s*>", "\n\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"<(?:p|div|section|article|blockquote)\b[^>]*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>",
+        lambda match: f"\n\n**{_strip_html_tags(match.group(1)).strip()}**\n\n",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"<(?:strong|b)\b[^>]*>(.*?)</(?:strong|b)\s*>",
+        lambda match: f"**{_strip_html_tags(match.group(1)).strip()}**",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"<(?:em|i)\b[^>]*>(.*?)</(?:em|i)\s*>",
+        lambda match: f"*{_strip_html_tags(match.group(1)).strip()}*",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(r"<li\b[^>]*>", "\n- ", value, flags=re.IGNORECASE)
+    value = re.sub(r"</li\s*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"</?(?:ul|ol)\b[^>]*>", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(
+        r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a\s*>",
+        lambda match: f"{_strip_html_tags(match.group(2)).strip()} ({match.group(1).strip()})",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     value = re.sub(r"<[^>]+>", "", value)
-    value = html.unescape(value)
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
+    return value
 
 
-def _steam_bbcode_to_text(value: str | None) -> str:
-    if not value:
-        return ""
+def _strip_html_tags(value: str) -> str:
+    return re.sub(r"<[^>]+>", "", html.unescape(value))
 
+
+def _steam_bbcode_to_discord_markdown(value: str) -> str:
     value = re.sub(r"\[img\].*?\[/img\]", "", value, flags=re.IGNORECASE | re.DOTALL)
     value = re.sub(
         r"\[previewyoutube=([^;\]]+)[^\]]*\]\[/previewyoutube\]",
@@ -361,14 +406,57 @@ def _steam_bbcode_to_text(value: str | None) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
     value = re.sub(
-        r"\[/?(?:b|i|u|h[1-6]|list|olist|quote|code|strike|spoiler|noparse|table|tr|th|td|center|left|right|indent|hr|url)(?:=[^\]]*)?\]",
+        r"\[b\](.*?)\[/b\]",
+        r"**\1**",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[h[1-6]\](.*?)\[/h[1-6]\]",
+        lambda match: f"\n\n**{match.group(1).strip()}**\n\n",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[i\](.*?)\[/i\]",
+        r"*\1*",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[/?(?:list|olist|quote|table)(?:=[^\]]*)?\]",
+        "\n",
+        value,
+        flags=re.IGNORECASE,
+    )
+    value = re.sub(r"\[/?(?:tr|th|td)\]", "\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"\[hr\]", "\n\n", value, flags=re.IGNORECASE)
+    value = re.sub(r"\[\*\]", "\n- ", value)
+    value = re.sub(
+        r"\[/?(?:u|code|strike|spoiler|noparse|center|left|right|indent|url)(?:=[^\]]*)?\]",
         "",
         value,
         flags=re.IGNORECASE,
     )
-    value = re.sub(r"\[\*\]", "- ", value)
-    value = html.unescape(value)
-    return "\n".join(line.strip() for line in value.splitlines() if line.strip())
+    return value
+
+
+def _normalize_discord_markdown(value: str) -> str:
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"[ \t]*\n[ \t]*", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r"\n\n(?=- )", "\n", value)
+
+    lines: list[str] = []
+    for line in value.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            stripped = "- " + stripped[2:].strip()
+        lines.append(stripped)
+
+    return "\n".join(lines).strip()
 
 
 def _extract_image_urls(element: ElementTree.Element, html_text: str | None) -> list[str]:
@@ -397,13 +485,16 @@ def _extract_steam_bbcode_image_urls(value: str, clan_id: str) -> list[str]:
     return urls
 
 
-def _localized_event_image_urls(json_data: dict, clan_id: str, language: str) -> list[str]:
-    urls: list[str] = []
-    for key in ("localized_capsule_image", "localized_title_image"):
-        filename = _localized_value(json_data.get(key), language)
-        if filename and clan_id:
-            urls.append(f"{STEAM_CLAN_IMAGE_BASE_URL}/{clan_id}/{filename}")
-    return urls
+def _localized_event_image_url(
+    json_data: dict,
+    clan_id: str,
+    language: str,
+    key: str,
+) -> str | None:
+    filename = _localized_value(json_data.get(key), language)
+    if filename and clan_id:
+        return f"{STEAM_CLAN_IMAGE_BASE_URL}/{clan_id}/{filename}"
+    return None
 
 
 def _localized_value(values: object, language: str) -> str | None:
