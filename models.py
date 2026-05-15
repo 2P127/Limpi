@@ -37,6 +37,16 @@ class GuildSettings:
 
 
 @dataclass(frozen=True)
+class GuildNewsTarget:
+    target_id: int
+    guild_id: int
+    channel_id: int
+    language: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
 class UserSettings:
     user_id: int
     username: str

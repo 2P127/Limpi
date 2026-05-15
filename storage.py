@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -7,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from models import GuildSettings, NewsPost, TrackedMessage, UserSettings
+from models import GuildNewsTarget, GuildSettings, NewsPost, TrackedMessage, UserSettings
 
 
 DEFAULT_AUTO_CLEANUP_ENABLED = True
@@ -18,6 +19,12 @@ DEFAULT_MISSED_NEWS_RECOVERY_ENABLED = False
 DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED = False
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
+
+
+def _post_content_hash(post: "NewsPost") -> str:
+    """제목·본문·이미지 URL 기반 내용 해시 (변경 감지용)."""
+    raw = f"{post.title}\x00{post.text}\x00{json.dumps(post.image_urls, sort_keys=True)}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 class SQLiteStorage:
@@ -88,6 +95,32 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS guild_news_targets (
+                    target_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    language TEXT NOT NULL DEFAULT 'koreana',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(guild_id, channel_id)
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
+                    target_id INTEGER NOT NULL,
+                    post_id TEXT NOT NULL,
+                    seen_at TEXT NOT NULL,
+                    announced_at TEXT,
+                    PRIMARY KEY (target_id, post_id),
+                    FOREIGN KEY (target_id) REFERENCES guild_news_targets(target_id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            self._connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS tracked_messages (
                     guild_id INTEGER NOT NULL,
                     channel_id INTEGER NOT NULL,
@@ -152,6 +185,14 @@ class SQLiteStorage:
             self._ensure_column("user_settings", "nickname", "TEXT")
             self._ensure_column("user_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column("user_settings", "image_delivery", "TEXT")
+            self._ensure_column("posts", "content_hash", "TEXT NOT NULL DEFAULT ''")
+            # 이미지 전송 방식 임베드 → 첨부파일 일괄 마이그레이션
+            self._connection.execute(
+                "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
+            )
+            self._connection.execute(
+                "UPDATE user_settings SET image_delivery = NULL WHERE image_delivery = 'embeds'"
+            )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)"
             )
@@ -172,6 +213,25 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_guild_news_targets_guild_language
+                ON guild_news_targets(guild_id, language)
+                """
+            )
+            self._dedupe_news_target_channels()
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_guild_news_targets_guild_channel
+                ON guild_news_targets(guild_id, channel_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_news_target_seen_posts_post_id
+                ON guild_news_target_seen_posts(post_id)
+                """
+            )
+            self._connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_tracked_messages_sent_at
                 ON tracked_messages(sent_at)
                 """
@@ -183,6 +243,7 @@ class SQLiteStorage:
                 """
             )
             self._migrate_legacy_post_ids()
+            self._migrate_legacy_news_targets()
             self._connection.commit()
 
     def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
@@ -281,6 +342,94 @@ class SQLiteStorage:
             (old_id,),
         )
 
+    def _migrate_legacy_news_targets(self) -> None:
+        rows = self._connection.execute(
+            """
+            SELECT guild_id, channel_id, language, created_at, updated_at
+            FROM guild_settings
+            WHERE channel_id IS NOT NULL
+            """
+        ).fetchall()
+        for row in rows:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO guild_news_targets (
+                    guild_id, channel_id, language, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    int(row["guild_id"]),
+                    int(row["channel_id"]),
+                    str(row["language"] or "koreana"),
+                    row["created_at"] or _now_iso(),
+                    row["updated_at"] or _now_iso(),
+                ),
+            )
+            target = self._connection.execute(
+                """
+                SELECT target_id FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ? AND language = ?
+                """,
+                (
+                    int(row["guild_id"]),
+                    int(row["channel_id"]),
+                    str(row["language"] or "koreana"),
+                ),
+            ).fetchone()
+            if target is None:
+                continue
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO guild_news_target_seen_posts (
+                    target_id, post_id, seen_at, announced_at
+                )
+                SELECT ?, gsp.post_id, gsp.seen_at, gsp.announced_at
+                FROM guild_seen_posts gsp
+                JOIN posts p ON p.post_id = gsp.post_id
+                WHERE gsp.guild_id = ? AND p.language = ?
+                """,
+                (
+                    int(target["target_id"]),
+                    int(row["guild_id"]),
+                    str(row["language"] or "koreana"),
+                ),
+            )
+
+    def _dedupe_news_target_channels(self) -> None:
+        duplicate_rows = self._connection.execute(
+            """
+            SELECT guild_id, channel_id
+            FROM guild_news_targets
+            GROUP BY guild_id, channel_id
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for duplicate in duplicate_rows:
+            rows = self._connection.execute(
+                """
+                SELECT target_id
+                FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ?
+                ORDER BY updated_at DESC, target_id DESC
+                """,
+                (int(duplicate["guild_id"]), int(duplicate["channel_id"])),
+            ).fetchall()
+            keep_id = int(rows[0]["target_id"])
+            delete_ids = [int(row["target_id"]) for row in rows[1:]]
+            if not delete_ids:
+                continue
+
+            placeholders = ", ".join("?" for _ in delete_ids)
+            self._connection.execute(
+                f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                delete_ids,
+            )
+            self._connection.execute(
+                f"DELETE FROM guild_news_targets WHERE target_id IN ({placeholders})",
+                delete_ids,
+            )
+
     def get_settings(self, guild_id: int) -> GuildSettings:
         with self._lock:
             row = self._connection.execute(
@@ -316,6 +465,170 @@ class SQLiteStorage:
             ).fetchall()
 
         return [self._row_to_settings(row) for row in rows]
+
+    def list_news_targets(self, guild_id: int) -> list[GuildNewsTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE guild_id = ?
+                ORDER BY language, channel_id
+                """,
+                (guild_id,),
+            ).fetchall()
+
+        return [self._row_to_news_target(row) for row in rows]
+
+    def list_all_news_targets(self) -> list[GuildNewsTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                ORDER BY guild_id, language, channel_id
+                """
+            ).fetchall()
+
+        return [self._row_to_news_target(row) for row in rows]
+
+    def list_news_targets_for_language(self, language: str) -> list[GuildNewsTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE language = ?
+                ORDER BY guild_id, channel_id
+                """,
+                (language,),
+            ).fetchall()
+
+        return [self._row_to_news_target(row) for row in rows]
+
+    def upsert_news_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        language: str,
+    ) -> GuildNewsTarget:
+        now = _now_iso()
+        with self._lock:
+            existing = self._connection.execute(
+                """
+                SELECT target_id, language
+                FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ?
+                """,
+                (guild_id, channel_id),
+            ).fetchone()
+            if existing is not None:
+                target_id = int(existing["target_id"])
+                old_language = str(existing["language"] or "koreana")
+                if old_language != language:
+                    self._connection.execute(
+                        "DELETE FROM guild_news_target_seen_posts WHERE target_id = ?",
+                        (target_id,),
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE guild_news_targets
+                    SET language = ?, updated_at = ?
+                    WHERE target_id = ?
+                    """,
+                    (language, now, target_id),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    INSERT INTO guild_news_targets (
+                        guild_id, channel_id, language, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (guild_id, channel_id, language, now, now),
+                )
+            self._connection.commit()
+            row = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ?
+                """,
+                (guild_id, channel_id),
+            ).fetchone()
+
+        if row is None:
+            raise RuntimeError("Failed to upsert guild news target")
+        return self._row_to_news_target(row)
+
+    def get_news_target_by_channel(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+    ) -> GuildNewsTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ?
+                """,
+                (guild_id, channel_id),
+            ).fetchone()
+
+        return self._row_to_news_target(row) if row is not None else None
+
+    def get_news_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        language: str,
+    ) -> GuildNewsTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ? AND language = ?
+                """,
+                (guild_id, channel_id, language),
+            ).fetchone()
+
+        return self._row_to_news_target(row) if row is not None else None
+
+    def delete_news_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        language: str,
+    ) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT target_id FROM guild_news_targets
+                WHERE guild_id = ? AND channel_id = ? AND language = ?
+                """,
+                (guild_id, channel_id, language),
+            ).fetchone()
+            if row is None:
+                return False
+
+            target_id = int(row["target_id"])
+            self._connection.execute(
+                "DELETE FROM guild_news_target_seen_posts WHERE target_id = ?",
+                (target_id,),
+            )
+            self._connection.execute(
+                "DELETE FROM guild_news_targets WHERE target_id = ?",
+                (target_id,),
+            )
+            self._connection.commit()
+            return True
 
     def get_user_settings(self, user_id: int) -> UserSettings:
         with self._lock:
@@ -671,18 +984,97 @@ class SQLiteStorage:
             )
             self._connection.commit()
 
-    def save_posts(self, posts: Iterable[NewsPost]) -> int:
-        saved = 0
-        now = _now_iso()
+    def get_news_target_seen_post_ids(
+        self, target_id: int, post_ids: Iterable[str]
+    ) -> set[str]:
+        ids = list(dict.fromkeys(post_ids))
+        if not ids:
+            return set()
+
+        placeholders = ", ".join("?" for _ in ids)
         with self._lock:
-            for post in posts:
+            rows = self._connection.execute(
+                f"""
+                SELECT post_id FROM guild_news_target_seen_posts
+                WHERE target_id = ? AND post_id IN ({placeholders})
+                """,
+                (target_id, *ids),
+            ).fetchall()
+
+        return {str(row["post_id"]) for row in rows}
+
+    def news_target_has_seen_posts(self, target_id: int) -> bool:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM guild_news_target_seen_posts
+                WHERE target_id = ?
+                LIMIT 1
+                """,
+                (target_id,),
+            ).fetchone()
+
+        return row is not None
+
+    def mark_news_target_posts_seen(
+        self,
+        target_id: int,
+        post_ids: Iterable[str],
+        *,
+        announced: bool = False,
+    ) -> None:
+        ids = list(dict.fromkeys(post_ids))
+        if not ids:
+            return
+
+        now = _now_iso()
+        announced_at = now if announced else None
+        with self._lock:
+            self._connection.executemany(
+                """
+                INSERT INTO guild_news_target_seen_posts (
+                    target_id, post_id, seen_at, announced_at
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(target_id, post_id) DO UPDATE SET
+                    seen_at = excluded.seen_at,
+                    announced_at = COALESCE(
+                        excluded.announced_at,
+                        guild_news_target_seen_posts.announced_at
+                    )
+                """,
+                ((target_id, post_id, now, announced_at) for post_id in ids),
+            )
+            self._connection.commit()
+
+    def save_posts(self, posts: Iterable[NewsPost]) -> tuple[int, list[str]]:
+        """저장. 반환값: (저장 수, 내용이 변경된 post_id 목록)."""
+        posts_list = list(posts)
+        if not posts_list:
+            return 0, []
+        now = _now_iso()
+        saved = 0
+        changed_post_ids: list[str] = []
+        with self._lock:
+            ids = [p.post_id for p in posts_list]
+            placeholders = ",".join("?" * len(ids))
+            existing_hashes: dict[str, str] = {
+                row["post_id"]: row["content_hash"]
+                for row in self._connection.execute(
+                    f"SELECT post_id, content_hash FROM posts WHERE post_id IN ({placeholders})",
+                    ids,
+                ).fetchall()
+            }
+            for post in posts_list:
+                new_hash = _post_content_hash(post)
+                old_hash = existing_hashes.get(post.post_id)
                 cursor = self._connection.execute(
                     """
                     INSERT INTO posts (
                         post_id, source_user, url, text, title, created_at, language,
-                        image_urls, raw_json, saved_at
+                        image_urls, raw_json, saved_at, content_hash
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(post_id) DO UPDATE SET
                         source_user = excluded.source_user,
                         url = excluded.url,
@@ -691,7 +1083,8 @@ class SQLiteStorage:
                         created_at = excluded.created_at,
                         language = excluded.language,
                         image_urls = excluded.image_urls,
-                        raw_json = excluded.raw_json
+                        raw_json = excluded.raw_json,
+                        content_hash = excluded.content_hash
                     """,
                     (
                         post.post_id,
@@ -704,13 +1097,16 @@ class SQLiteStorage:
                         json.dumps(post.image_urls, ensure_ascii=False),
                         json.dumps(post.raw, ensure_ascii=False),
                         now,
+                        new_hash,
                     ),
                 )
                 if cursor.rowcount:
                     saved += 1
+                if old_hash is not None and old_hash != "" and old_hash != new_hash:
+                    changed_post_ids.append(post.post_id)
             self._connection.commit()
 
-        return saved
+        return saved, changed_post_ids
 
     def get_post(self, post_id: str) -> NewsPost | None:
         with self._lock:
@@ -839,12 +1235,75 @@ class SQLiteStorage:
             )
             self._connection.commit()
 
+    def get_announced_guild_ids(self, post_id: str) -> list[int]:
+        """해당 게시물을 이미 공지한 서버 ID 목록."""
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT gs.guild_id
+                FROM guild_seen_posts gsp
+                JOIN guild_settings gs ON gs.guild_id = gsp.guild_id
+                WHERE gsp.post_id = ? AND gsp.announced_at IS NOT NULL
+                  AND gs.enabled = 1 AND gs.channel_id IS NOT NULL
+                """,
+                (post_id,),
+            ).fetchall()
+        return [int(row["guild_id"]) for row in rows]
+
+    def get_announced_news_targets(self, post_id: str) -> list[GuildNewsTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT gnt.target_id, gnt.guild_id, gnt.channel_id, gnt.language,
+                       gnt.created_at, gnt.updated_at
+                FROM guild_news_target_seen_posts gntsp
+                JOIN guild_news_targets gnt ON gnt.target_id = gntsp.target_id
+                JOIN guild_settings gs ON gs.guild_id = gnt.guild_id
+                WHERE gntsp.post_id = ? AND gntsp.announced_at IS NOT NULL
+                  AND gs.enabled = 1
+                ORDER BY gnt.guild_id, gnt.channel_id
+                """,
+                (post_id,),
+            ).fetchall()
+
+        return [self._row_to_news_target(row) for row in rows]
+
+    def delete_guild_data(self, guild_id: int) -> None:
+        with self._lock:
+            target_rows = self._connection.execute(
+                "SELECT target_id FROM guild_news_targets WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchall()
+            target_ids = [int(row["target_id"]) for row in target_rows]
+            if target_ids:
+                placeholders = ", ".join("?" for _ in target_ids)
+                self._connection.execute(
+                    f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                    target_ids,
+                )
+            self._connection.execute(
+                "DELETE FROM guild_news_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM guild_seen_posts WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM tracked_messages WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.commit()
+
+    def reset_guild_settings(self, guild_id: int) -> None:
+        self.delete_guild_data(guild_id)
+
     @staticmethod
     def _row_to_settings(row: sqlite3.Row) -> GuildSettings:
         cleanup_days = int(row["auto_cleanup_days"] or DEFAULT_AUTO_CLEANUP_DAYS)
         cleanup_days = max(MIN_CLEANUP_DAYS, min(MAX_CLEANUP_DAYS, cleanup_days))
         image_delivery = str(row["image_delivery"] or DEFAULT_IMAGE_DELIVERY)
-        if image_delivery not in {"files", "embeds"}:
+        if image_delivery != "files":
             image_delivery = DEFAULT_IMAGE_DELIVERY
         return GuildSettings(
             guild_id=int(row["guild_id"]),
@@ -866,9 +1325,20 @@ class SQLiteStorage:
         )
 
     @staticmethod
+    def _row_to_news_target(row: sqlite3.Row) -> GuildNewsTarget:
+        return GuildNewsTarget(
+            target_id=int(row["target_id"]),
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            language=str(row["language"] or "koreana"),
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
     def _row_to_user_settings(row: sqlite3.Row) -> UserSettings:
         raw_delivery = row["image_delivery"] if "image_delivery" in row.keys() else None
-        image_delivery = str(raw_delivery) if raw_delivery in ("files", "embeds") else None
+        image_delivery = "files" if raw_delivery == "files" else None
         return UserSettings(
             user_id=int(row["user_id"]),
             username=str(row["username"] or ""),

@@ -152,12 +152,17 @@ class AppConfig:
     announce_existing_on_first_run: bool
 
     @classmethod
-    def from_env(cls) -> "AppConfig":
+    def from_env(cls, *, test: bool = False) -> "AppConfig":
         _load_dotenv_if_available()
 
-        discord_token = os.getenv("DISCORD_TOKEN", "").strip()
-        if not discord_token:
-            raise RuntimeError("DISCORD_TOKEN is required.")
+        if test:
+            discord_token = os.getenv("DISCORD_TOKEN_TEST", "").strip()
+            if not discord_token:
+                raise RuntimeError("DISCORD_TOKEN_TEST is required for test mode.")
+        else:
+            discord_token = os.getenv("DISCORD_TOKEN", "").strip()
+            if not discord_token:
+                raise RuntimeError("DISCORD_TOKEN is required.")
 
         command_guild_id = _get_optional_int("COMMAND_GUILD_ID")
         return cls(

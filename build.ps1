@@ -20,6 +20,7 @@ Remove-Item -Recurse -Force "$root\dist", "$root\build" -ErrorAction SilentlyCon
     --name=Limpi `
     --add-data "$root\.env;." `
     --add-data "$root\logo.ico;." `
+    --add-data "$root\img;img" `
     --hidden-import=bot `
     --hidden-import=config `
     --hidden-import=models `

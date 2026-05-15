@@ -26,6 +26,12 @@ function Invoke-NativeOrThrow {
     }
 }
 
+$testMode = $args -contains "--test"
+
+if ($testMode) {
+    Write-Host "테스트 모드: DISCORD_TOKEN_TEST 토큰을 사용합니다."
+}
+
 if (-not (Test-Path ".env")) {
     Write-Warning ".env file was not found. Copy .env.example to .env and fill DISCORD_TOKEN."
 }
@@ -61,4 +67,8 @@ if (-not $dependenciesInstalled) {
 }
 
 Write-Host "Starting Limpi bot..."
-Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("bot.py")
+if ($testMode) {
+    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("bot.py", "--test")
+} else {
+    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("bot.py")
+}
