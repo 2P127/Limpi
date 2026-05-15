@@ -6,7 +6,6 @@ try {
     chcp 65001 > $null
 }
 catch {
-    # Ignore code page changes on hosts that do not support chcp.
 }
 
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"

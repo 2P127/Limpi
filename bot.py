@@ -33,20 +33,16 @@ USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
 ZIP_CACHE_MAX_ITEMS = 8
-# 메모리 풋프린트 제한: 큰 이미지가 캐시를 점령하지 못하게 항목 수 + 총 바이트 + 항목당 상한을 둡니다.
 IMAGE_CACHE_MAX_ITEMS = 64
-IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024   # 누적 64 MB 상한
-IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024  # 항목당 4 MB 초과 시 캐시하지 않음
+IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
 IMAGE_CACHE_WARM_POST_LIMIT = 5
 NEWS_BANNER_PATH = Path("img") / "banner.png"
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
 YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
 LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS = (
-    # "1dc5775f3444c32d11acb9d57c03232157739877",
-    # "62e63adbc551470064256668df2ba6cae5138cad",
 )
 EMBEDS_PER_MESSAGE = 10
-# 이미지 전용 임베드를 한 메시지에 많이 넣으면 디스코드가 격자로 붙여 레이아웃이 깨집니다.
 IMAGE_ONLY_EMBEDS_PER_MESSAGE = 4
 EMBED_DESCRIPTION_LIMIT = 8096
 FILES_PER_MESSAGE = 10
@@ -67,8 +63,43 @@ LANGUAGE_LABELS = {
     "english": "English",
     "japanese": "日本語",
 }
+NEWS_UI_TEXT = {
+    "koreana": {
+        "schedule": "일정",
+        "original": "원문 보기",
+        "download_images": "이미지 다운로드",
+        "updated": "-# 🔄 수정된 소식입니다.",
+        "zip_unavailable": "지금은 다운로드를 처리할 수 없어요.",
+        "zip_no_images": "이 게시물에는 이미지가 없어요.",
+        "zip_fetch_failed": "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
+        "zip_empty": "이미지를 다운로드하지 못했어요.",
+        "zip_ready": "이미지 {count}장을 압축했어요.",
+    },
+    "english": {
+        "schedule": "Schedule",
+        "original": "View original",
+        "download_images": "Download images",
+        "updated": "-# 🔄 This news was updated.",
+        "zip_unavailable": "Downloads are unavailable right now.",
+        "zip_no_images": "This post has no images.",
+        "zip_fetch_failed": "Something went wrong while fetching the images. Please try again later.",
+        "zip_empty": "Could not download the images.",
+        "zip_ready": "Compressed {count} images.",
+    },
+    "japanese": {
+        "schedule": "日程",
+        "original": "原文を見る",
+        "download_images": "画像をダウンロード",
+        "updated": "-# 🔄 このお知らせは更新されました。",
+        "zip_unavailable": "現在、ダウンロードを処理できません。",
+        "zip_no_images": "この投稿には画像がありません。",
+        "zip_fetch_failed": "画像の取得中に問題が発生しました。しばらくしてからもう一度お試しください。",
+        "zip_empty": "画像をダウンロードできませんでした。",
+        "zip_ready": "画像{count}枚を圧縮しました。",
+    },
+}
 SYNC_LANGUAGES = ("koreana", "english", "japanese")
-MAINTENANCE_WEEKDAY = 3  # Thursday in datetime.weekday(), KST 기준
+MAINTENANCE_WEEKDAY = 3
 MAINTENANCE_START_HOUR = 10
 MAINTENANCE_UPDATE_HOUR = 12
 MAINTENANCE_START_TITLE = "림버스 컴퍼니 점검 알림"
@@ -79,7 +110,7 @@ MAINTENANCE_START_DESCRIPTION = (
 MAINTENANCE_UPDATE_TITLE = "림버스 컴퍼니 업데이트"
 MAINTENANCE_UPDATE_DESCRIPTION = (
     "지금 림버스 컴퍼니가 점검이 끝나고 업데이트가 되었어요! "
-    "스팀에 들어가서 업데이트 해주세요! :3"
+    "스팀에 들어가서 림버스를 업데이트 해주세요! <3"
 )
 
 
@@ -238,10 +269,10 @@ class ZipDownloadButton(
     discord.ui.DynamicItem[discord.ui.Button],
     template=r"limpi:zip:(?P<post_id>.+)",
 ):
-    def __init__(self, post_id: str) -> None:
+    def __init__(self, post_id: str, *, language: str = "koreana") -> None:
         super().__init__(
             discord.ui.Button(
-                label="이미지 다운로드",
+                label=_news_ui_text(language, "download_images"),
                 style=discord.ButtonStyle.primary,
                 custom_id=f"{ZIP_CUSTOM_ID_PREFIX}{post_id}",
                 emoji="🗂️",
@@ -250,14 +281,14 @@ class ZipDownloadButton(
         self.post_id = post_id
 
     @classmethod
-    async def from_custom_id(cls, interaction, item, match):  # type: ignore[override]
+    async def from_custom_id(cls, interaction, item, match):
         return cls(match["post_id"])
 
     async def callback(self, interaction: discord.Interaction) -> None:
         cog = interaction.client.get_cog("NewsCog")
         if not isinstance(cog, NewsCog):
             await interaction.response.send_message(
-                "지금은 다운로드를 처리할 수 없어요.", ephemeral=True
+                _news_ui_text("koreana", "zip_unavailable"), ephemeral=True
             )
             return
         await cog.handle_zip_request(interaction, self.post_id)
@@ -466,8 +497,6 @@ class NewsCog(commands.Cog):
             await self._cleanup_expired_messages()
         except Exception:
             LOGGER.exception("추적 메시지 정리 실패.")
-        # 장시간 가동 시 cyclic GC가 잘 안 도는 큰 객체(이미지 바이트 등)를 회수해
-        # RSS가 우상향하는 현상을 막습니다.
         collected = gc.collect()
         if collected:
             LOGGER.debug("gc.collect 정리 객체 수: %s", collected)
@@ -1526,9 +1555,10 @@ class NewsCog(commands.Cog):
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         post = self.storage.get_post(post_id)
+        language = _post_language(post) if post is not None else "koreana"
         if post is None or not _content_image_urls(post):
             await interaction.followup.send(
-                "이 게시물에는 이미지가 없어요.", ephemeral=True
+                _news_ui_text(language, "zip_no_images"), ephemeral=True
             )
             return
 
@@ -1544,21 +1574,21 @@ class NewsCog(commands.Cog):
         except Exception:
             LOGGER.exception("게시물 %s의 이미지 ZIP 생성 실패.", post_id)
             await interaction.followup.send(
-                "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
+                _news_ui_text(language, "zip_fetch_failed"),
                 ephemeral=True,
             )
             return
 
         if buffer is None or count == 0:
             await interaction.followup.send(
-                "이미지를 다운로드하지 못했어요.", ephemeral=True
+                _news_ui_text(language, "zip_empty"), ephemeral=True
             )
             return
 
         filename = _safe_zip_filename(post)
         file = discord.File(buffer, filename=filename)
         await interaction.followup.send(
-            f"이미지 {count}장을 압축했어요.",
+            _news_ui_text(language, "zip_ready").format(count=count),
             file=file,
             ephemeral=True,
         )
@@ -1867,8 +1897,6 @@ class NewsCog(commands.Cog):
         self,
         urls: list[str],
     ) -> list[asyncio.Task[list[discord.File]]]:
-        """이미지 URL 목록을 배치 크기로 나눠 배치별 독립 Task를 반환.
-        모든 배치의 다운로드가 즉시 시작되며, 배치별로 완료 즉시 전송 가능."""
         if not urls:
             return []
         semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
@@ -1888,7 +1916,6 @@ class NewsCog(commands.Cog):
         offset: int,
         urls: list[str],
     ) -> list[discord.File]:
-        """단일 배치(최대 FILES_PER_MESSAGE장)를 병렬 다운로드해 discord.File 목록으로 반환."""
         image_tasks = [
             asyncio.create_task(self._prepare_zip_image(semaphore, offset + i, url))
             for i, url in enumerate(urls)
@@ -1941,7 +1968,6 @@ class NewsCog(commands.Cog):
     async def _download_image(self, url: str) -> tuple[bytes, str | None] | None:
         cached = self._image_cache.get(url)
         if cached is not None:
-            # Hit: dict 끝으로 재삽입해 LRU 신선도 갱신 (Python dict는 삽입 순서 보존).
             self._image_cache[url] = self._image_cache.pop(url)
             return cached
 
@@ -1960,7 +1986,6 @@ class NewsCog(commands.Cog):
 
     def _cache_image(self, url: str, data: bytes, content_type: str | None) -> None:
         size = len(data)
-        # 단발성 거대 이미지가 캐시를 폭발시키지 않도록 항목당 상한 통과 못하면 스킵.
         if size > IMAGE_CACHE_MAX_ITEM_BYTES:
             return
         prev = self._image_cache.pop(url, None)
@@ -1968,7 +1993,6 @@ class NewsCog(commands.Cog):
             self._image_cache_bytes -= len(prev[0])
         self._image_cache[url] = (data, content_type)
         self._image_cache_bytes += size
-        # 항목 수 또는 누적 바이트 중 하나라도 초과하면 가장 오래된 항목부터 evict (LRU).
         while self._image_cache and (
             len(self._image_cache) > IMAGE_CACHE_MAX_ITEMS
             or self._image_cache_bytes > IMAGE_CACHE_MAX_BYTES
@@ -2497,7 +2521,7 @@ class NewsCog(commands.Cog):
                 LOGGER.exception("최신 뉴스 조회 실패. 캐시를 사용합니다.")
                 fresh = []
             if fresh:
-                self.storage.save_posts(fresh[:NEWS_POST_LIMIT])  # type: ignore[assignment]
+                self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
                 self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
                 post = fresh[0]
 
@@ -2726,7 +2750,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/서버동기화",
-            value="서버를 즉시 동기화합니다. (서버 전용)",
+            value="현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인합니다. (서버 관리 권한 필요)",
             inline=False,
         )
         embed.add_field(
@@ -2758,59 +2782,82 @@ class NewsCog(commands.Cog):
         embed.set_footer(text=f"한 번에 가져오는 소식 수: 최대 {NEWS_POST_LIMIT}개")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="서버동기화", description="Steam 뉴스 소스 + 디스코드 서버와 봇을 연동합니다.")
+    @app_commands.command(name="서버동기화", description="현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     async def sync_news(self, interaction: discord.Interaction) -> None:
-        if self.news_source is None:
+        if interaction.guild_id is None or interaction.guild is None:
             await interaction.response.send_message(
-                "Steam 뉴스 소스가 설정되지 않았어요. .env의 STEAM_APP_ID 또는 STEAM_NEWS_URL을 확인해주세요.",
+                "서버 안에서만 사용할 수 있어요.",
                 ephemeral=True,
             )
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        async with self._poll_lock:
-            settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-            try:
-                posts_by_language, _changed_post_ids = await self._sync_global_news_cache()
-            except Exception:
-                LOGGER.exception("수동 Steam 뉴스 동기화 실패.")
-                await interaction.followup.send(
-                    "Steam 뉴스 피드를 가져오지 못했어요. 콘솔 로그를 확인해주세요.",
-                    ephemeral=True,
-                )
-                return
-            all_posts = [
-                post
-                for posts in posts_by_language.values()
-                for post in posts
-            ]
-            if interaction.guild_id and all_posts:
-                self.storage.mark_posts_seen(
-                    interaction.guild_id,
-                    (post.post_id for post in all_posts),
-                )
-                for target in self.storage.list_news_targets(interaction.guild_id):
-                    target_posts = posts_by_language.get(target.language, [])
-                    self.storage.mark_news_target_posts_seen(
-                        target.target_id,
-                        (post.post_id for post in target_posts),
-                    )
-                if settings and settings.last_seen_post_id is None:
-                    preferred_posts = posts_by_language.get(settings.language) if settings else None
-                    newest_post = (preferred_posts or all_posts)[0]
-                    self.storage.set_last_seen_post_id(interaction.guild_id, newest_post.post_id)
 
-        summary = ", ".join(
-            f"{_language_label(language)} {len(posts_by_language.get(language, []))}개"
-            for language in SYNC_LANGUAGES
+        settings, created = self.storage.ensure_guild_settings(interaction.guild_id)
+        targets = self.storage.list_news_targets(interaction.guild_id)
+
+        try:
+            synced_commands = await self.bot.tree.sync()
+        except discord.HTTPException:
+            LOGGER.exception(
+                "서버 명령어 준비 중 글로벌 명령어 동기화 실패 (guild_id=%s).",
+                interaction.guild_id,
+            )
+            synced_commands = []
+            command_status = "명령어 동기화 확인 실패 (콘솔 로그를 확인해주세요)"
+        else:
+            command_status = f"명령어 {len(synced_commands)}개 동기화 확인 완료"
+
+        role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
+        target_text = _format_news_targets(targets)
+        status_text = "새로 등록됨" if created else "이미 등록됨"
+        embed = discord.Embed(
+            title="서버 동기화가 완료되었어요",
+            description=(
+                "현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인했어요.\n"
+                "이 명령어는 Steam 소식을 새로 불러오지 않아요."
+            ),
+            color=discord.Color.from_rgb(179, 28, 28),
+        )
+        embed.add_field(
+            name="서버 DB",
+            value=(
+                f"상태: {status_text}\n"
+                f"서버: {interaction.guild.name} (`{interaction.guild_id}`)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="명령어 준비",
+            value=command_status,
+            inline=False,
+        )
+        embed.add_field(
+            name="현재 설정",
+            value=(
+                f"언어별 소식 채널\n{target_text}\n"
+                f"기본 언어: {_language_label(settings.language)}\n"
+                f"역할 핑: {role_text}\n"
+                f"새 게시물 자동 알림: {'켜짐' if settings.enabled else '꺼짐'}"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="다음 설정",
+            value=(
+                "자동 소식 채널은 `/소식채널설정`으로 등록해주세요.\n"
+                "역할 핑, 기본 언어, 공개 소식 전송은 `/서버설정`에서 바꿀 수 있어요."
+            ),
+            inline=False,
         )
         await interaction.followup.send(
-            f"서버와 동기화가 완료되었어요!",
+            embed=embed,
             ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
 
@@ -2917,7 +2964,8 @@ def _description_for_post(post: NewsPost) -> str:
     description = chunks[0] if chunks else post.url
     schedule_text = _schedule_text_for_post(post)
     if schedule_text:
-        schedule_block = f"\n\n**일정**\n{schedule_text}"
+        schedule_label = _news_ui_text(_post_language(post), "schedule")
+        schedule_block = f"\n\n**{schedule_label}**\n{schedule_text}"
         if len(description) + len(schedule_block) <= EMBED_DESCRIPTION_LIMIT:
             description = f"{description}{schedule_block}"
     return description
@@ -2948,9 +2996,10 @@ def _build_layout_view_for_post(
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=discord.Color.from_rgb(179, 28, 28))
+    language = _post_language(post)
 
     if is_update:
-        container.add_item(discord.ui.TextDisplay("-# 🔄 수정된 소식입니다."))
+        container.add_item(discord.ui.TextDisplay(_news_ui_text(language, "updated")))
     if leading_text:
         container.add_item(discord.ui.TextDisplay(leading_text))
 
@@ -2959,10 +3008,18 @@ def _build_layout_view_for_post(
         banner_gallery.add_item(media=f"attachment://{NEWS_BANNER_ATTACHMENT_NAME}")
         container.add_item(banner_gallery)
 
-    _UPDATE_BADGE = "-# 🔄 수정된 소식입니다."
+    update_badge = _news_ui_text(language, "updated")
     schedule_text = _schedule_text_for_post(post)
-    schedule_display = f"**일정**\n{schedule_text}" if schedule_text else ""
-    overhead = (len(_UPDATE_BADGE) if is_update else 0) + (len(schedule_display) if schedule_display else 0) + (len(leading_text) if leading_text else 0)
+    schedule_display = (
+        f"**{_news_ui_text(language, 'schedule')}**\n{schedule_text}"
+        if schedule_text
+        else ""
+    )
+    overhead = (
+        (len(update_badge) if is_update else 0)
+        + (len(schedule_display) if schedule_display else 0)
+        + (len(leading_text) if leading_text else 0)
+    )
     body_limit = max(100, 4000 - overhead)
 
     container.add_item(
@@ -2989,13 +3046,13 @@ def _build_layout_view_for_post(
     if post.url:
         action_row.add_item(
             discord.ui.Button(
-                label="원문 보기",
+                label=_news_ui_text(language, "original"),
                 style=discord.ButtonStyle.link,
                 url=post.url,
             )
         )
     if include_zip_button and _content_image_urls(post):
-        action_row.add_item(ZipDownloadButton(post.post_id))
+        action_row.add_item(ZipDownloadButton(post.post_id, language=language))
     if action_row.children:
         container.add_item(discord.ui.Separator())
         container.add_item(action_row)
@@ -3018,16 +3075,17 @@ def _build_view_for_post(
     include_zip_button: bool,
 ) -> discord.ui.View | None:
     view = discord.ui.View(timeout=None)
+    language = _post_language(post)
     if post.url:
         view.add_item(
             discord.ui.Button(
-                label="원문 보기",
+                label=_news_ui_text(language, "original"),
                 style=discord.ButtonStyle.link,
                 url=post.url,
             )
         )
     if include_zip_button and _content_image_urls(post):
-        view.add_item(ZipDownloadButton(post.post_id))
+        view.add_item(ZipDownloadButton(post.post_id, language=language))
     return view if view.children else None
 
 
@@ -3054,6 +3112,12 @@ def _maintenance_embed(title: str, description: str) -> discord.Embed:
 
 def _language_label(language: str) -> str:
     return LANGUAGE_LABELS.get(language, language)
+
+
+def _news_ui_text(language: str, key: str) -> str:
+    language_text = (language or "koreana").strip()
+    texts = NEWS_UI_TEXT.get(language_text) or NEWS_UI_TEXT["koreana"]
+    return texts.get(key) or NEWS_UI_TEXT["koreana"][key]
 
 
 def _format_news_targets(targets: list[GuildNewsTarget]) -> str:
@@ -3253,9 +3317,6 @@ async def main() -> None:
     _console_handler.setFormatter(_fmt)
     logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
 
-    # 10062 = Discord interaction expired before bot responded — harmless, suppress noise.
-    # Covers both autocomplete timeouts and commands where defer() races the 3-second window.
-    # exc_info holds the actual exception; getMessage() only has the headline.
     class _DropExpiredInteraction(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             if record.exc_info:
@@ -3298,7 +3359,13 @@ async def main() -> None:
                 guild.member_count,
             )
 
-            settings = storage.get_settings(guild.id)
+            settings, created = storage.ensure_guild_settings(guild.id)
+            if created:
+                LOGGER.info(
+                    "참가한 서버를 DB에 등록했습니다: guild=%s (%s)",
+                    guild.name,
+                    guild.id,
+                )
             if settings.channel_id:
                 channel = bot.get_channel(settings.channel_id) if settings.channel_id else None
                 channel_name = getattr(channel, "name", None) or "unknown"

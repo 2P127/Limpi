@@ -47,7 +47,6 @@ def _load_dotenv_if_available() -> None:
 
     import sys as _sys
     if getattr(_sys, "frozen", False):
-        # Frozen exe: prefer .env next to the exe (user can override), fall back to bundled copy
         exe_dir = os.path.dirname(_sys.executable)
         env_path = os.path.join(exe_dir, ".env")
         if not os.path.exists(env_path):

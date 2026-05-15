@@ -15,3 +15,5 @@ build/
 *.spec
 limpi.ico
 AGENTS.md
+BOT_USAGE.md
+RELEASE_GUIDE.md

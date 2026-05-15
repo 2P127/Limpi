@@ -1,7 +1,5 @@
-"""Limpi Bot GUI Launcher — system tray + management window."""
 from __future__ import annotations
 
-# ── Worker mode (must run before any heavy imports) ───────────────────────────
 import multiprocessing
 import sys
 
@@ -10,10 +8,9 @@ multiprocessing.freeze_support()
 _WORKER_FLAG = "--bot-worker"
 if _WORKER_FLAG in sys.argv:
     import asyncio
-    import bot  # bundled by PyInstaller; runs in subprocess with no GUI
+    import bot
     sys.exit(asyncio.run(bot.main()))
 
-# ── GUI mode ──────────────────────────────────────────────────────────────────
 import datetime
 import os
 import subprocess
@@ -28,9 +25,8 @@ import pystray
 
 if getattr(sys, "frozen", False):
     _BASE = os.path.dirname(sys.executable)
-    PYTHON = sys.executable          # exe spawns itself with --bot-worker
-    BOT_SCRIPT = None                # not used in frozen mode
-    # add-data 번들 파일은 _MEIPASS(임시 압축 해제 폴더)에 있음
+    PYTHON = sys.executable
+    BOT_SCRIPT = None
     _MEIPASS = getattr(sys, "_MEIPASS", _BASE)
     ICON_PATH = os.path.join(_MEIPASS, "logo.ico")
 else:
@@ -40,7 +36,6 @@ else:
     ICON_PATH = os.path.join(_BASE, "logo.ico")
 MAX_LOG_LINES = 2000
 
-# ── colour palette (Catppuccin Mocha) ────────────────────────────────────────
 C_BG       = "#1e1e2e"
 C_SURFACE  = "#11111b"
 C_TEXT     = "#cdd6f4"
@@ -53,7 +48,6 @@ C_PEACH    = "#fab387"
 
 
 _BELOW_NORMAL_PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
-# 백그라운드 동작이 전경 작업을 방해하지 않도록 우선순위를 한 단계 낮춥니다.
 _CPU_LOGICAL_COUNT = psutil.cpu_count(logical=True) or 1
 
 
@@ -94,7 +88,6 @@ class BotProcess:
             )
             try:
                 self._psutil = psutil.Process(self.proc.pid)
-                # 첫 CPU 측정은 baseline용 (다음 호출부터 정확한 %).
                 self._psutil.cpu_percent(interval=None)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 self._psutil = None
@@ -142,13 +135,10 @@ class BotProcess:
         return self.start_time.strftime("%Y-%m-%d %H:%M:%S")
 
     def metrics(self) -> tuple[float | None, float | None]:
-        """현재 봇 프로세스의 (CPU %, RAM MB) 반환. 실패 시 (None, None)."""
         proc = self._psutil
         if proc is None or not self.is_running():
             return None, None
         try:
-            # cpu_percent(None)은 직전 호출 이후 누적 사용률 / 논리코어 수.
-            # 100%가 1코어 풀가동을 의미하도록 코어 수로 나눕니다.
             cpu = proc.cpu_percent(interval=None) / _CPU_LOGICAL_COUNT
             ram = proc.memory_info().rss / (1024 * 1024)
             return cpu, ram
@@ -174,10 +164,7 @@ class LimpiLauncher:
         self._update_status()
         self.bot.start()
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-
     def _build_ui(self) -> None:
-        # ── top bar ──
         top = tk.Frame(self.root, bg=C_BG, pady=10, padx=14)
         top.pack(fill=tk.X)
 
@@ -207,7 +194,6 @@ class LimpiLauncher:
         )
         self._metric_label.pack(side=tk.LEFT, padx=10)
 
-        # ── buttons ──
         btn_frame = tk.Frame(top, bg=C_BG)
         btn_frame.pack(side=tk.RIGHT)
 
@@ -223,16 +209,13 @@ class LimpiLauncher:
                 activebackground=color, activeforeground=C_BG,
             ).pack(side=tk.LEFT, padx=3)
 
-        # ── separator ──
         tk.Frame(self.root, bg=C_SUBTEXT, height=1).pack(fill=tk.X)
 
-        # ── log label ──
         tk.Label(
             self.root, text="로그", fg=C_SUBTEXT, bg=C_BG,
             font=("Segoe UI", 8), anchor="w", padx=14,
         ).pack(fill=tk.X)
 
-        # ── log area ──
         log_frame = tk.Frame(self.root, bg=C_SURFACE)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
@@ -252,8 +235,6 @@ class LimpiLauncher:
         self._log.tag_config("warning", foreground=C_YELLOW)
         self._log.tag_config("info",    foreground=C_BLUE)
         self._log.tag_config("system",  foreground=C_SUBTEXT, font=("Consolas", 9, "italic"))
-
-    # ── tray ─────────────────────────────────────────────────────────────────
 
     def _build_tray(self) -> None:
         icon_img = Image.open(ICON_PATH).convert("RGBA") if os.path.exists(ICON_PATH) else self._make_fallback_icon()
@@ -278,8 +259,6 @@ class LimpiLauncher:
     def _tray_show(self, _icon=None, _item=None) -> None:
         self.root.after(0, self._show_window)
 
-    # ── log handling ──────────────────────────────────────────────────────────
-
     def _queue_log(self, line: str) -> None:
         self.root.after(0, self._flush_log, line)
 
@@ -301,14 +280,11 @@ class LimpiLauncher:
         self._log.insert(tk.END, line + "\n", tag or ())
         self._log.see(tk.END)
 
-        # trim old lines
         total = int(self._log.index("end-1c").split(".")[0])
         if total > MAX_LOG_LINES:
             self._log.delete("1.0", f"{total - MAX_LOG_LINES}.0")
 
         self._log.config(state=tk.DISABLED)
-
-    # ── status ticker ─────────────────────────────────────────────────────────
 
     def _update_status(self) -> None:
         running = self.bot.is_running()
@@ -333,10 +309,7 @@ class LimpiLauncher:
             self._status_label.config(text=" 중지됨", fg=C_RED)
             self._uptime_label.config(text="  가동 시간: –")
             self._metric_label.config(text="", fg=C_SUBTEXT)
-        # 1초 간격 — psutil cpu_percent의 적정 샘플링 구간.
         self.root.after(1000, self._update_status)
-
-    # ── button handlers ───────────────────────────────────────────────────────
 
     def _clear_log(self) -> None:
         self._log.config(state=tk.NORMAL)
@@ -366,8 +339,6 @@ class LimpiLauncher:
         self.bot.stop()
         self._tray.stop()
         self.root.after(0, self.root.destroy)
-
-    # ── entry ─────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         self.root.mainloop()

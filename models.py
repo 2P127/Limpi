@@ -52,7 +52,7 @@ class UserSettings:
     username: str
     nickname: str | None
     language: str
-    image_delivery: str | None  # None = 서버 기본값 사용
+    image_delivery: str | None
     created_at: datetime | None
     updated_at: datetime | None
 

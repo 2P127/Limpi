@@ -22,7 +22,6 @@ MAX_CLEANUP_DAYS = 7
 
 
 def _post_content_hash(post: "NewsPost") -> str:
-    """제목·본문·이미지 URL 기반 내용 해시 (변경 감지용)."""
     raw = f"{post.title}\x00{post.text}\x00{json.dumps(post.image_urls, sort_keys=True)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -186,7 +185,6 @@ class SQLiteStorage:
             self._ensure_column("user_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column("user_settings", "image_delivery", "TEXT")
             self._ensure_column("posts", "content_hash", "TEXT NOT NULL DEFAULT ''")
-            # 이미지 전송 방식 임베드 → 첨부파일 일괄 마이그레이션
             self._connection.execute(
                 "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
             )
@@ -458,6 +456,18 @@ class SQLiteStorage:
 
         return self._row_to_settings(row)
 
+    def ensure_guild_settings(self, guild_id: int) -> tuple[GuildSettings, bool]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM guild_settings WHERE guild_id = ?", (guild_id,)
+            ).fetchone()
+
+        if row is not None:
+            return self._row_to_settings(row), False
+
+        settings = self.update_settings(guild_id)
+        return settings, True
+
     def list_settings(self) -> list[GuildSettings]:
         with self._lock:
             rows = self._connection.execute(
@@ -703,7 +713,6 @@ class SQLiteStorage:
         nickname: str | None,
         image_delivery: str | None,
     ) -> UserSettings:
-        """image_delivery=None → 서버 기본값으로 초기화 (DB에 NULL 저장)."""
         current = self.get_user_settings(user_id)
         now = _now_iso()
         with self._lock:
@@ -1048,7 +1057,6 @@ class SQLiteStorage:
             self._connection.commit()
 
     def save_posts(self, posts: Iterable[NewsPost]) -> tuple[int, list[str]]:
-        """저장. 반환값: (저장 수, 내용이 변경된 post_id 목록)."""
         posts_list = list(posts)
         if not posts_list:
             return 0, []
@@ -1236,7 +1244,6 @@ class SQLiteStorage:
             self._connection.commit()
 
     def get_announced_guild_ids(self, post_id: str) -> list[int]:
-        """해당 게시물을 이미 공지한 서버 ID 목록."""
         with self._lock:
             rows = self._connection.execute(
                 """

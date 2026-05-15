@@ -1,0 +1,85 @@
+name: Build Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Release version name. Leave empty to use KST upload date."
+        required: false
+        type: string
+      publish_release:
+        description: "Create GitHub Release and upload files."
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark GitHub Release as prerelease."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ inputs.version_name }}".Trim()
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            $version = (Get-Date).ToUniversalTime().AddHours(9).ToString("yyyy.MM.dd-HHmm")
+          }
+          $safeTag = $version -replace "[^A-Za-z0-9._-]", "-"
+          if ([string]::IsNullOrWhiteSpace($safeTag)) {
+            $safeTag = (Get-Date).ToUniversalTime().AddHours(9).ToString("yyyy.MM.dd-HHmm")
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=release-$safeTag" >> $env:GITHUB_OUTPUT
+          "asset=$safeTag" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+          .\.venv\Scripts\python.exe -m pip install pyinstaller
+
+      - name: Build executable
+        shell: pwsh
+        run: powershell -File build.ps1
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist\Limpi.exe "release\Limpi-${{ steps.version.outputs.asset }}.exe"
+          git archive --format=zip --output "release\Limpi-source-${{ steps.version.outputs.asset }}.zip" HEAD
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Limpi-${{ steps.version.outputs.version }}
+          path: release/*
+
+      - name: Create GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.version }}
+          prerelease: ${{ inputs.prerelease }}
+          files: release/*
