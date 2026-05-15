@@ -3,7 +3,7 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $iconPath = "$root\logo.ico"
 if (-not (Test-Path $iconPath)) {
-    throw "아이콘 파일이 없습니다: $iconPath"
+    throw "Icon file was not found: $iconPath"
 }
 
 Remove-Item -Recurse -Force "$root\dist", "$root\build" -ErrorAction SilentlyContinue

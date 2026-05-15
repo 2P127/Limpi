@@ -60,7 +60,7 @@ jobs:
 
       - name: Build executable
         shell: pwsh
-        run: powershell -File build.ps1
+        run: ./build.ps1
 
       - name: Prepare release files
         shell: pwsh
