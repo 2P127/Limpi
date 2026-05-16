@@ -2779,8 +2779,27 @@ class NewsCog(commands.Cog):
             value="이 안내를 봅니다.",
             inline=False,
         )
+        embed.add_field(
+            name="/크레딧",
+            value="림피 제작 크레딧을 봅니다.",
+            inline=False,
+        )
         embed.set_footer(text=f"한 번에 가져오는 소식 수: 최대 {NEWS_POST_LIMIT}개")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="크레딧", description="림피 제작 크레딧을 봅니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def credits(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="크레딧",
+            description=(
+                "림피(Limpi) 봇 By. 2P\n"
+                "알림 배너 그림 By. @gamstergd7"
+            ),
+            color=discord.Color.from_rgb(179, 28, 28),
+        )
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="서버동기화", description="현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
