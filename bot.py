@@ -2799,7 +2799,7 @@ class NewsCog(commands.Cog):
             ),
             color=discord.Color.from_rgb(179, 28, 28),
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="서버동기화", description="현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
