@@ -14,6 +14,8 @@ from models import GuildNewsTarget, GuildSettings, NewsPost, TrackedMessage, Use
 DEFAULT_AUTO_CLEANUP_ENABLED = True
 DEFAULT_AUTO_CLEANUP_DAYS = 1
 DEFAULT_IMAGE_DELIVERY = "files"
+DEFAULT_NOTIFICATION_BANNER = "림피 배너.png"
+DISABLED_NOTIFICATION_BANNER = "none"
 DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED = True
 DEFAULT_MISSED_NEWS_RECOVERY_ENABLED = False
 DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED = False
@@ -55,6 +57,7 @@ class SQLiteStorage:
                     auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
                     auto_cleanup_days INTEGER NOT NULL DEFAULT 1,
                     image_delivery TEXT NOT NULL DEFAULT 'files',
+                    notification_banner TEXT DEFAULT '림피 배너.png',
                     public_news_lookup_allowed INTEGER NOT NULL DEFAULT 1,
                     missed_news_recovery_enabled INTEGER NOT NULL DEFAULT 0,
                     maintenance_notifications_enabled INTEGER NOT NULL DEFAULT 0,
@@ -136,6 +139,7 @@ class SQLiteStorage:
                     username TEXT NOT NULL,
                     nickname TEXT,
                     language TEXT NOT NULL DEFAULT 'koreana',
+                    news_banner TEXT DEFAULT '림피 배너.png',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -164,6 +168,11 @@ class SQLiteStorage:
             )
             self._ensure_column(
                 "guild_settings",
+                "notification_banner",
+                "TEXT DEFAULT '림피 배너.png'",
+            )
+            self._ensure_column(
+                "guild_settings",
                 "public_news_lookup_allowed",
                 "INTEGER NOT NULL DEFAULT 1",
             )
@@ -184,6 +193,11 @@ class SQLiteStorage:
             self._ensure_column("user_settings", "nickname", "TEXT")
             self._ensure_column("user_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
             self._ensure_column("user_settings", "image_delivery", "TEXT")
+            self._ensure_column(
+                "user_settings",
+                "news_banner",
+                "TEXT DEFAULT '림피 배너.png'",
+            )
             self._ensure_column("posts", "content_hash", "TEXT NOT NULL DEFAULT ''")
             self._connection.execute(
                 "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
@@ -447,6 +461,7 @@ class SQLiteStorage:
                 auto_cleanup_enabled=DEFAULT_AUTO_CLEANUP_ENABLED,
                 auto_cleanup_days=DEFAULT_AUTO_CLEANUP_DAYS,
                 image_delivery=DEFAULT_IMAGE_DELIVERY,
+                notification_banner=DEFAULT_NOTIFICATION_BANNER,
                 public_news_lookup_allowed=DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED,
                 missed_news_recovery_enabled=DEFAULT_MISSED_NEWS_RECOVERY_ENABLED,
                 maintenance_notifications_enabled=DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED,
@@ -653,6 +668,7 @@ class SQLiteStorage:
                 nickname=None,
                 language="koreana",
                 image_delivery=None,
+                news_banner=DEFAULT_NOTIFICATION_BANNER,
                 created_at=None,
                 updated_at=None,
             )
@@ -733,6 +749,44 @@ class SQLiteStorage:
             self._connection.commit()
         return self.get_user_settings(user_id)
 
+    def update_user_news_banner(
+        self,
+        user_id: int,
+        *,
+        username: str,
+        nickname: str | None,
+        news_banner: str | None,
+    ) -> UserSettings:
+        current = self.get_user_settings(user_id)
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO user_settings (
+                    user_id, username, nickname, language, image_delivery,
+                    news_banner, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    nickname = excluded.nickname,
+                    news_banner = excluded.news_banner,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    username,
+                    nickname,
+                    current.language,
+                    current.image_delivery,
+                    news_banner,
+                    now,
+                    now,
+                ),
+            )
+            self._connection.commit()
+        return self.get_user_settings(user_id)
+
     def update_settings(
         self,
         guild_id: int,
@@ -746,6 +800,7 @@ class SQLiteStorage:
         auto_cleanup_enabled: bool | None = None,
         auto_cleanup_days: int | None = None,
         image_delivery: str | None = None,
+        notification_banner: str | None = None,
         public_news_lookup_allowed: bool | None = None,
         missed_news_recovery_enabled: bool | None = None,
         maintenance_notifications_enabled: bool | None = None,
@@ -780,6 +835,11 @@ class SQLiteStorage:
                 if image_delivery is not None
                 else current.image_delivery
             ),
+            notification_banner=(
+                notification_banner
+                if notification_banner is not None
+                else current.notification_banner
+            ),
             public_news_lookup_allowed=(
                 public_news_lookup_allowed
                 if public_news_lookup_allowed is not None
@@ -805,11 +865,11 @@ class SQLiteStorage:
                 INSERT INTO guild_settings (
                     guild_id, channel_id, role_id, post_format, enabled, language,
                     max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
-                    image_delivery, public_news_lookup_allowed,
+                    image_delivery, notification_banner, public_news_lookup_allowed,
                     missed_news_recovery_enabled, maintenance_notifications_enabled, last_maintenance_start_notice,
                     last_maintenance_update_notice, last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     role_id = excluded.role_id,
@@ -820,6 +880,7 @@ class SQLiteStorage:
                     auto_cleanup_enabled = excluded.auto_cleanup_enabled,
                     auto_cleanup_days = excluded.auto_cleanup_days,
                     image_delivery = excluded.image_delivery,
+                    notification_banner = excluded.notification_banner,
                     public_news_lookup_allowed = excluded.public_news_lookup_allowed,
                     missed_news_recovery_enabled = excluded.missed_news_recovery_enabled,
                     maintenance_notifications_enabled = excluded.maintenance_notifications_enabled,
@@ -836,6 +897,7 @@ class SQLiteStorage:
                     int(next_settings.auto_cleanup_enabled),
                     next_settings.auto_cleanup_days,
                     next_settings.image_delivery,
+                    next_settings.notification_banner,
                     int(next_settings.public_news_lookup_allowed),
                     int(next_settings.missed_news_recovery_enabled),
                     int(next_settings.maintenance_notifications_enabled),
@@ -1324,6 +1386,7 @@ class SQLiteStorage:
             auto_cleanup_enabled=bool(row["auto_cleanup_enabled"]),
             auto_cleanup_days=cleanup_days,
             image_delivery=image_delivery,
+            notification_banner=row["notification_banner"] or DEFAULT_NOTIFICATION_BANNER,
             public_news_lookup_allowed=bool(row["public_news_lookup_allowed"]),
             missed_news_recovery_enabled=bool(row["missed_news_recovery_enabled"]),
             maintenance_notifications_enabled=bool(row["maintenance_notifications_enabled"]),
@@ -1346,12 +1409,14 @@ class SQLiteStorage:
     def _row_to_user_settings(row: sqlite3.Row) -> UserSettings:
         raw_delivery = row["image_delivery"] if "image_delivery" in row.keys() else None
         image_delivery = "files" if raw_delivery == "files" else None
+        news_banner = row["news_banner"] if "news_banner" in row.keys() else None
         return UserSettings(
             user_id=int(row["user_id"]),
             username=str(row["username"] or ""),
             nickname=str(row["nickname"]) if row["nickname"] is not None else None,
             language=str(row["language"] or "koreana"),
             image_delivery=image_delivery,
+            news_banner=str(news_banner) if news_banner else None,
             created_at=_datetime_from_iso(row["created_at"]),
             updated_at=_datetime_from_iso(row["updated_at"]),
         )

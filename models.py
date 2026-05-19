@@ -29,6 +29,7 @@ class GuildSettings:
     auto_cleanup_enabled: bool
     auto_cleanup_days: int
     image_delivery: str
+    notification_banner: str | None
     public_news_lookup_allowed: bool
     missed_news_recovery_enabled: bool
     maintenance_notifications_enabled: bool
@@ -53,6 +54,7 @@ class UserSettings:
     nickname: str | None
     language: str
     image_delivery: str | None
+    news_banner: str | None
     created_at: datetime | None
     updated_at: datetime | None
 

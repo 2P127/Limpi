@@ -21,7 +21,13 @@ from discord.ext import commands, tasks
 
 from config import AppConfig
 from models import GuildNewsTarget, GuildSettings, NewsPost
-from storage import MAX_CLEANUP_DAYS, MIN_CLEANUP_DAYS, SQLiteStorage
+from storage import (
+    DEFAULT_NOTIFICATION_BANNER,
+    DISABLED_NOTIFICATION_BANNER,
+    MAX_CLEANUP_DAYS,
+    MIN_CLEANUP_DAYS,
+    SQLiteStorage,
+)
 from steam_client import NewsSource, build_news_source
 
 
@@ -37,8 +43,10 @@ IMAGE_CACHE_MAX_ITEMS = 64
 IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
 IMAGE_CACHE_WARM_POST_LIMIT = 5
-NEWS_BANNER_PATH = Path("img") / "banner.png"
+NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
+NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
 YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
 LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS = (
 )
@@ -411,7 +419,7 @@ class NewsCog(commands.Cog):
             LOGGER.info(
                 "알림 대상: guild=%s (%s), connected=%s, "
                 "news_enabled=%s, missed_recovery_enabled=%s, maintenance_enabled=%s, "
-                "channel=%s (%s), role=%s (%s), language=%s, image_delivery=%s",
+                "channel=%s (%s), role=%s (%s), language=%s, image_delivery=%s, notification_banner=%s",
                 guild_name,
                 settings.guild_id,
                 settings.guild_id in connected_guild_ids,
@@ -424,6 +432,7 @@ class NewsCog(commands.Cog):
                 settings.role_id or "none",
                 settings.language,
                 settings.image_delivery,
+                settings.notification_banner or "none",
             )
 
         for target in news_targets:
@@ -862,6 +871,21 @@ class NewsCog(commands.Cog):
     def _interaction_image_delivery(self, interaction: discord.Interaction) -> str:
         return IMAGE_DELIVERY_FILES
 
+    def _interaction_banner_filename(
+        self,
+        interaction: discord.Interaction,
+        *,
+        private: bool,
+    ) -> str | None:
+        if (
+            private
+            or interaction.guild_id is None
+            or self._interaction_uses_user_install(interaction)
+        ):
+            self._remember_interaction_user(interaction)
+            return self.storage.get_user_settings(interaction.user.id).news_banner
+        return self.storage.get_settings(interaction.guild_id).notification_banner
+
     def _post_variant_for_language(
         self,
         post: NewsPost,
@@ -1258,6 +1282,7 @@ class NewsCog(commands.Cog):
                 channel,
                 post,
                 settings.role_id,
+                banner_filename=settings.notification_banner,
             )
             return True
         except discord.Forbidden as exc:
@@ -1323,6 +1348,7 @@ class NewsCog(commands.Cog):
                 channel,
                 post,
                 settings.role_id,
+                banner_filename=settings.notification_banner,
             )
             return True
         except discord.Forbidden as exc:
@@ -1406,6 +1432,7 @@ class NewsCog(commands.Cog):
                         channel,
                         post,
                         settings.role_id,
+                        banner_filename=settings.notification_banner,
                         is_update=True,
                     )
                 except Exception:
@@ -1422,6 +1449,7 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         role_id: int | None,
         *,
+        banner_filename: str | None = None,
         is_update: bool = False,
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
@@ -1432,7 +1460,7 @@ class NewsCog(commands.Cog):
         )
 
         standalone_urls = _standalone_image_urls(post, attach_images=True)
-        banner_file = _news_banner_file()
+        banner_file = _news_banner_file(banner_filename)
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=True,
@@ -1477,7 +1505,9 @@ class NewsCog(commands.Cog):
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
         standalone_urls = _standalone_image_urls(post, attach_images=attach_photos)
-        banner_file = _news_banner_file()
+        banner_file = _news_banner_file(
+            self._interaction_banner_filename(interaction, private=private)
+        )
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=attach_photos,
@@ -2039,6 +2069,7 @@ class NewsCog(commands.Cog):
         auto_cleanup="자동삭제",
         cleanup_days="자동삭제일수",
         public_news_send="공개소식전송",
+        notification_banner="알림배너",
     )
     @app_commands.describe(
         role="새 소식과 함께 핑할 역할입니다.",
@@ -2047,6 +2078,7 @@ class NewsCog(commands.Cog):
         auto_cleanup="조회한 소식 메시지를 일정 시간 뒤 자동으로 지울지 여부입니다.",
         cleanup_days="자동 삭제까지의 유예 기간(일)입니다. 1~7 사이로 입력합니다.",
         public_news_send="관리자가 아닌 다른 유저가 /이전소식보기 이나 /최근소식보기 으로 서버 채널에 공개 소식을 보낼 수 있는지 설정합니다.",
+        notification_banner="자동 알림과 서버에서 보내는 소식에 사용할 배너입니다. 이미지 이름 또는 사용 안 함을 고릅니다.",
     )
     @app_commands.choices(
         language=LANGUAGE_CHOICES,
@@ -2063,6 +2095,7 @@ class NewsCog(commands.Cog):
         auto_cleanup: app_commands.Choice[str] | None = None,
         cleanup_days: int | None = None,
         public_news_send: app_commands.Choice[str] | None = None,
+        notification_banner: str | None = None,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
@@ -2075,6 +2108,16 @@ class NewsCog(commands.Cog):
             )
             return
 
+        banner_filename = None
+        if notification_banner is not None:
+            banner_filename = _resolve_banner_filename(notification_banner)
+            if banner_filename is None:
+                await interaction.response.send_message(
+                    "선택한 알림 배너를 찾지 못했어요. `img` 폴더의 배너 이미지 이름이나 `사용 안 함`을 다시 골라주세요.",
+                    ephemeral=True,
+                )
+                return
+
         settings = self.storage.update_settings(
             interaction.guild_id,
             role_id=role.id if role else None,
@@ -2084,12 +2127,14 @@ class NewsCog(commands.Cog):
             auto_cleanup_enabled=_choice_bool(auto_cleanup),
             auto_cleanup_days=cleanup_days,
             public_news_lookup_allowed=_choice_bool(public_news_send),
+            notification_banner=banner_filename,
         )
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
         language_text = _language_label(settings.language)
         cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
         public_news_send_text = _bool_label(settings.public_news_lookup_allowed)
+        banner_text = _banner_display_name(settings.notification_banner)
         embed = discord.Embed(
             title="설정이 완료되었어요~!",
             description=(
@@ -2098,7 +2143,8 @@ class NewsCog(commands.Cog):
                 f"기본 언어: {language_text}\n"
                 f"조회 메시지 자동 삭제: {cleanup_text}\n"
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
-                f"공개 소식 전송: {public_news_send_text}"
+                f"공개 소식 전송: {public_news_send_text}\n"
+                f"알림 배너: {banner_text}"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
         )
@@ -2108,6 +2154,12 @@ class NewsCog(commands.Cog):
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @configure.autocomplete("notification_banner")
+    async def configure_banner_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return _banner_autocomplete_choices(current)
 
     @app_commands.command(name="소식채널설정", description="언어별 자동 소식 채널을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -2288,33 +2340,73 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="유저설정", description="앱에서 사용할 봇 개인 언어를 설정합니다.")
+    @app_commands.command(name="유저설정", description="앱에서 사용할 봇 개인 설정을 변경합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(language="언어")
-    @app_commands.describe(language="앱으로 사용하는 /최근소식보기, /이전소식보기의 표시 언어입니다.")
+    @app_commands.rename(language="언어", news_banner="알림배너")
+    @app_commands.describe(
+        language="앱으로 사용하는 /최근소식보기, /이전소식보기의 표시 언어입니다.",
+        news_banner="앱으로 사용하는 /최근소식보기, /이전소식보기의 배너입니다. 이미지 이름 또는 사용 안 함을 고릅니다.",
+    )
     @app_commands.choices(language=LANGUAGE_CHOICES)
     async def configure_user(
         self,
         interaction: discord.Interaction,
-        language: app_commands.Choice[str],
+        language: app_commands.Choice[str] | None = None,
+        news_banner: str | None = None,
     ) -> None:
+        if language is None and news_banner is None:
+            await interaction.response.send_message(
+                "바꿀 언어나 알림 배너를 하나 이상 선택해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        banner_filename = None
+        if news_banner is not None:
+            banner_filename = _resolve_banner_filename(news_banner)
+            if banner_filename is None:
+                await interaction.response.send_message(
+                    "선택한 알림 배너를 찾지 못했어요. `img` 폴더의 배너 이미지 이름이나 `사용 안 함`을 다시 골라주세요.",
+                    ephemeral=True,
+                )
+                return
+
         user_id, username, nickname = self._interaction_user_values(interaction)
-        settings = self.storage.update_user_language(
-            user_id,
-            username=username,
-            nickname=nickname,
-            language=language.value,
-        )
+        if language is not None:
+            settings = self.storage.update_user_language(
+                user_id,
+                username=username,
+                nickname=nickname,
+                language=language.value,
+            )
+        else:
+            self._remember_interaction_user(interaction)
+            settings = self.storage.get_user_settings(user_id)
+
+        if news_banner is not None:
+            settings = self.storage.update_user_news_banner(
+                user_id,
+                username=username,
+                nickname=nickname,
+                news_banner=banner_filename,
+            )
 
         await interaction.response.send_message(
             (
                 f"개인 언어를 {_language_label(settings.language)}로 설정했어요.\n"
-                "앱으로 사용하는 /최근소식보기와 /이전소식보기에서 이 언어를 사용할게요."
+                f"개인 알림 배너를 {_banner_display_name(settings.news_banner)}로 설정했어요.\n"
+                "앱으로 사용하는 /최근소식보기와 /이전소식보기에서 이 설정을 사용할게요."
             ),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @configure_user.autocomplete("news_banner")
+    async def configure_user_banner_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        return _banner_autocomplete_choices(current)
 
     @app_commands.command(name="역할핑해제", description="새 소식 알림의 역할 핑을 제거합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -2351,6 +2443,7 @@ class NewsCog(commands.Cog):
                 f"조회 메시지 자동 삭제: {'켜짐' if settings.auto_cleanup_enabled else '꺼짐'}\n"
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
                 f"공개 소식 전송: {_bool_label(settings.public_news_lookup_allowed)}\n"
+                f"알림 배너: {_banner_display_name(settings.notification_banner)}\n"
                 "점검 알림: 꺼짐"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
@@ -2399,7 +2492,8 @@ class NewsCog(commands.Cog):
             value=(
                 f"기본 언어: {_language_label(settings.language)}\n"
                 f"역할 핑: {role_text}\n"
-                f"새 게시물 자동 알림: {enabled_text}"
+                f"새 게시물 자동 알림: {enabled_text}\n"
+                f"알림 배너: {_banner_display_name(settings.notification_banner)}"
             ),
             inline=False,
         )
@@ -2629,6 +2723,7 @@ class NewsCog(commands.Cog):
                     target,
                     target_post,
                     role_id,
+                    banner_filename=settings.notification_banner,
                 )
             except discord.Forbidden:
                 failed_channel_ids.append(channel_id)
@@ -2693,6 +2788,7 @@ class NewsCog(commands.Cog):
             name="/서버설정",
             value=(
                 "역할, 자동 알림, 기본 언어, 공개 소식 전송, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
+                "알림 배너는 `img` 폴더의 배너 이미지 이름 또는 `사용 안 함`으로 고릅니다.\n"
                 "자동 알림·자동 삭제 같은 선택 옵션은 `허용`/`비허용`으로 고릅니다.\n"
                 "서버에서만 사용 가능 (서버 관리 권한 필요)."
             ),
@@ -2730,7 +2826,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/유저설정",
-            value="앱으로 사용할 때의 개인 언어를 설정합니다.",
+            value="앱으로 사용할 때의 개인 언어와 /최근소식보기·/이전소식보기 배너를 설정합니다.",
             inline=False,
         )
         embed.add_field(
@@ -2861,7 +2957,8 @@ class NewsCog(commands.Cog):
                 f"언어별 소식 채널\n{target_text}\n"
                 f"기본 언어: {_language_label(settings.language)}\n"
                 f"역할 핑: {role_text}\n"
-                f"새 게시물 자동 알림: {'켜짐' if settings.enabled else '꺼짐'}"
+                f"새 게시물 자동 알림: {'켜짐' if settings.enabled else '꺼짐'}\n"
+                f"알림 배너: {_banner_display_name(settings.notification_banner)}"
             ),
             inline=False,
         )
@@ -2869,7 +2966,7 @@ class NewsCog(commands.Cog):
             name="다음 설정",
             value=(
                 "자동 소식 채널은 `/소식채널설정`으로 등록해주세요.\n"
-                "역할 핑, 기본 언어, 공개 소식 전송은 `/서버설정`에서 바꿀 수 있어요."
+                "역할 핑, 기본 언어, 공개 소식 전송, 알림 배너는 `/서버설정`에서 바꿀 수 있어요."
             ),
             inline=False,
         )
@@ -2893,8 +2990,85 @@ def _resource_path(relative_path: Path) -> Path:
     return base_path / relative_path
 
 
-def _news_banner_file() -> discord.File | None:
-    path = _resource_path(NEWS_BANNER_PATH)
+def _banner_files() -> list[Path]:
+    directory = _resource_path(NEWS_BANNER_DIR)
+    if not directory.exists():
+        return []
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if (
+                path.is_file()
+                and path.suffix.lower() in NEWS_BANNER_EXTENSIONS
+                and "배너" in path.stem
+            )
+        ),
+        key=lambda path: path.stem.casefold(),
+    )
+
+
+def _resolve_banner_filename(value: str | None) -> str | None:
+    if value is None:
+        return None
+    selected = value.strip()
+    if not selected:
+        return None
+    if selected.casefold() in {
+        DISABLED_NOTIFICATION_BANNER.casefold(),
+        NEWS_BANNER_DISABLED_LABEL.casefold(),
+        "없음",
+        "off",
+        "disable",
+        "disabled",
+    }:
+        return DISABLED_NOTIFICATION_BANNER
+    for path in _banner_files():
+        if selected.casefold() in {path.name.casefold(), path.stem.casefold()}:
+            return path.name
+    return None
+
+
+def _banner_display_name(filename: str | None) -> str:
+    resolved = _resolve_banner_filename(filename or DEFAULT_NOTIFICATION_BANNER)
+    if resolved == DISABLED_NOTIFICATION_BANNER:
+        return NEWS_BANNER_DISABLED_LABEL
+    if resolved is None:
+        return "없음"
+    return Path(resolved).stem
+
+
+def _banner_autocomplete_choices(current: str) -> list[app_commands.Choice[str]]:
+    query = current.strip().casefold()
+    choices: list[app_commands.Choice[str]] = []
+    disabled_aliases = (
+        NEWS_BANNER_DISABLED_LABEL.casefold(),
+        DISABLED_NOTIFICATION_BANNER.casefold(),
+        "없음",
+    )
+    if not query or any(query in alias for alias in disabled_aliases):
+        choices.append(
+            app_commands.Choice(
+                name=NEWS_BANNER_DISABLED_LABEL,
+                value=DISABLED_NOTIFICATION_BANNER,
+            )
+        )
+    for path in _banner_files():
+        if query and query not in path.stem.casefold() and query not in path.name.casefold():
+            continue
+        choices.append(app_commands.Choice(name=path.stem[:100], value=path.name[:100]))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
+def _news_banner_file(filename: str | None) -> discord.File | None:
+    resolved = _resolve_banner_filename(filename or DEFAULT_NOTIFICATION_BANNER)
+    if resolved == DISABLED_NOTIFICATION_BANNER:
+        return None
+    if resolved is None:
+        return None
+    path = _resource_path(NEWS_BANNER_DIR / resolved)
     if not path.exists():
         return None
     return discord.File(path, filename=NEWS_BANNER_ATTACHMENT_NAME)
