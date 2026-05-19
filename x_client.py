@@ -316,8 +316,7 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     legacy = tweet.get("legacy")
     if not isinstance(legacy, dict):
         return None
-    if not _tweet_author_matches(tweet, username):
-        return None
+    author_username = _tweet_author_username(tweet) or username
     tweet_id = str(tweet.get("rest_id") or legacy.get("id_str") or "").strip()
     if not tweet_id:
         return None
@@ -351,9 +350,9 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
         raw["link_urls"] = link_urls
     return TwitterPost(
         post_id=f"x:{tweet_id}",
-        author_username=username,
-        url=f"https://x.com/{username}/status/{tweet_id}",
-        text=text or f"https://x.com/{username}/status/{tweet_id}",
+        author_username=author_username,
+        url=f"https://x.com/{author_username}/status/{tweet_id}",
+        text=text or f"https://x.com/{author_username}/status/{tweet_id}",
         title=title,
         created_at=created_at,
         image_urls=image_urls,
@@ -405,17 +404,15 @@ def _parse_twitter_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _tweet_author_matches(tweet: dict[str, Any], username: str) -> bool:
+def _tweet_author_username(tweet: dict[str, Any]) -> str | None:
     user_result = tweet.get("core", {}).get("user_results", {}).get("result")
     if not isinstance(user_result, dict):
-        return True
+        return None
     legacy = user_result.get("legacy")
     if not isinstance(legacy, dict):
-        return True
+        return None
     screen_name = str(legacy.get("screen_name") or "").strip()
-    if not screen_name:
-        return True
-    return screen_name.lower() == username.lower()
+    return screen_name or None
 
 
 def _photo_urls(tweet: dict[str, Any]) -> list[str]:
@@ -437,7 +434,7 @@ def _photo_urls(tweet: dict[str, Any]) -> list[str]:
 def _highest_quality_photo_url(url: str) -> str:
     parsed = urlparse(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["name"] = "orig"
+    query["name"] = "large"
     if parsed.netloc.endswith("twimg.com") and "format" not in query:
         suffix = parsed.path.rsplit(".", 1)
         if len(suffix) == 2 and suffix[1]:
@@ -660,8 +657,6 @@ def _parse_nitter_rss(xml_text: str, username: str, limit: int) -> list[TwitterP
     posts: list[TwitterPost] = []
     for item in root.findall("./channel/item"):
         creator = item.findtext("{http://purl.org/dc/elements/1.1/}creator") or ""
-        if creator.strip().lower() != f"@{username.lower()}":
-            continue
         tweet_id = (item.findtext("guid") or "").strip()
         if not tweet_id.isdigit():
             continue
@@ -672,9 +667,10 @@ def _parse_nitter_rss(xml_text: str, username: str, limit: int) -> list[TwitterP
             continue
         description = item.findtext("description") or ""
         created_at = _parse_twitter_datetime(item.findtext("pubDate"))
-        post_url = f"https://x.com/{username}/status/{tweet_id}"
+        author_username = creator.strip().lstrip("@") or username
+        post_url = _rss_post_url(item.findtext("link"), author_username, tweet_id)
         image_urls = _rss_image_urls(description)
-        link_urls = _rss_link_urls(description, username, tweet_id)
+        link_urls = _rss_link_urls(description, author_username, tweet_id)
         raw: dict[str, Any] = {
             "source": "x-rss",
             "language": "koreana",
@@ -690,7 +686,7 @@ def _parse_nitter_rss(xml_text: str, username: str, limit: int) -> list[TwitterP
         posts.append(
             TwitterPost(
                 post_id=f"x:{tweet_id}",
-                author_username=username,
+                author_username=author_username,
                 url=post_url,
                 text=_clean_tweet_text(title) or post_url,
                 title=_title_from_text(title) or f"X 게시물 {tweet_id}",
@@ -705,10 +701,16 @@ def _parse_nitter_rss(xml_text: str, username: str, limit: int) -> list[TwitterP
 
 
 def _strip_rss_reply_prefix(text: str, username: str) -> str:
-    prefix = f"R to @{username}:"
-    if text.startswith(prefix):
-        return text[len(prefix) :].strip()
-    return text
+    return re.sub(r"^R to @[A-Za-z0-9_]+:\s*", "", text).strip()
+
+
+def _rss_post_url(value: str | None, username: str, tweet_id: str) -> str:
+    if value:
+        parsed = urlparse(html.unescape(value).strip())
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 3 and parts[1] == "status":
+            return f"https://x.com/{parts[0]}/status/{parts[2]}"
+    return f"https://x.com/{username}/status/{tweet_id}"
 
 
 def _rss_has_video(description: str) -> bool:

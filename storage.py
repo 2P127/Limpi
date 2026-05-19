@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+
+LOGGER = logging.getLogger(__name__)
 
 from models import (
     GuildNewsTarget,
@@ -27,6 +30,7 @@ DISABLED_NOTIFICATION_BANNER = "none"
 DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED = True
 DEFAULT_MISSED_NEWS_RECOVERY_ENABLED = False
 DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED = False
+DEFAULT_NEWS_SOURCE_MODE = "both"
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
 
@@ -40,6 +44,7 @@ class SQLiteStorage:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
+        path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._initialize()
@@ -48,192 +53,131 @@ class SQLiteStorage:
         with self._lock:
             self._connection.close()
 
+    _TABLE_SCHEMAS: dict[str, str] = {
+        "guild_settings": """
+            CREATE TABLE IF NOT EXISTS guild_settings (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER,
+                role_id INTEGER,
+                post_format TEXT NOT NULL DEFAULT 'rich',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_seen_post_id TEXT,
+                language TEXT NOT NULL DEFAULT 'koreana',
+                max_posts_per_poll INTEGER NOT NULL DEFAULT 30,
+                auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
+                auto_cleanup_days INTEGER NOT NULL DEFAULT 1,
+                image_delivery TEXT NOT NULL DEFAULT 'files',
+                notification_banner TEXT DEFAULT '림피 배너.png',
+                public_news_lookup_allowed INTEGER NOT NULL DEFAULT 1,
+                missed_news_recovery_enabled INTEGER NOT NULL DEFAULT 0,
+                maintenance_notifications_enabled INTEGER NOT NULL DEFAULT 0,
+                news_source_mode TEXT NOT NULL DEFAULT 'both',
+                last_maintenance_start_notice TEXT,
+                last_maintenance_update_notice TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
+        "posts": """
+            CREATE TABLE IF NOT EXISTS posts (
+                post_id TEXT PRIMARY KEY,
+                source_user TEXT NOT NULL,
+                url TEXT NOT NULL,
+                text TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT,
+                language TEXT NOT NULL DEFAULT 'koreana',
+                image_urls TEXT NOT NULL DEFAULT '[]',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                content_hash TEXT NOT NULL DEFAULT '',
+                saved_at TEXT NOT NULL
+            )
+        """,
+        "guild_seen_posts": """
+            CREATE TABLE IF NOT EXISTS guild_seen_posts (
+                guild_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                announced_at TEXT,
+                PRIMARY KEY (guild_id, post_id)
+            )
+        """,
+        "twitter_posts": """
+            CREATE TABLE IF NOT EXISTS twitter_posts (
+                post_id TEXT PRIMARY KEY,
+                author_username TEXT NOT NULL,
+                url TEXT NOT NULL,
+                text TEXT NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT,
+                image_urls TEXT NOT NULL DEFAULT '[]',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                saved_at TEXT NOT NULL
+            )
+        """,
+        "guild_news_targets": """
+            CREATE TABLE IF NOT EXISTS guild_news_targets (
+                target_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                language TEXT NOT NULL DEFAULT 'koreana',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(guild_id, channel_id)
+            )
+        """,
+        "guild_twitter_targets": """
+            CREATE TABLE IF NOT EXISTS guild_twitter_targets (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_seen_post_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
+        "guild_news_target_seen_posts": """
+            CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
+                target_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                announced_at TEXT,
+                PRIMARY KEY (target_id, post_id),
+                FOREIGN KEY (target_id) REFERENCES guild_news_targets(target_id)
+                    ON DELETE CASCADE
+            )
+        """,
+        "tracked_messages": """
+            CREATE TABLE IF NOT EXISTS tracked_messages (
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, channel_id, message_id)
+            )
+        """,
+        "user_settings": """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL DEFAULT '',
+                nickname TEXT,
+                language TEXT NOT NULL DEFAULT 'koreana',
+                image_delivery TEXT,
+                news_banner TEXT DEFAULT '림피 배너.png',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
+    }
+
     def _initialize(self) -> None:
         with self._lock:
             self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id INTEGER PRIMARY KEY,
-                    channel_id INTEGER,
-                    role_id INTEGER,
-                    post_format TEXT NOT NULL DEFAULT 'rich',
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    last_seen_post_id TEXT,
-                    language TEXT NOT NULL DEFAULT 'koreana',
-                    max_posts_per_poll INTEGER NOT NULL DEFAULT 30,
-                    auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
-                    auto_cleanup_days INTEGER NOT NULL DEFAULT 1,
-                    image_delivery TEXT NOT NULL DEFAULT 'files',
-                    notification_banner TEXT DEFAULT '림피 배너.png',
-                    public_news_lookup_allowed INTEGER NOT NULL DEFAULT 1,
-                    missed_news_recovery_enabled INTEGER NOT NULL DEFAULT 0,
-                    maintenance_notifications_enabled INTEGER NOT NULL DEFAULT 0,
-                    last_maintenance_start_notice TEXT,
-                    last_maintenance_update_notice TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS posts (
-                    post_id TEXT PRIMARY KEY,
-                    source_user TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    created_at TEXT,
-                    language TEXT NOT NULL DEFAULT 'koreana',
-                    image_urls TEXT NOT NULL DEFAULT '[]',
-                    raw_json TEXT NOT NULL DEFAULT '{}',
-                    saved_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_seen_posts (
-                    guild_id INTEGER NOT NULL,
-                    post_id TEXT NOT NULL,
-                    seen_at TEXT NOT NULL,
-                    announced_at TEXT,
-                    PRIMARY KEY (guild_id, post_id)
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS twitter_posts (
-                    post_id TEXT PRIMARY KEY,
-                    author_username TEXT NOT NULL,
-                    url TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    created_at TEXT,
-                    image_urls TEXT NOT NULL DEFAULT '[]',
-                    raw_json TEXT NOT NULL DEFAULT '{}',
-                    saved_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_news_targets (
-                    target_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    guild_id INTEGER NOT NULL,
-                    channel_id INTEGER NOT NULL,
-                    language TEXT NOT NULL DEFAULT 'koreana',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(guild_id, channel_id)
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_twitter_targets (
-                    guild_id INTEGER PRIMARY KEY,
-                    channel_id INTEGER NOT NULL,
-                    enabled INTEGER NOT NULL DEFAULT 1,
-                    last_seen_post_id TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
-                    target_id INTEGER NOT NULL,
-                    post_id TEXT NOT NULL,
-                    seen_at TEXT NOT NULL,
-                    announced_at TEXT,
-                    PRIMARY KEY (target_id, post_id),
-                    FOREIGN KEY (target_id) REFERENCES guild_news_targets(target_id)
-                        ON DELETE CASCADE
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS tracked_messages (
-                    guild_id INTEGER NOT NULL,
-                    channel_id INTEGER NOT NULL,
-                    message_id INTEGER NOT NULL,
-                    sent_at TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, channel_id, message_id)
-                )
-                """
-            )
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_settings (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    nickname TEXT,
-                    language TEXT NOT NULL DEFAULT 'koreana',
-                    news_banner TEXT DEFAULT '림피 배너.png',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self._ensure_column("guild_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
-            self._ensure_column(
-                "guild_settings",
-                "max_posts_per_poll",
-                "INTEGER NOT NULL DEFAULT 30",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "auto_cleanup_enabled",
-                "INTEGER NOT NULL DEFAULT 1",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "auto_cleanup_days",
-                "INTEGER NOT NULL DEFAULT 1",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "image_delivery",
-                "TEXT NOT NULL DEFAULT 'files'",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "notification_banner",
-                "TEXT DEFAULT '림피 배너.png'",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "public_news_lookup_allowed",
-                "INTEGER NOT NULL DEFAULT 1",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "missed_news_recovery_enabled",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            self._ensure_column(
-                "guild_settings",
-                "maintenance_notifications_enabled",
-                "INTEGER NOT NULL DEFAULT 0",
-            )
-            self._ensure_column("guild_settings", "last_maintenance_start_notice", "TEXT")
-            self._ensure_column("guild_settings", "last_maintenance_update_notice", "TEXT")
-            self._ensure_column("posts", "language", "TEXT NOT NULL DEFAULT 'koreana'")
-            self._ensure_column("user_settings", "username", "TEXT NOT NULL DEFAULT ''")
-            self._ensure_column("user_settings", "nickname", "TEXT")
-            self._ensure_column("user_settings", "language", "TEXT NOT NULL DEFAULT 'koreana'")
-            self._ensure_column("user_settings", "image_delivery", "TEXT")
-            self._ensure_column(
-                "user_settings",
-                "news_banner",
-                "TEXT DEFAULT '림피 배너.png'",
-            )
-            self._ensure_column("posts", "content_hash", "TEXT NOT NULL DEFAULT ''")
+
+            for table_name, ddl in self._TABLE_SCHEMAS.items():
+                self._connection.execute(ddl)
+                self._auto_migrate_table(table_name, ddl)
+
             self._connection.execute(
                 "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
             )
@@ -272,21 +216,23 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_guild_news_targets_guild_language
-                ON guild_news_targets(guild_id, language)
-                """
-            )
-            self._connection.execute(
-                """
                 CREATE INDEX IF NOT EXISTS idx_guild_twitter_targets_channel
                 ON guild_twitter_targets(channel_id)
                 """
             )
             self._dedupe_news_target_channels()
+            self._dedupe_news_target_languages()
             self._connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_guild_news_targets_guild_channel
                 ON guild_news_targets(guild_id, channel_id)
+                """
+            )
+            self._connection.execute("DROP INDEX IF EXISTS idx_guild_news_targets_guild_language")
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_guild_news_targets_unique_guild_language
+                ON guild_news_targets(guild_id, language)
                 """
             )
             self._connection.execute(
@@ -317,6 +263,48 @@ class SQLiteStorage:
         if column_name not in existing_columns:
             self._connection.execute(
                 f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+            )
+
+    def _auto_migrate_table(self, table_name: str, ddl: str) -> None:
+        import re
+
+        rows = self._connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        existing = {str(row["name"]) for row in rows}
+
+        start = ddl.index("(") + 1
+        end = ddl.rindex(")")
+        body = ddl[start:end]
+
+        depth, current, clauses = 0, [], []
+        for ch in body:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch == "," and depth == 0:
+                clauses.append("".join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            clauses.append("".join(current).strip())
+
+        _CONSTRAINT_KEYWORDS = {"PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"}
+        for clause in clauses:
+            clause = clause.strip()
+            if not clause:
+                continue
+            m = re.match(r"[A-Za-z_]+", clause)
+            first_token = m.group(0).upper() if m else ""
+            if first_token in _CONSTRAINT_KEYWORDS:
+                continue
+            col_name = first_token.lower()
+            col_def = clause[len(first_token):].strip()
+            if col_name in existing:
+                continue
+            LOGGER.info("스키마 마이그레이션: %s.%s 컬럼 추가 (%s)", table_name, col_name, col_def)
+            self._connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}"
             )
 
     def _migrate_legacy_post_ids(self) -> None:
@@ -495,6 +483,40 @@ class SQLiteStorage:
                 delete_ids,
             )
 
+    def _dedupe_news_target_languages(self) -> None:
+        duplicate_rows = self._connection.execute(
+            """
+            SELECT guild_id, language
+            FROM guild_news_targets
+            GROUP BY guild_id, language
+            HAVING COUNT(*) > 1
+            """
+        ).fetchall()
+        for duplicate in duplicate_rows:
+            rows = self._connection.execute(
+                """
+                SELECT target_id
+                FROM guild_news_targets
+                WHERE guild_id = ? AND language = ?
+                ORDER BY updated_at DESC, target_id DESC
+                """,
+                (int(duplicate["guild_id"]), str(duplicate["language"] or "koreana")),
+            ).fetchall()
+            keep_id = int(rows[0]["target_id"])
+            delete_ids = [int(row["target_id"]) for row in rows[1:] if int(row["target_id"]) != keep_id]
+            if not delete_ids:
+                continue
+
+            placeholders = ", ".join("?" for _ in delete_ids)
+            self._connection.execute(
+                f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                delete_ids,
+            )
+            self._connection.execute(
+                f"DELETE FROM guild_news_targets WHERE target_id IN ({placeholders})",
+                delete_ids,
+            )
+
     def get_settings(self, guild_id: int) -> GuildSettings:
         with self._lock:
             row = self._connection.execute(
@@ -518,6 +540,7 @@ class SQLiteStorage:
                 public_news_lookup_allowed=DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED,
                 missed_news_recovery_enabled=DEFAULT_MISSED_NEWS_RECOVERY_ENABLED,
                 maintenance_notifications_enabled=DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED,
+                news_source_mode=DEFAULT_NEWS_SOURCE_MODE,
                 last_maintenance_start_notice=None,
                 last_maintenance_update_notice=None,
             )
@@ -604,6 +627,25 @@ class SQLiteStorage:
             if existing is not None:
                 target_id = int(existing["target_id"])
                 old_language = str(existing["language"] or "koreana")
+                language_rows = self._connection.execute(
+                    """
+                    SELECT target_id
+                    FROM guild_news_targets
+                    WHERE guild_id = ? AND language = ? AND target_id != ?
+                    """,
+                    (guild_id, language, target_id),
+                ).fetchall()
+                language_delete_ids = [int(row["target_id"]) for row in language_rows]
+                if language_delete_ids:
+                    placeholders = ", ".join("?" for _ in language_delete_ids)
+                    self._connection.execute(
+                        f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                        language_delete_ids,
+                    )
+                    self._connection.execute(
+                        f"DELETE FROM guild_news_targets WHERE target_id IN ({placeholders})",
+                        language_delete_ids,
+                    )
                 if old_language != language:
                     self._connection.execute(
                         "DELETE FROM guild_news_target_seen_posts WHERE target_id = ?",
@@ -618,6 +660,25 @@ class SQLiteStorage:
                     (language, now, target_id),
                 )
             else:
+                language_rows = self._connection.execute(
+                    """
+                    SELECT target_id
+                    FROM guild_news_targets
+                    WHERE guild_id = ? AND language = ?
+                    """,
+                    (guild_id, language),
+                ).fetchall()
+                language_delete_ids = [int(row["target_id"]) for row in language_rows]
+                if language_delete_ids:
+                    placeholders = ", ".join("?" for _ in language_delete_ids)
+                    self._connection.execute(
+                        f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                        language_delete_ids,
+                    )
+                    self._connection.execute(
+                        f"DELETE FROM guild_news_targets WHERE target_id IN ({placeholders})",
+                        language_delete_ids,
+                    )
                 self._connection.execute(
                     """
                     INSERT INTO guild_news_targets (
@@ -942,6 +1003,7 @@ class SQLiteStorage:
         public_news_lookup_allowed: bool | None = None,
         missed_news_recovery_enabled: bool | None = None,
         maintenance_notifications_enabled: bool | None = None,
+        news_source_mode: str | None = None,
     ) -> GuildSettings:
         current = self.get_settings(guild_id)
         now = _now_iso()
@@ -993,6 +1055,11 @@ class SQLiteStorage:
                 if maintenance_notifications_enabled is not None
                 else current.maintenance_notifications_enabled
             ),
+            news_source_mode=(
+                news_source_mode
+                if news_source_mode is not None
+                else current.news_source_mode
+            ),
             last_maintenance_start_notice=current.last_maintenance_start_notice,
             last_maintenance_update_notice=current.last_maintenance_update_notice,
         )
@@ -1004,10 +1071,10 @@ class SQLiteStorage:
                     guild_id, channel_id, role_id, post_format, enabled, language,
                     max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
                     image_delivery, notification_banner, public_news_lookup_allowed,
-                    missed_news_recovery_enabled, maintenance_notifications_enabled, last_maintenance_start_notice,
+                    missed_news_recovery_enabled, maintenance_notifications_enabled, news_source_mode, last_maintenance_start_notice,
                     last_maintenance_update_notice, last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     role_id = excluded.role_id,
@@ -1022,6 +1089,7 @@ class SQLiteStorage:
                     public_news_lookup_allowed = excluded.public_news_lookup_allowed,
                     missed_news_recovery_enabled = excluded.missed_news_recovery_enabled,
                     maintenance_notifications_enabled = excluded.maintenance_notifications_enabled,
+                    news_source_mode = excluded.news_source_mode,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -1039,6 +1107,7 @@ class SQLiteStorage:
                     int(next_settings.public_news_lookup_allowed),
                     int(next_settings.missed_news_recovery_enabled),
                     int(next_settings.maintenance_notifications_enabled),
+                    next_settings.news_source_mode,
                     next_settings.last_maintenance_start_notice,
                     next_settings.last_maintenance_update_notice,
                     next_settings.last_seen_post_id,
@@ -1642,6 +1711,9 @@ class SQLiteStorage:
         image_delivery = str(row["image_delivery"] or DEFAULT_IMAGE_DELIVERY)
         if image_delivery != "files":
             image_delivery = DEFAULT_IMAGE_DELIVERY
+        news_source_mode = str(row["news_source_mode"] or DEFAULT_NEWS_SOURCE_MODE)
+        if news_source_mode not in {"both", "steam", "twitter"}:
+            news_source_mode = DEFAULT_NEWS_SOURCE_MODE
         return GuildSettings(
             guild_id=int(row["guild_id"]),
             channel_id=_optional_int(row["channel_id"]),
@@ -1658,6 +1730,7 @@ class SQLiteStorage:
             public_news_lookup_allowed=bool(row["public_news_lookup_allowed"]),
             missed_news_recovery_enabled=bool(row["missed_news_recovery_enabled"]),
             maintenance_notifications_enabled=bool(row["maintenance_notifications_enabled"]),
+            news_source_mode=news_source_mode,
             last_maintenance_start_notice=row["last_maintenance_start_notice"],
             last_maintenance_update_notice=row["last_maintenance_update_notice"],
         )

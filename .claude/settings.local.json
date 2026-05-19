@@ -10,7 +10,11 @@
       "Bash(sed -n '495,520p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
       "Bash(sed -n '940,960p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
       "Bash(sed -n '920,940p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "mcp__plugin_claude-mem_mcp-search__smart_unfold",
+      "Bash(py -m py_compile storage.py)",
+      "Bash(py -c ' *)",
+      "Bash(py -m py_compile storage.py bot.py)"
     ]
   }
 }
