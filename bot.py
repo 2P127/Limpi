@@ -16,11 +16,12 @@ from urllib.parse import urlparse
 
 import aiohttp
 import discord
+from PIL import Image, UnidentifiedImageError
 from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import AppConfig
-from models import GuildNewsTarget, GuildSettings, NewsPost
+from models import GuildNewsTarget, GuildSettings, GuildTwitterTarget, NewsPost, TwitterPost
 from storage import (
     DEFAULT_NOTIFICATION_BANNER,
     DISABLED_NOTIFICATION_BANNER,
@@ -29,12 +30,14 @@ from storage import (
     SQLiteStorage,
 )
 from steam_client import NewsSource, build_news_source
+from x_client import LimbusXClient, XClientError
 
 
 POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
+TWITTER_POST_LIMIT = 30
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 10
@@ -346,24 +349,28 @@ class NewsCog(commands.Cog):
         config: AppConfig,
         storage: SQLiteStorage,
         news_source: NewsSource | None,
+        x_source: LimbusXClient,
         session: aiohttp.ClientSession,
     ) -> None:
         self.bot = bot
         self.config = config
         self.storage = storage
         self.news_source = news_source
+        self.x_source = x_source
         self.session = session
         self._poll_lock = asyncio.Lock()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
         self._last_poll_at: datetime | None = None
+        self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
         self._in_high_frequency_window: bool = False
 
     async def cog_load(self) -> None:
         self.maintenance_notifications.start()
         self.cleanup_messages.start()
+        self.poll_twitter_posts.start()
 
         if self.news_source is None:
             LOGGER.warning("Steam 뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -374,6 +381,8 @@ class NewsCog(commands.Cog):
     async def cog_unload(self) -> None:
         if self.poll_news.is_running():
             self.poll_news.cancel()
+        if self.poll_twitter_posts.is_running():
+            self.poll_twitter_posts.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
 
@@ -487,6 +496,24 @@ class NewsCog(commands.Cog):
 
     @poll_news.before_loop
     async def before_poll_news(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=60)
+    async def poll_twitter_posts(self) -> None:
+        async with self._poll_lock:
+            try:
+                now = datetime.now(timezone.utc)
+                if not self._should_poll_twitter_now(now):
+                    return
+                self._last_twitter_poll_at = now
+                await self._poll_twitter_once()
+            except XClientError as exc:
+                LOGGER.warning("X 게시물 자동 확인 실패: %s", exc)
+            except Exception:
+                LOGGER.exception("X 게시물 자동 확인 실패.")
+
+    @poll_twitter_posts.before_loop
+    async def before_poll_twitter_posts(self) -> None:
         await self.bot.wait_until_ready()
 
     @tasks.loop(seconds=60)
@@ -906,6 +933,13 @@ class NewsCog(commands.Cog):
 
         interval = self._current_poll_interval_seconds(now)
         elapsed = (now - self._last_poll_at).total_seconds()
+        return elapsed >= interval
+
+    def _should_poll_twitter_now(self, now: datetime) -> bool:
+        if self._last_twitter_poll_at is None:
+            return True
+        interval = self._current_poll_interval_seconds(now)
+        elapsed = (now - self._last_twitter_poll_at).total_seconds()
         return elapsed >= interval
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
@@ -1660,6 +1694,7 @@ class NewsCog(commands.Cog):
                 return None
 
             data, content_type = downloaded
+            data, content_type = _image_bytes_as_png(data, content_type)
             return index, url, content_type, data
 
     def _schedule_channel_image_messages(
@@ -2014,6 +2049,43 @@ class NewsCog(commands.Cog):
             LOGGER.exception("이미지 다운로드 오류: %s", url)
             return None
 
+    async def _download_twitter_video(self, url: str) -> discord.File | None:
+        max_bytes = 23 * 1024 * 1024
+        try:
+            async with self.session.get(
+                url, timeout=aiohttp.ClientTimeout(total=60)
+            ) as response:
+                if response.status >= 400:
+                    LOGGER.warning("트위터 영상 다운로드 실패 (%s): %s", response.status, url)
+                    return None
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > max_bytes:
+                    LOGGER.warning(
+                        "트위터 영상이 Discord 업로드 제한보다 커서 최고화질 링크로 보냅니다 (%s bytes): %s",
+                        content_length,
+                        url,
+                    )
+                    return None
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.content.iter_chunked(65536):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        LOGGER.warning(
+                            "트위터 영상이 Discord 업로드 제한보다 커서 최고화질 링크로 보냅니다: %s",
+                            url,
+                        )
+                        return None
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                filename = url.split("/")[-1].split("?")[0] or "video.mp4"
+                if not filename.endswith(".mp4"):
+                    filename = "video.mp4"
+                return discord.File(io.BytesIO(data), filename=filename)
+        except aiohttp.ClientError:
+            LOGGER.exception("트위터 영상 다운로드 오류: %s", url)
+            return None
+
     def _cache_image(self, url: str, data: bytes, content_type: str | None) -> None:
         size = len(data)
         if size > IMAGE_CACHE_MAX_ITEM_BYTES:
@@ -2041,11 +2113,43 @@ class NewsCog(commands.Cog):
         if self.news_source is None or self._startup_synced:
             return
         try:
-            await self._sync_global_news_cache()
+            posts_by_language, _ = await self._sync_global_news_cache()
             self._startup_synced = True
-            LOGGER.info("시작 시 뉴스 동기화 완료 (limit=%s).", NEWS_POST_LIMIT)
+            synced_posts = [
+                post
+                for posts in posts_by_language.values()
+                for post in posts
+            ]
+            latest = max(
+                synced_posts,
+                key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                default=None,
+            )
+            if latest is not None:
+                LOGGER.info(
+                    "시작 시 Steam 뉴스 동기화 완료: %d개 등록. 최신 소식: %s (%s)",
+                    len(synced_posts),
+                    latest.title,
+                    latest.url,
+                )
+            else:
+                LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
         except Exception:
             LOGGER.exception("시작 시 뉴스 동기화 실패.")
+        try:
+            saved, _ = await self._sync_twitter_posts()
+            latest = self.storage.get_latest_twitter_post()
+            if latest is not None:
+                LOGGER.info(
+                    "시작 시 X 게시물 동기화 완료: %d개 저장. 최신 소식: %s (%s)",
+                    saved,
+                    latest.title,
+                    latest.url,
+                )
+            else:
+                LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
+        except Exception:
+            LOGGER.exception("시작 시 X 게시물 동기화 실패.")
 
     async def _track_manual_message(
         self,
@@ -2056,6 +2160,556 @@ class NewsCog(commands.Cog):
         if guild_id is None or channel_id is None or message is None:
             return
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
+
+    async def _sync_twitter_posts(self) -> tuple[int, list[TwitterPost]]:
+        posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+        saved = self.storage.replace_twitter_posts(posts)
+        return saved, posts
+
+    async def _poll_twitter_once(self) -> int:
+        targets = self.storage.list_twitter_targets()
+        connected_targets = [
+            target
+            for target in targets
+            if self.bot.get_guild(target.guild_id) is not None
+        ]
+        if not connected_targets:
+            return 0
+
+        _, posts = await self._sync_twitter_posts()
+        if not posts:
+            return 0
+
+        announced = 0
+        latest_post_id = posts[0].post_id
+        for target in connected_targets:
+            channel = await self._resolve_twitter_target_channel(target)
+            if channel is None:
+                continue
+            new_posts = self._new_twitter_posts_for_target(target, posts)
+            if target.last_seen_post_id is None:
+                self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+                continue
+            if not new_posts:
+                continue
+            sent_any = False
+            for post in new_posts:
+                try:
+                    message = await self._send_twitter_post_to_channel(channel, post)
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                        target.guild_id,
+                        target.channel_id,
+                        post.post_id,
+                    )
+                    continue
+                await self._track_manual_message(target.guild_id, target.channel_id, message)
+                announced += 1
+                sent_any = True
+            if sent_any:
+                self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+        return announced
+
+    def _new_twitter_posts_for_target(
+        self,
+        target: GuildTwitterTarget,
+        posts_newest_first: list[TwitterPost],
+    ) -> list[TwitterPost]:
+        if target.last_seen_post_id is None:
+            return []
+        ids = [post.post_id for post in posts_newest_first]
+        if target.last_seen_post_id in ids:
+            index = ids.index(target.last_seen_post_id)
+            return list(reversed(posts_newest_first[:index]))
+
+        last_seen_post = self.storage.get_twitter_post(target.last_seen_post_id)
+        if last_seen_post and last_seen_post.created_at:
+            return [
+                post
+                for post in reversed(posts_newest_first)
+                if post.created_at and post.created_at > last_seen_post.created_at
+            ]
+        return []
+
+    async def _resolve_twitter_target_channel(
+        self, target: GuildTwitterTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "X 게시물 자동 전송 건너뜀: 채널 접근 불가 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "X 게시물 자동 전송 채널 조회 실패 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
+    async def _send_twitter_post_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        post: TwitterPost,
+        *,
+        attach_photos: bool = True,
+        role_id: int | None = None,
+    ) -> discord.Message:
+        embed = _embed_for_twitter_post(post)
+        image_urls = _twitter_image_urls(post) if attach_photos else []
+        batch_tasks = self._start_image_batch_tasks(image_urls) if image_urls else []
+        if role_id:
+            await channel.send(
+                content=f"<@&{role_id}>",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
+                ),
+            )
+        message = await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        if batch_tasks:
+            self._schedule_twitter_channel_image_messages(
+                channel,
+                post,
+                batch_tasks=batch_tasks,
+            )
+        link_urls = _twitter_link_urls(post)
+        if link_urls:
+            task = asyncio.create_task(
+                channel.send(
+                    content="\n".join(link_urls),
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            )
+            task.add_done_callback(self._log_background_task_result)
+        video_url_groups = _twitter_video_url_groups(post)
+        video_fallback_url = _twitter_video_fallback_url(post)
+        if video_url_groups:
+            task = asyncio.create_task(
+                self._send_twitter_video_to_channel(
+                    channel, video_url_groups, video_fallback_url or post.url
+                )
+            )
+            task.add_done_callback(self._log_background_task_result)
+        elif video_fallback_url:
+            task = asyncio.create_task(
+                channel.send(
+                    content=video_fallback_url,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            )
+            task.add_done_callback(self._log_background_task_result)
+        return message
+
+    async def _send_twitter_post_followups(
+        self,
+        interaction: discord.Interaction,
+        post: TwitterPost,
+        *,
+        private: bool,
+        attach_photos: bool = True,
+    ) -> list[discord.Message | None]:
+        sent_messages: list[discord.Message | None] = []
+        embed = _embed_for_twitter_post(post)
+        sent_messages.append(
+            await interaction.followup.send(
+                embed=embed,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+        )
+        image_urls = _twitter_image_urls(post) if attach_photos else []
+        if image_urls:
+            batch_tasks = self._start_image_batch_tasks(image_urls)
+            task = asyncio.create_task(
+                self._send_twitter_interaction_image_followups(
+                    interaction,
+                    private=private,
+                    batch_tasks=batch_tasks,
+                )
+            )
+            task.add_done_callback(self._log_background_task_result)
+        link_urls = _twitter_link_urls(post)
+        if link_urls:
+            sent_messages.append(
+                await interaction.followup.send(
+                    content="\n".join(link_urls),
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            )
+        video_url_groups = _twitter_video_url_groups(post)
+        video_fallback_url = _twitter_video_fallback_url(post)
+        if video_url_groups:
+            task = asyncio.create_task(
+                self._send_twitter_video_followups(
+                    interaction, private, video_url_groups, video_fallback_url or post.url
+                )
+            )
+            task.add_done_callback(self._log_background_task_result)
+        elif video_fallback_url:
+            sent_messages.append(
+                await interaction.followup.send(
+                    content=video_fallback_url,
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            )
+        return sent_messages
+
+    def _schedule_twitter_channel_image_messages(
+        self,
+        channel: discord.abc.Messageable,
+        post: TwitterPost,
+        *,
+        batch_tasks: list[asyncio.Task[list[discord.File]]],
+    ) -> None:
+        if not batch_tasks:
+            return
+        task = asyncio.create_task(
+            self._send_twitter_channel_image_messages(channel, batch_tasks=batch_tasks)
+        )
+        task.add_done_callback(self._log_background_task_result)
+
+    async def _send_twitter_channel_image_messages(
+        self,
+        channel: discord.abc.Messageable,
+        *,
+        batch_tasks: list[asyncio.Task[list[discord.File]]],
+    ) -> None:
+        for batch_task in batch_tasks:
+            file_batch = await batch_task
+            if not file_batch:
+                continue
+            await channel.send(
+                files=file_batch,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _send_twitter_interaction_image_followups(
+        self,
+        interaction: discord.Interaction,
+        *,
+        private: bool,
+        batch_tasks: list[asyncio.Task[list[discord.File]]],
+    ) -> None:
+        for batch_task in batch_tasks:
+            file_batch = await batch_task
+            if not file_batch:
+                continue
+            await interaction.followup.send(
+                files=file_batch,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+
+    async def _send_twitter_video_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        video_url_groups: list[list[str]],
+        fallback_url: str,
+    ) -> None:
+        for urls in video_url_groups:
+            best_url = urls[0] if urls else fallback_url
+            file = await self._download_twitter_video(best_url)
+            if file:
+                try:
+                    await channel.send(
+                        files=[file],
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    continue
+                except discord.HTTPException as exc:
+                    if not _is_payload_too_large(exc):
+                        raise
+                    LOGGER.warning("Discord 업로드 제한으로 X 최고화질 영상을 링크로 보냅니다.")
+            await channel.send(
+                content=best_url,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        if not video_url_groups:
+            await channel.send(
+                content=fallback_url,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _send_twitter_video_followups(
+        self,
+        interaction: discord.Interaction,
+        private: bool,
+        video_url_groups: list[list[str]],
+        fallback_url: str,
+    ) -> None:
+        for urls in video_url_groups:
+            best_url = urls[0] if urls else fallback_url
+            file = await self._download_twitter_video(best_url)
+            if file:
+                try:
+                    await interaction.followup.send(
+                        files=[file],
+                        ephemeral=private,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        wait=True,
+                    )
+                    continue
+                except discord.HTTPException as exc:
+                    if not _is_payload_too_large(exc):
+                        raise
+                    LOGGER.warning("Discord 업로드 제한으로 X 최고화질 영상을 링크로 보냅니다.")
+            await interaction.followup.send(
+                content=best_url,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+        if not video_url_groups:
+            await interaction.followup.send(
+                content=fallback_url,
+                ephemeral=private,
+                allowed_mentions=discord.AllowedMentions.none(),
+                wait=True,
+            )
+
+    @app_commands.command(name="트위터소식채널설정", description="공식 X 새 게시물을 자동으로 보낼 채널을 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(channel="채널")
+    @app_commands.describe(channel="공식 X 새 게시물을 보낼 채널입니다.")
+    async def configure_twitter_news_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        latest = self.storage.get_latest_twitter_post()
+        last_seen_post_id = latest.post_id if latest else None
+
+        target = self.storage.upsert_twitter_target(
+            interaction.guild_id,
+            channel_id=channel.id,
+            enabled=True,
+            last_seen_post_id=last_seen_post_id,
+        )
+        baseline_text = (
+            "현재 최신 게시물을 기준으로 잡아서 이후 새 게시물부터 자동 전송해요."
+            if target.last_seen_post_id
+            else "아직 기준 게시물을 잡지 못했어요. 다음 자동 확인 때 최신 게시물을 기준으로 잡고, 그 이후 새 게시물부터 전송해요."
+        )
+        await interaction.followup.send(
+            (
+                f"공식 X 새 게시물을 {channel.mention}에 보낼게요.\n"
+                f"{baseline_text}"
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="트위터최근보기", description="림버스 컴퍼니 공식 X의 가장 최근 게시물을 봅니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(private="나만보기", attach_photos="사진첨부")
+    @app_commands.describe(
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+        attach_photos="켜면 게시물에 포함된 이미지를 함께 표시합니다.",
+    )
+    @app_commands.choices(private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
+    async def recent_twitter_post(
+        self,
+        interaction: discord.Interaction,
+        private: app_commands.Choice[str] | None = None,
+        attach_photos: app_commands.Choice[str] | None = None,
+    ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        attach_photos_value = bool(_choice_bool(attach_photos, True))
+        if not await self._confirm_external_news_send(interaction):
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private_value, thinking=True)
+
+        post: TwitterPost | None = self.storage.get_latest_twitter_post()
+
+        if post is None:
+            await interaction.followup.send(
+                "아직 저장된 X 게시물이 없어요. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        sent_messages = await self._send_twitter_post_followups(
+            interaction,
+            post,
+            private=private_value,
+            attach_photos=attach_photos_value,
+        )
+        if not private_value:
+            for message in sent_messages:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, message
+                )
+
+    @app_commands.command(name="트위터이전보기", description="캐시에 저장된 림버스 컴퍼니 공식 X 게시물을 다시 봅니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(title="게시물", private="나만보기", attach_photos="사진첨부")
+    @app_commands.describe(
+        title="게시물을 선택합니다.",
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+        attach_photos="켜면 게시물에 포함된 이미지를 함께 표시합니다.",
+    )
+    @app_commands.choices(private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
+    async def previous_twitter_post(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        private: app_commands.Choice[str] | None = None,
+        attach_photos: app_commands.Choice[str] | None = None,
+    ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        attach_photos_value = bool(_choice_bool(attach_photos, True))
+        post = self.storage.get_twitter_post_by_id_or_title(title)
+        if post is None:
+            await interaction.response.send_message(
+                "저장된 X 게시물을 찾지 못했어요. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+        if not await self._confirm_external_news_send(interaction):
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private_value, thinking=True)
+
+        sent_messages = await self._send_twitter_post_followups(
+            interaction,
+            post,
+            private=private_value,
+            attach_photos=attach_photos_value,
+        )
+        if not private_value:
+            for message in sent_messages:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, message
+                )
+
+    @previous_twitter_post.autocomplete("title")
+    async def previous_twitter_post_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        posts = self.storage.search_twitter_posts(current, limit=25)
+        return [
+            app_commands.Choice(name=_twitter_choice_name(post), value=post.post_id)
+            for post in posts
+        ]
+
+    @app_commands.command(
+        name="트위터소식보내기",
+        description="저장된 공식 X 게시물을 지정한 채널에 보냅니다.",
+    )
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.rename(title="게시물", channel="채널", role="역할")
+    @app_commands.describe(
+        title="보낼 공식 X 게시물을 선택합니다.",
+        channel="보낼 채널입니다. 비워두면 /트위터소식채널설정 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정 값을 사용합니다.",
+    )
+    async def send_twitter_post(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "서버 안에서만 사용할 수 있어요.",
+                ephemeral=True,
+            )
+            return
+
+        post = self.storage.get_twitter_post_by_id_or_title(title)
+        if post is None:
+            await interaction.response.send_message(
+                "저장된 X 게시물을 찾지 못했어요. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        twitter_target = self.storage.get_twitter_target(interaction.guild_id)
+        target = channel
+        if target is None and twitter_target is not None:
+            resolved = await self._resolve_target_channel(None, twitter_target.channel_id)
+            target = resolved if isinstance(resolved, discord.TextChannel) else None
+
+        if target is None:
+            await interaction.response.send_message(
+                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /트위터소식채널설정으로 채널을 설정해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        role_id = role.id if role else settings.role_id
+        try:
+            await self._send_twitter_post_to_channel(
+                target,
+                post,
+                role_id=role_id,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "채널 권한이 부족해서 X 게시물을 보낼 수 없어요.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            LOGGER.exception("수동 X 게시물 전송 실패.")
+            await interaction.followup.send(
+                "X 게시물을 보내는 중 Discord 오류가 발생했어요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"{target.mention}에 X 게시물을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @send_twitter_post.autocomplete("title")
+    async def send_twitter_post_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        posts = self.storage.search_twitter_posts(current, limit=25)
+        return [
+            app_commands.Choice(name=_twitter_choice_name(post), value=post.post_id)
+            for post in posts
+        ]
 
     @app_commands.command(name="서버설정", description="서버의 공통 봇 설정을 변경합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -2466,6 +3120,7 @@ class NewsCog(commands.Cog):
 
         settings = self.storage.get_settings(interaction.guild_id)
         targets = self.storage.list_news_targets(interaction.guild_id)
+        twitter_target = self.storage.get_twitter_target(interaction.guild_id)
         target_languages = sorted({target.language for target in targets})
         if not target_languages:
             target_languages = [settings.language]
@@ -2485,6 +3140,11 @@ class NewsCog(commands.Cog):
         embed.add_field(
             name="소식 채널",
             value=_format_news_targets(targets),
+            inline=False,
+        )
+        embed.add_field(
+            name="트위터 소식 채널",
+            value=f"<#{twitter_target.channel_id}>" if twitter_target else "미설정",
             inline=False,
         )
         embed.add_field(
@@ -2825,6 +3485,11 @@ class NewsCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="/트위터소식채널설정",
+            value="림버스 컴퍼니 공식 X 새 게시물을 자동으로 보낼 채널을 설정합니다. (서버 관리 권한 필요)",
+            inline=False,
+        )
+        embed.add_field(
             name="/유저설정",
             value="앱으로 사용할 때의 개인 언어와 /최근소식보기·/이전소식보기 배너를 설정합니다.",
             inline=False,
@@ -2852,6 +3517,24 @@ class NewsCog(commands.Cog):
         embed.add_field(
             name="/최근소식보기",
             value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 나만보기·사진 첨부 옵션은 `허용`/`비허용`으로 고릅니다.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/트위터최근보기",
+            value="림버스 컴퍼니 공식 X의 가장 최근 게시물을 보여줍니다. 사진은 썸네일 없이 첨부파일로 보냅니다.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/트위터이전보기",
+            value="캐시에 저장된 림버스 컴퍼니 공식 X 게시물을 다시 봅니다. 자동완성으로 게시물을 고릅니다.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/트위터소식보내기",
+            value=(
+                "저장된 공식 X 게시물을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
+                "채널을 비우면 /트위터소식채널설정 채널을 사용하고, 역할을 비우면 /서버설정 값을 사용합니다. (서버 관리 권한 필요)"
+            ),
             inline=False,
         )
         embed.add_field(
@@ -3178,6 +3861,91 @@ def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
     groups = _embed_groups_for_post(post)
     return groups[0] if groups else []
 
+def _twitter_video_urls(post: TwitterPost) -> list[str]:
+    value = post.raw.get("video_urls")
+    return [str(u) for u in value] if isinstance(value, list) else []
+
+
+def _twitter_video_url_groups(post: TwitterPost) -> list[list[str]]:
+    value = post.raw.get("video_variant_groups")
+    if isinstance(value, list):
+        groups = [
+            [str(url) for url in group if url]
+            for group in value
+            if isinstance(group, list)
+        ]
+        groups = [group for group in groups if group]
+        if groups:
+            return groups
+    return [[url] for url in _twitter_video_urls(post)]
+
+
+def _twitter_video_fallback_url(post: TwitterPost) -> str | None:
+    value = post.raw.get("video_fallback_url")
+    return str(value) if value else None
+
+
+def _is_payload_too_large(exc: discord.HTTPException) -> bool:
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    return code == 40005 or status == 413
+
+
+def _twitter_image_urls(post: TwitterPost) -> list[str]:
+    return [
+        url
+        for url in post.image_urls
+        if not _is_twitter_video_thumbnail_url(url)
+    ]
+
+
+def _is_twitter_video_thumbnail_url(url: str) -> bool:
+    lowered = url.lower()
+    return any(
+        fragment in lowered
+        for fragment in (
+            "/ext_tw_video_thumb/",
+            "/amplify_video_thumb/",
+            "/tweet_video_thumb/",
+        )
+    )
+
+
+def _twitter_youtube_urls(post: TwitterPost) -> list[str]:
+    value = post.raw.get("youtube_urls")
+    return [str(u) for u in value] if isinstance(value, list) else []
+
+
+def _twitter_link_urls(post: TwitterPost) -> list[str]:
+    value = post.raw.get("link_urls")
+    urls = [str(u) for u in value] if isinstance(value, list) else []
+    urls = [url for url in urls if not _is_steam_news_url(url)]
+    if not urls:
+        urls = _twitter_youtube_urls(post)
+    return list(dict.fromkeys(urls))
+
+
+def _is_steam_news_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host != "store.steampowered.com":
+        return False
+    return parsed.path.lower().startswith("/news/app/")
+
+
+def _embed_for_twitter_post(post: TwitterPost) -> discord.Embed:
+    embed = discord.Embed(
+        title=post.title[:256],
+        description=_truncate_component_text(post.text or post.url, EMBED_DESCRIPTION_LIMIT),
+        url=post.url,
+        color=discord.Color.from_rgb(29, 155, 240),
+    )
+    if post.created_at is not None:
+        embed.timestamp = post.created_at
+    embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
+    embed.add_field(name="원문", value=f"[X에서 보기]({post.url})", inline=False)
+    return embed
+
 
 def _build_layout_view_for_post(
     post: NewsPost,
@@ -3414,6 +4182,20 @@ def _choice_name(post: NewsPost, *, include_language: bool = False) -> str:
     return f"{prefix}{title[: max_title_length - 3]}..."
 
 
+def _twitter_choice_name(post: TwitterPost) -> str:
+    title = post.title.strip() or post.post_id
+    if post.created_at:
+        prefix = f"[{_format_kst(post.created_at)}] "
+    else:
+        prefix = ""
+    max_title_length = max(1, 100 - len(prefix))
+    if len(title) <= max_title_length:
+        return f"{prefix}{title}"
+    if max_title_length <= 3:
+        return f"{prefix}{title[:max_title_length]}"
+    return f"{prefix}{title[: max_title_length - 3]}..."
+
+
 def _post_language(post: NewsPost) -> str:
     raw_language = post.raw.get("language")
     if raw_language:
@@ -3457,24 +4239,43 @@ def _unique_zip_name(
 def _image_file_extension(url: str, content_type: str | None) -> str:
     if content_type:
         normalized = content_type.split(";", 1)[0].strip().lower()
-        if normalized == "image/jpeg":
-            return ".jpg"
         if normalized == "image/png":
             return ".png"
+        if normalized == "image/jpeg":
+            return ".png"
         if normalized == "image/gif":
-            return ".gif"
+            return ".png"
         if normalized == "image/webp":
-            return ".webp"
+            return ".png"
         if normalized == "image/bmp":
-            return ".bmp"
+            return ".png"
 
     suffix = urlparse(url).path.rsplit("/", 1)[-1].lower().rsplit(".", 1)
     if len(suffix) == 2:
         extension = f".{suffix[1]}"
         if extension in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-            return ".jpg" if extension == ".jpeg" else extension
+            return ".png"
 
     return ".img"
+
+
+def _image_bytes_as_png(
+    data: bytes, content_type: str | None
+) -> tuple[bytes, str | None]:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized == "image/png":
+        return data, "image/png"
+
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            output = io.BytesIO()
+            image.save(output, format="PNG", optimize=True)
+            return output.getvalue(), "image/png"
+    except (UnidentifiedImageError, OSError):
+        LOGGER.warning("이미지를 PNG로 변환하지 못해 원본으로 보냅니다.")
+        return data, content_type
 
 
 def _safe_zip_filename(post: NewsPost) -> str:
@@ -3529,9 +4330,10 @@ async def main() -> None:
 
     async with aiohttp.ClientSession() as session:
         news_source = build_news_source(config, session)
+        x_source = LimbusXClient(config, session)
         bot = LimpiBot(config)
 
-        cog = NewsCog(bot, config, storage, news_source, session)
+        cog = NewsCog(bot, config, storage, news_source, x_source, session)
 
         @bot.event
         async def on_ready() -> None:

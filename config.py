@@ -149,6 +149,7 @@ class AppConfig:
     command_guild_id: int | None
     command_sync_mode: str
     announce_existing_on_first_run: bool
+    x_account_username: str
 
     @classmethod
     def from_env(cls, *, test: bool = False) -> "AppConfig":
@@ -164,6 +165,7 @@ class AppConfig:
                 raise RuntimeError("DISCORD_TOKEN is required.")
 
         command_guild_id = _get_optional_int("COMMAND_GUILD_ID")
+        x_account_username = os.getenv("X_ACCOUNT_USERNAME", "LimbusCompany_B").strip() or "LimbusCompany_B"
         return cls(
             discord_token=discord_token,
             database_path=Path(os.getenv("DATABASE_PATH", "limpi.sqlite3")),
@@ -184,4 +186,5 @@ class AppConfig:
             command_guild_id=command_guild_id,
             command_sync_mode=_get_command_sync_mode(command_guild_id),
             announce_existing_on_first_run=_get_bool("ANNOUNCE_EXISTING_ON_FIRST_RUN", False),
+            x_account_username=x_account_username,
         )

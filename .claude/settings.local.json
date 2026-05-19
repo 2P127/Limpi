@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_claude-mem_mcp-search__get_observations",
+      "Bash(python -c \"from config import AppConfig; print\\('config OK'\\)\")",
+      "Bash(python -c \"from x_client import LimbusXClient, XClientError; print\\('x_client OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(sed -n '2072,2095p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
+      "Bash(sed -n '930,945p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
+      "Bash(sed -n '495,520p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
+      "Bash(sed -n '940,960p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
+      "Bash(sed -n '920,940p' C:/Users/Haryu5412/Documents/Github/Limpi/bot.py)",
+      "Bash(python *)"
+    ]
+  }
+}

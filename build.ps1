@@ -27,6 +27,7 @@ $pyInstallerArgs = @(
     "--hidden-import=models",
     "--hidden-import=storage",
     "--hidden-import=steam_client",
+    "--hidden-import=x_client",
     "--hidden-import=pm_twitter",
     "--hidden-import=discord",
     "--hidden-import=discord.ext.commands",

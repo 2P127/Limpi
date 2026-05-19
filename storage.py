@@ -8,7 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-from models import GuildNewsTarget, GuildSettings, NewsPost, TrackedMessage, UserSettings
+from models import (
+    GuildNewsTarget,
+    GuildTwitterTarget,
+    GuildSettings,
+    NewsPost,
+    TrackedMessage,
+    TwitterPost,
+    UserSettings,
+)
 
 
 DEFAULT_AUTO_CLEANUP_ENABLED = True
@@ -97,6 +105,21 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS twitter_posts (
+                    post_id TEXT PRIMARY KEY,
+                    author_username TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT,
+                    image_urls TEXT NOT NULL DEFAULT '[]',
+                    raw_json TEXT NOT NULL DEFAULT '{}',
+                    saved_at TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS guild_news_targets (
                     target_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
@@ -105,6 +128,18 @@ class SQLiteStorage:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     UNIQUE(guild_id, channel_id)
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_twitter_targets (
+                    guild_id INTEGER PRIMARY KEY,
+                    channel_id INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_seen_post_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )
                 """
             )
@@ -219,6 +254,18 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_twitter_posts_created_at
+                ON twitter_posts(created_at DESC)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_twitter_posts_title
+                ON twitter_posts(title)
+                """
+            )
+            self._connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_guild_seen_posts_post_id
                 ON guild_seen_posts(post_id)
                 """
@@ -227,6 +274,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_news_targets_guild_language
                 ON guild_news_targets(guild_id, language)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_twitter_targets_channel
+                ON guild_twitter_targets(channel_id)
                 """
             )
             self._dedupe_news_target_channels()
@@ -654,6 +707,91 @@ class SQLiteStorage:
             )
             self._connection.commit()
             return True
+
+    def get_twitter_target(self, guild_id: int) -> GuildTwitterTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_seen_post_id, created_at, updated_at
+                FROM guild_twitter_targets
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return self._row_to_twitter_target(row) if row is not None else None
+
+    def list_twitter_targets(self) -> list[GuildTwitterTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_seen_post_id, created_at, updated_at
+                FROM guild_twitter_targets
+                WHERE enabled = 1
+                ORDER BY guild_id
+                """
+            ).fetchall()
+        return [self._row_to_twitter_target(row) for row in rows]
+
+    def upsert_twitter_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        enabled: bool = True,
+        last_seen_post_id: str | None = None,
+    ) -> GuildTwitterTarget:
+        current = self.get_twitter_target(guild_id)
+        now = _now_iso()
+        next_last_seen = (
+            last_seen_post_id if last_seen_post_id is not None else (
+                current.last_seen_post_id if current is not None else None
+            )
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO guild_twitter_targets (
+                    guild_id, channel_id, enabled, last_seen_post_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    enabled = excluded.enabled,
+                    last_seen_post_id = COALESCE(
+                        excluded.last_seen_post_id,
+                        guild_twitter_targets.last_seen_post_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, channel_id, int(enabled), next_last_seen, now, now),
+            )
+            self._connection.commit()
+        target = self.get_twitter_target(guild_id)
+        if target is None:
+            raise RuntimeError("Failed to upsert guild twitter target")
+        return target
+
+    def delete_twitter_target(self, guild_id: int) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM guild_twitter_targets WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.commit()
+        return cursor.rowcount > 0
+
+    def mark_twitter_target_seen(self, guild_id: int, post_id: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_twitter_targets
+                SET last_seen_post_id = ?, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (post_id, now, guild_id),
+            )
+            self._connection.commit()
 
     def get_user_settings(self, user_id: int) -> UserSettings:
         with self._lock:
@@ -1261,6 +1399,133 @@ class SQLiteStorage:
         posts = [self._row_to_post(row) for row in rows]
         return _dedupe_posts_for_choices(posts, limit)
 
+    def save_twitter_posts(self, posts: Iterable[TwitterPost]) -> int:
+        posts_list = list(posts)
+        if not posts_list:
+            return 0
+        now = _now_iso()
+        saved = 0
+        with self._lock:
+            for post in posts_list:
+                cursor = self._connection.execute(
+                    """
+                    INSERT INTO twitter_posts (
+                        post_id, author_username, url, text, title, created_at,
+                        image_urls, raw_json, saved_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(post_id) DO UPDATE SET
+                        author_username = excluded.author_username,
+                        url = excluded.url,
+                        text = excluded.text,
+                        title = excluded.title,
+                        created_at = excluded.created_at,
+                        image_urls = excluded.image_urls,
+                        raw_json = excluded.raw_json
+                    """,
+                    (
+                        post.post_id,
+                        post.author_username,
+                        post.url,
+                        post.text,
+                        post.title,
+                        _datetime_to_iso(post.created_at),
+                        json.dumps(post.image_urls, ensure_ascii=False),
+                        json.dumps(post.raw, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                if cursor.rowcount:
+                    saved += 1
+            self._connection.commit()
+        return saved
+
+    def replace_twitter_posts(self, posts: Iterable[TwitterPost]) -> int:
+        posts_list = list(posts)
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute("DELETE FROM twitter_posts")
+            saved = 0
+            for post in posts_list:
+                self._connection.execute(
+                    """
+                    INSERT INTO twitter_posts (
+                        post_id, author_username, url, text, title, created_at,
+                        image_urls, raw_json, saved_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        post.post_id,
+                        post.author_username,
+                        post.url,
+                        post.text,
+                        post.title,
+                        _datetime_to_iso(post.created_at),
+                        json.dumps(post.image_urls, ensure_ascii=False),
+                        json.dumps(post.raw, ensure_ascii=False),
+                        now,
+                    ),
+                )
+                saved += 1
+            self._connection.commit()
+        return saved
+
+    def get_twitter_post(self, post_id: str) -> TwitterPost | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM twitter_posts WHERE post_id = ?", (post_id,)
+            ).fetchone()
+        return self._row_to_twitter_post(row) if row else None
+
+    def get_twitter_post_by_id_or_title(self, value: str) -> TwitterPost | None:
+        post = self.get_twitter_post(value)
+        if post is not None:
+            return post
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM twitter_posts
+                WHERE title = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (value,),
+            ).fetchone()
+        return self._row_to_twitter_post(row) if row else None
+
+    def get_latest_twitter_post(self) -> TwitterPost | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM twitter_posts
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._row_to_twitter_post(row) if row else None
+
+    def search_twitter_posts(self, query: str, limit: int = 25) -> list[TwitterPost]:
+        query = query.strip()
+        if query:
+            sql = """
+                SELECT * FROM twitter_posts
+                WHERE title LIKE ? OR text LIKE ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            """
+            params: tuple[object, ...] = (f"%{query}%", f"%{query}%", limit)
+        else:
+            sql = """
+                SELECT * FROM twitter_posts
+                ORDER BY created_at DESC
+                LIMIT ?
+            """
+            params = (limit,)
+        with self._lock:
+            rows = self._connection.execute(sql, params).fetchall()
+        return [self._row_to_twitter_post(row) for row in rows]
+
     def add_tracked_message(
         self, guild_id: int, channel_id: int, message_id: int
     ) -> None:
@@ -1354,6 +1619,9 @@ class SQLiteStorage:
                 "DELETE FROM guild_news_targets WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
+                "DELETE FROM guild_twitter_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
@@ -1406,6 +1674,17 @@ class SQLiteStorage:
         )
 
     @staticmethod
+    def _row_to_twitter_target(row: sqlite3.Row) -> GuildTwitterTarget:
+        return GuildTwitterTarget(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            enabled=bool(row["enabled"]),
+            last_seen_post_id=row["last_seen_post_id"],
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
     def _row_to_user_settings(row: sqlite3.Row) -> UserSettings:
         raw_delivery = row["image_delivery"] if "image_delivery" in row.keys() else None
         image_delivery = "files" if raw_delivery == "files" else None
@@ -1426,6 +1705,19 @@ class SQLiteStorage:
         return NewsPost(
             post_id=str(row["post_id"]),
             source_user=str(row["source_user"]),
+            url=str(row["url"]),
+            text=str(row["text"]),
+            title=str(row["title"]),
+            created_at=_datetime_from_iso(row["created_at"]),
+            image_urls=json.loads(row["image_urls"]),
+            raw=json.loads(row["raw_json"]),
+        )
+
+    @staticmethod
+    def _row_to_twitter_post(row: sqlite3.Row) -> TwitterPost:
+        return TwitterPost(
+            post_id=str(row["post_id"]),
+            author_username=str(row["author_username"]),
             url=str(row["url"]),
             text=str(row["text"]),
             title=str(row["title"]),

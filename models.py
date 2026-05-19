@@ -17,6 +17,18 @@ class NewsPost:
 
 
 @dataclass(frozen=True)
+class TwitterPost:
+    post_id: str
+    author_username: str
+    url: str
+    text: str
+    title: str
+    created_at: datetime | None
+    image_urls: list[str]
+    raw: dict
+
+
+@dataclass(frozen=True)
 class GuildSettings:
     guild_id: int
     channel_id: int | None
@@ -43,6 +55,16 @@ class GuildNewsTarget:
     guild_id: int
     channel_id: int
     language: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class GuildTwitterTarget:
+    guild_id: int
+    channel_id: int
+    enabled: bool
+    last_seen_post_id: str | None
     created_at: datetime | None
     updated_at: datetime | None
 
