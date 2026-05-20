@@ -12,6 +12,7 @@ from typing import Iterable
 LOGGER = logging.getLogger(__name__)
 
 from models import (
+    GuildChzzkTarget,
     GuildNewsTarget,
     GuildTwitterTarget,
     GuildSettings,
@@ -38,6 +39,17 @@ MAX_CLEANUP_DAYS = 7
 def _post_content_hash(post: "NewsPost") -> str:
     raw = f"{post.title}\x00{post.text}\x00{json.dumps(post.image_urls, sort_keys=True)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _column_default_definition(definition: str) -> str:
+    upper = definition.upper()
+    if "TEXT" in upper:
+        return f"{definition} DEFAULT ''"
+    if "INTEGER" in upper:
+        return f"{definition} DEFAULT 0"
+    if "REAL" in upper:
+        return f"{definition} DEFAULT 0"
+    return f"{definition} DEFAULT ''"
 
 
 class SQLiteStorage:
@@ -136,6 +148,16 @@ class SQLiteStorage:
                 updated_at TEXT NOT NULL
             )
         """,
+        "guild_chzzk_targets": """
+            CREATE TABLE IF NOT EXISTS guild_chzzk_targets (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_live_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
         "guild_news_target_seen_posts": """
             CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
                 target_id INTEGER NOT NULL,
@@ -178,6 +200,7 @@ class SQLiteStorage:
                 self._connection.execute(ddl)
                 self._auto_migrate_table(table_name, ddl)
 
+            self._backfill_schema_defaults()
             self._connection.execute(
                 "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
             )
@@ -218,6 +241,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_twitter_targets_channel
                 ON guild_twitter_targets(channel_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_chzzk_targets_channel
+                ON guild_chzzk_targets(channel_id)
                 """
             )
             self._dedupe_news_target_channels()
@@ -261,8 +290,29 @@ class SQLiteStorage:
         rows = self._connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         existing_columns = {str(row["name"]) for row in rows}
         if column_name not in existing_columns:
+            self._add_missing_column(table_name, column_name, definition)
+
+    def _add_missing_column(self, table_name: str, column_name: str, definition: str) -> None:
+        sql = f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+        try:
+            self._connection.execute(sql)
+        except sqlite3.OperationalError as exc:
+            message = str(exc)
+            needs_default = (
+                "Cannot add a NOT NULL column with default value NULL" in message
+                and "DEFAULT" not in definition.upper()
+            )
+            if not needs_default:
+                raise
+            fallback = _column_default_definition(definition)
+            LOGGER.info(
+                "Schema migration: adding %s.%s with fallback default (%s)",
+                table_name,
+                column_name,
+                fallback,
+            )
             self._connection.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {fallback}"
             )
 
     def _auto_migrate_table(self, table_name: str, ddl: str) -> None:
@@ -303,9 +353,81 @@ class SQLiteStorage:
             if col_name in existing:
                 continue
             LOGGER.info("스키마 마이그레이션: %s.%s 컬럼 추가 (%s)", table_name, col_name, col_def)
-            self._connection.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_def}"
-            )
+            self._add_missing_column(table_name, col_name, col_def)
+
+    def _backfill_schema_defaults(self) -> None:
+        now = _now_iso()
+        self._connection.execute(
+            """
+            UPDATE guild_settings
+            SET
+                post_format = COALESCE(NULLIF(post_format, ''), 'rich'),
+                enabled = COALESCE(enabled, 1),
+                language = COALESCE(NULLIF(language, ''), 'koreana'),
+                max_posts_per_poll = COALESCE(max_posts_per_poll, 30),
+                auto_cleanup_enabled = COALESCE(auto_cleanup_enabled, 1),
+                auto_cleanup_days = COALESCE(auto_cleanup_days, 1),
+                image_delivery = COALESCE(NULLIF(image_delivery, ''), 'files'),
+                notification_banner = COALESCE(NULLIF(notification_banner, ''), ?),
+                public_news_lookup_allowed = COALESCE(public_news_lookup_allowed, 1),
+                missed_news_recovery_enabled = COALESCE(missed_news_recovery_enabled, 0),
+                maintenance_notifications_enabled = COALESCE(maintenance_notifications_enabled, 0),
+                news_source_mode = COALESCE(NULLIF(news_source_mode, ''), ?),
+                created_at = COALESCE(NULLIF(created_at, ''), ?),
+                updated_at = COALESCE(NULLIF(updated_at, ''), ?)
+            """,
+            (DEFAULT_NOTIFICATION_BANNER, DEFAULT_NEWS_SOURCE_MODE, now, now),
+        )
+        self._connection.execute(
+            """
+            UPDATE posts
+            SET
+                source_user = COALESCE(NULLIF(source_user, ''), 'ProjectMoon'),
+                url = COALESCE(url, ''),
+                text = COALESCE(text, ''),
+                title = COALESCE(NULLIF(title, ''), COALESCE(NULLIF(text, ''), post_id)),
+                language = COALESCE(NULLIF(language, ''), 'koreana'),
+                image_urls = COALESCE(NULLIF(image_urls, ''), '[]'),
+                raw_json = COALESCE(NULLIF(raw_json, ''), '{}'),
+                content_hash = COALESCE(content_hash, ''),
+                saved_at = COALESCE(NULLIF(saved_at, ''), ?)
+            """,
+            (now,),
+        )
+        self._connection.execute(
+            """
+            UPDATE twitter_posts
+            SET
+                author_username = COALESCE(NULLIF(author_username, ''), 'LimbusCompany_B'),
+                url = COALESCE(url, ''),
+                text = COALESCE(text, ''),
+                title = COALESCE(NULLIF(title, ''), COALESCE(NULLIF(text, ''), post_id)),
+                image_urls = COALESCE(NULLIF(image_urls, ''), '[]'),
+                raw_json = COALESCE(NULLIF(raw_json, ''), '{}'),
+                saved_at = COALESCE(NULLIF(saved_at, ''), ?)
+            """,
+            (now,),
+        )
+        self._connection.execute(
+            """
+            UPDATE guild_news_targets
+            SET
+                language = COALESCE(NULLIF(language, ''), 'koreana'),
+                created_at = COALESCE(NULLIF(created_at, ''), ?),
+                updated_at = COALESCE(NULLIF(updated_at, ''), ?)
+            """,
+            (now, now),
+        )
+        self._connection.execute(
+            """
+            UPDATE guild_twitter_targets
+            SET
+                enabled = COALESCE(enabled, 1),
+                created_at = COALESCE(NULLIF(created_at, ''), ?),
+                updated_at = COALESCE(NULLIF(updated_at, ''), ?)
+            """,
+            (now, now),
+        )
 
     def _migrate_legacy_post_ids(self) -> None:
         rows = self._connection.execute(
@@ -854,6 +976,82 @@ class SQLiteStorage:
             )
             self._connection.commit()
 
+    def get_chzzk_target(self, guild_id: int) -> GuildChzzkTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                FROM guild_chzzk_targets
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return self._row_to_chzzk_target(row) if row is not None else None
+
+    def list_chzzk_targets(self) -> list[GuildChzzkTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                FROM guild_chzzk_targets
+                WHERE enabled = 1
+                ORDER BY guild_id
+                """
+            ).fetchall()
+        return [self._row_to_chzzk_target(row) for row in rows]
+
+    def upsert_chzzk_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        enabled: bool = True,
+        last_live_id: str | None = None,
+    ) -> GuildChzzkTarget:
+        current = self.get_chzzk_target(guild_id)
+        now = _now_iso()
+        next_last_live_id = (
+            last_live_id if last_live_id is not None else (
+                current.last_live_id if current is not None else None
+            )
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO guild_chzzk_targets (
+                    guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    enabled = excluded.enabled,
+                    last_live_id = COALESCE(
+                        excluded.last_live_id,
+                        guild_chzzk_targets.last_live_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, channel_id, int(enabled), next_last_live_id, now, now),
+            )
+            self._connection.commit()
+        target = self.get_chzzk_target(guild_id)
+        if target is None:
+            raise RuntimeError("Failed to upsert guild chzzk target")
+        return target
+
+    def mark_chzzk_target_seen(self, guild_id: int, live_id: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_chzzk_targets
+                SET last_live_id = ?, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (live_id, now, guild_id),
+            )
+            self._connection.commit()
+
     def get_user_settings(self, user_id: int) -> UserSettings:
         with self._lock:
             row = self._connection.execute(
@@ -873,6 +1071,13 @@ class SQLiteStorage:
             )
 
         return self._row_to_user_settings(row)
+
+    def count_user_settings(self) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COUNT(*) AS count FROM user_settings"
+            ).fetchone()
+        return int(row["count"] or 0) if row is not None else 0
 
     def upsert_user_settings(
         self,
@@ -1695,6 +1900,9 @@ class SQLiteStorage:
                 "DELETE FROM guild_twitter_targets WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
+                "DELETE FROM guild_chzzk_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
@@ -1757,6 +1965,17 @@ class SQLiteStorage:
             channel_id=int(row["channel_id"]),
             enabled=bool(row["enabled"]),
             last_seen_post_id=row["last_seen_post_id"],
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_chzzk_target(row: sqlite3.Row) -> GuildChzzkTarget:
+        return GuildChzzkTarget(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            enabled=bool(row["enabled"]),
+            last_live_id=row["last_live_id"],
             created_at=_datetime_from_iso(row["created_at"]),
             updated_at=_datetime_from_iso(row["updated_at"]),
         )

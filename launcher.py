@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import signal
 import sys
 
 multiprocessing.freeze_support()
@@ -9,7 +10,10 @@ _WORKER_FLAG = "--bot-worker"
 if _WORKER_FLAG in sys.argv:
     import asyncio
     import bot
-    sys.exit(asyncio.run(bot.main()))
+    try:
+        sys.exit(asyncio.run(bot.main()))
+    except KeyboardInterrupt:
+        sys.exit(0)
 
 import datetime
 import os
@@ -17,7 +21,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from tkinter import scrolledtext
+from tkinter import messagebox, scrolledtext
 
 from PIL import Image, ImageDraw
 import psutil
@@ -48,6 +52,7 @@ C_PEACH    = "#fab387"
 
 
 _BELOW_NORMAL_PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+_CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
 _CPU_LOGICAL_COUNT = psutil.cpu_count(logical=True) or 1
 
 
@@ -84,7 +89,11 @@ class BotProcess:
                 bufsize=1,
                 cwd=cwd,
                 env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW | _BELOW_NORMAL_PRIORITY,
+                creationflags=(
+                    subprocess.CREATE_NO_WINDOW
+                    | _CREATE_NEW_PROCESS_GROUP
+                    | _BELOW_NORMAL_PRIORITY
+                ),
             )
             try:
                 self._psutil = psutil.Process(self.proc.pid)
@@ -106,9 +115,16 @@ class BotProcess:
             if not (self.proc and self.proc.poll() is None):
                 return
             self.on_log("[시스템] 봇 중지 중…")
+            try:
+                self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+            except (ValueError, OSError):
+                self.proc.terminate()
+        try:
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
             self.proc.terminate()
         try:
-            self.proc.wait(timeout=8)
+            self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.proc.kill()
         self._psutil = None
@@ -160,7 +176,7 @@ class LimpiLauncher:
 
         if os.path.exists(ICON_PATH):
             self.root.iconbitmap(ICON_PATH)
-        self.root.protocol("WM_DELETE_WINDOW", self._hide_window)
+        self.root.protocol("WM_DELETE_WINDOW", self._confirm_close)
         self._update_status()
         self.bot.start()
 
@@ -329,6 +345,22 @@ class LimpiLauncher:
 
     def _hide_window(self) -> None:
         self.root.withdraw()
+
+    def _confirm_close(self) -> None:
+        choice = messagebox.askyesnocancel(
+            "림피 종료",
+            "림피를 시스템 트레이에 남겨둘까요?\n\n"
+            "예: 창만 닫고 백그라운드에서 계속 실행\n"
+            "아니요: 봇과 앱 완전 종료\n"
+            "취소: 돌아가기",
+            parent=self.root,
+        )
+        if choice is None:
+            return
+        if choice:
+            self._hide_window()
+            return
+        self._on_quit()
 
     def _show_window(self) -> None:
         self.root.deiconify()

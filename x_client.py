@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from asyncio import Lock
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -104,6 +105,10 @@ class LimbusXClient:
         self.config = config
         self.session = session
         self._x_user_id: str | None = None
+        self._fetch_lock = Lock()
+        self._cached_posts: list[TwitterPost] = []
+        self._cached_at: datetime | None = None
+        self._rate_limited_until: datetime | None = None
 
     def _has_twitter_auth(self) -> bool:
         cfg = self.config
@@ -161,7 +166,38 @@ class LimbusXClient:
             raise XClientError(
                 "X_AUTH_TOKEN 또는 X_CT0가 설정되지 않아 Twitter 게시물을 가져올 수 없습니다."
             )
-        return await self._fetch_via_twitter_api(limit=limit)
+        async with self._fetch_lock:
+            now = datetime.now(timezone.utc)
+            if self._cached_posts and self._cached_at and now - self._cached_at < timedelta(minutes=2):
+                return self._cached_posts[:limit]
+            if self._rate_limited_until and now < self._rate_limited_until:
+                if self._cached_posts:
+                    LOGGER.warning(
+                        "X API rate limit 백오프 중이라 캐시된 게시물을 사용합니다 (until=%s).",
+                        self._rate_limited_until.isoformat(),
+                    )
+                    return self._cached_posts[:limit]
+                raise XClientError(
+                    f"X API rate limit 백오프 중입니다: {self._rate_limited_until.isoformat()}"
+                )
+
+            try:
+                posts = await self._fetch_via_twitter_api(limit=limit)
+            except XClientError as exc:
+                if _is_rate_limit_error(exc):
+                    self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+                    if self._cached_posts:
+                        LOGGER.warning(
+                            "X API rate limit으로 캐시된 게시물을 사용합니다 (until=%s).",
+                            self._rate_limited_until.isoformat(),
+                        )
+                        return self._cached_posts[:limit]
+                raise
+
+            self._cached_posts = posts
+            self._cached_at = datetime.now(timezone.utc)
+            self._rate_limited_until = None
+            return posts[:limit]
 
     async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
         username = self.config.x_account_username
@@ -216,7 +252,6 @@ class LimbusXClient:
         posts.sort(key=_tweet_sort_key, reverse=True)
         if not posts:
             raise XClientError("Twitter API에서 게시물을 가져오지 못했습니다.")
-        LOGGER.info("Twitter API: %d개 게시물 수집 완료.", len(posts))
         return posts[:limit]
 
     async def _enrich_posts_with_fx_media(
@@ -264,6 +299,11 @@ class LimbusXClient:
 
 def _graphql_url(query_id: str, operation_name: str) -> str:
     return f"https://x.com/i/api/graphql/{query_id}/{operation_name}"
+
+
+def _is_rate_limit_error(exc: XClientError) -> bool:
+    message = str(exc).lower()
+    return " 429" in message or "rate limit" in message
 
 
 def _next_cursor_from_payload(payload: dict[str, Any]) -> str | None:
@@ -452,8 +492,9 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     tweet_id = str(tweet.get("rest_id") or legacy.get("id_str") or "").strip()
     if not tweet_id:
         return None
-    text = str(legacy.get("full_text") or legacy.get("text") or "")
+    text = _tweet_full_text(tweet, legacy)
     link_urls = _external_link_urls(legacy, username, tweet_id)
+    text = _expand_note_tweet_urls(text, tweet)
     text = _strip_tco_links(text, legacy)
     text = _clean_tweet_text(text)
     if text in {"고정된 게시물", "Pinned", "Pinned Tweet"}:
@@ -507,6 +548,40 @@ def _strip_tco_links(text: str, legacy: dict[str, Any]) -> str:
             urls.add(str(url_entity["url"]))
     for url in urls:
         text = text.replace(url, "")
+    return text
+
+
+def _tweet_full_text(tweet: dict[str, Any], legacy: dict[str, Any]) -> str:
+    note_result = (
+        tweet.get("note_tweet", {})
+        .get("note_tweet_results", {})
+        .get("result")
+    )
+    if isinstance(note_result, dict):
+        text = note_result.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return str(legacy.get("full_text") or legacy.get("text") or "")
+
+
+def _expand_note_tweet_urls(text: str, tweet: dict[str, Any]) -> str:
+    note_result = (
+        tweet.get("note_tweet", {})
+        .get("note_tweet_results", {})
+        .get("result")
+    )
+    if not isinstance(note_result, dict):
+        return text
+    urls = note_result.get("entity_set", {}).get("urls")
+    if not isinstance(urls, list):
+        return text
+    for url_entity in urls:
+        if not isinstance(url_entity, dict):
+            continue
+        short_url = str(url_entity.get("url") or "")
+        expanded_url = str(url_entity.get("expanded_url") or "")
+        if short_url and expanded_url:
+            text = text.replace(short_url, expanded_url)
     return text
 
 

@@ -20,8 +20,14 @@ from PIL import Image, UnidentifiedImageError
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from chzzk_client import (
+    ChzzkClient,
+    ChzzkLive,
+    PROJECT_MOON_CHZZK_LIVE_URL,
+    PROJECT_MOON_YOUTUBE_STREAMS_URL,
+)
 from config import AppConfig
-from models import GuildNewsTarget, GuildSettings, NewsPost, TwitterPost
+from models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, NewsPost, TwitterPost
 from storage import (
     DEFAULT_NOTIFICATION_BANNER,
     DEFAULT_NEWS_SOURCE_MODE,
@@ -40,6 +46,8 @@ KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 80
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
+TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 30
+CHZZK_POLL_INTERVAL_SECONDS = 60
 AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
@@ -219,6 +227,13 @@ class LimpiBot(commands.Bot):
         self._cleared_connected_guild_commands = False
         self._logged_startup_summary = False
 
+    async def update_presence_status(self, text: str | None = None) -> None:
+        await self.change_presence(
+            activity=discord.Game(
+                name=text or f"림피가 {len(self.guilds)}개의 서버에서 활동중이에요!"
+            )
+        )
+
     async def setup_hook(self) -> None:
         self.add_dynamic_items(ZipDownloadButton)
         synced = await self.tree.sync()
@@ -373,8 +388,10 @@ class NewsCog(commands.Cog):
         self.news_source = news_source
         self.x_source = x_source
         self.session = session
+        self.chzzk_client = ChzzkClient(session)
         self._poll_lock = asyncio.Lock()
         self._twitter_poll_lock = asyncio.Lock()
+        self._chzzk_poll_lock = asyncio.Lock()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
@@ -383,11 +400,14 @@ class NewsCog(commands.Cog):
         self._startup_synced = False
         self._in_high_frequency_window: bool = False
         self._in_high_frequency_twitter_window: bool = False
+        self._presence_show_servers: bool = True
 
     async def cog_load(self) -> None:
+        self.presence_status.start()
         self.maintenance_notifications.start()
         self.cleanup_messages.start()
         self.poll_twitter_posts.start()
+        self.poll_chzzk_live.start()
 
         if self.news_source is None and self.x_source is None:
             LOGGER.warning("뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -396,12 +416,34 @@ class NewsCog(commands.Cog):
         self.poll_news.start()
 
     async def cog_unload(self) -> None:
+        if self.presence_status.is_running():
+            self.presence_status.cancel()
         if self.poll_news.is_running():
             self.poll_news.cancel()
         if self.poll_twitter_posts.is_running():
             self.poll_twitter_posts.cancel()
+        if self.poll_chzzk_live.is_running():
+            self.poll_chzzk_live.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
+
+    @tasks.loop(minutes=1)
+    async def presence_status(self) -> None:
+        await self.update_presence_status()
+
+    @presence_status.before_loop
+    async def before_presence_status(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def update_presence_status(self, *, show_servers: bool | None = None) -> None:
+        use_server_count = self._presence_show_servers if show_servers is None else show_servers
+        if use_server_count:
+            text = f"림피가 {len(self.bot.guilds)}개의 서버에서 활동중이에요!"
+        else:
+            text = f"림피 앱을 {self.storage.count_user_settings()}명이 사용중이에요!"
+        await self.bot.update_presence_status(text)
+        if show_servers is None:
+            self._presence_show_servers = not self._presence_show_servers
 
     def log_startup_summary(self) -> None:
         connected_guild_ids = {guild.id for guild in self.bot.guilds}
@@ -515,7 +557,7 @@ class NewsCog(commands.Cog):
     async def before_poll_news(self) -> None:
         await self.bot.wait_until_ready()
 
-    @tasks.loop(seconds=60)
+    @tasks.loop(seconds=TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS)
     async def poll_twitter_posts(self) -> None:
         async with self._twitter_poll_lock:
             try:
@@ -523,10 +565,11 @@ class NewsCog(commands.Cog):
                 currently_in_window = self._is_high_frequency_window(now)
                 if currently_in_window and not self._in_high_frequency_twitter_window:
                     LOGGER.info(
-                        "X 고빈도 추적 시작 (KST %s시~%s시, 요일 필터: %s).",
+                        "X 고빈도 추적 시작 (KST %s시~%s시, 요일 필터: %s, 간격: %s초).",
                         self.config.high_frequency_start_hour,
                         self.config.high_frequency_end_hour,
                         self.config.high_frequency_weekdays,
+                        TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS,
                     )
                 elif not currently_in_window and self._in_high_frequency_twitter_window:
                     LOGGER.info("X 고빈도 추적 종료.")
@@ -543,6 +586,20 @@ class NewsCog(commands.Cog):
 
     @poll_twitter_posts.before_loop
     async def before_poll_twitter_posts(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=CHZZK_POLL_INTERVAL_SECONDS)
+    async def poll_chzzk_live(self) -> None:
+        async with self._chzzk_poll_lock:
+            try:
+                await self._poll_chzzk_once()
+            except aiohttp.ClientError as exc:
+                LOGGER.warning("치지직 라이브 자동 확인 실패: %s", exc)
+            except Exception:
+                LOGGER.exception("치지직 라이브 자동 확인 실패.")
+
+    @poll_chzzk_live.before_loop
+    async def before_poll_chzzk_live(self) -> None:
         await self.bot.wait_until_ready()
 
     @tasks.loop(seconds=60)
@@ -741,8 +798,11 @@ class NewsCog(commands.Cog):
         if self.news_source is None and self.x_source is None:
             return 0
 
-        posts_by_language, changed_post_ids = await self._combined_posts_by_language()
         targets_by_language = self._news_targets_by_language()
+        if not targets_by_language:
+            return 0
+
+        posts_by_language, changed_post_ids = await self._combined_posts_by_language()
 
         announced_count = 0
         for language, target_list in targets_by_language.items():
@@ -1059,9 +1119,14 @@ class NewsCog(commands.Cog):
     def _should_poll_twitter_now(self, now: datetime) -> bool:
         if self._last_twitter_poll_at is None:
             return True
-        interval = self._current_poll_interval_seconds(now)
+        interval = self._current_twitter_poll_interval_seconds(now)
         elapsed = (now - self._last_twitter_poll_at).total_seconds()
         return elapsed >= interval
+
+    def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
+        if self._is_high_frequency_window(now):
+            return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
+        return self.config.poll_interval_seconds
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
         if self._is_high_frequency_window(now):
@@ -1643,6 +1708,18 @@ class NewsCog(commands.Cog):
                 content=youtube_content,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+        if _is_twitter_news_post(post):
+            video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
+            video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
+            if video_url_groups:
+                await self._send_twitter_video_to_channel(
+                    channel, video_url_groups, video_fallback_url or post.url
+                )
+            elif video_fallback_url:
+                await channel.send(
+                    content=video_fallback_url,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
         self._schedule_channel_image_messages(
             channel,
             post,
@@ -1691,6 +1768,28 @@ class NewsCog(commands.Cog):
                     wait=True,
                 )
             )
+        if _is_twitter_news_post(post):
+            video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
+            video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
+            if video_url_groups:
+                task = asyncio.create_task(
+                    self._send_twitter_video_followups(
+                        interaction,
+                        private,
+                        video_url_groups,
+                        video_fallback_url or post.url,
+                    )
+                )
+                task.add_done_callback(self._log_background_task_result)
+            elif video_fallback_url:
+                sent_messages.append(
+                    await interaction.followup.send(
+                        content=video_fallback_url,
+                        ephemeral=private,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        wait=True,
+                    )
+                )
 
         if self._bot_is_missing_from_interaction_guild(interaction):
             self._schedule_interaction_image_embed_followups(
@@ -2259,6 +2358,10 @@ class NewsCog(commands.Cog):
             except Exception:
                 LOGGER.exception("시작 시 뉴스 동기화 실패.")
         try:
+            if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
+                LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
+                return
+
             saved, _ = await self._sync_twitter_posts()
             latest = self.storage.get_latest_twitter_post()
             if latest is not None:
@@ -2270,6 +2373,8 @@ class NewsCog(commands.Cog):
                 )
             else:
                 LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
+        except XClientError as exc:
+            LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
 
@@ -2289,13 +2394,17 @@ class NewsCog(commands.Cog):
         return saved, posts
 
     async def _poll_twitter_once(self) -> int:
+        targets = self.storage.list_twitter_targets()
+        if not targets:
+            return 0
+
         _, posts = await self._sync_twitter_posts()
         if not posts:
             return 0
 
         announced = 0
         posts = posts[:TWITTER_POST_LIMIT]
-        for target in self.storage.list_twitter_targets():
+        for target in targets:
             if not target.enabled:
                 continue
             channel = await self._resolve_twitter_target_channel(target)
@@ -2347,6 +2456,103 @@ class NewsCog(commands.Cog):
             ]
         return []
 
+    async def _poll_chzzk_once(self) -> int:
+        targets = self.storage.list_chzzk_targets()
+        if not targets:
+            return 0
+
+        live = await self.chzzk_client.fetch_live()
+        if live is None:
+            return 0
+
+        announced = 0
+        for target in targets:
+            if not target.enabled:
+                continue
+            if target.last_live_id is None:
+                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+                continue
+            if str(target.last_live_id) == live.live_id:
+                continue
+
+            channel = await self._resolve_chzzk_target_channel(target)
+            if channel is None:
+                continue
+            try:
+                settings = self.storage.get_settings(target.guild_id)
+                message = await self._send_chzzk_live_to_channel(
+                    channel,
+                    live,
+                    role_id=settings.role_id,
+                )
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "치지직 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    live.live_id,
+                )
+                continue
+
+            self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+            await self._track_manual_message(target.guild_id, target.channel_id, message)
+            LOGGER.info(
+                "새 치지직 라이브 공지 (guild %s, channel %s): %s",
+                target.guild_id,
+                target.channel_id,
+                live.title,
+            )
+            announced += 1
+        return announced
+
+    async def _resolve_chzzk_target_channel(
+        self, target: GuildChzzkTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "치지직 라이브 자동 전송 건너뜀: 채널 접근 불가 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "치지직 라이브 자동 전송 채널 조회 실패 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
+    async def _send_chzzk_live_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        live: ChzzkLive,
+        *,
+        role_id: int | None = None,
+    ) -> discord.Message:
+        embed = _embed_for_chzzk_live(live)
+        youtube_url = await self._youtube_latest_live_url()
+        view = _chzzk_live_view(youtube_url)
+        if role_id:
+            await channel.send(
+                content=f"<@&{role_id}>",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
+                ),
+            )
+        return await channel.send(
+            embed=embed,
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     async def _resolve_twitter_target_channel(
         self, target: GuildTwitterTarget
     ) -> discord.abc.Messageable | None:
@@ -2378,9 +2584,12 @@ class NewsCog(commands.Cog):
         attach_photos: bool = True,
         role_id: int | None = None,
     ) -> discord.Message:
-        embed = _embed_for_twitter_post(post)
         image_urls = _twitter_image_urls(post) if attach_photos else []
-        batch_tasks = self._start_image_batch_tasks(image_urls) if image_urls else []
+        embed = _embed_for_twitter_post(
+            post,
+            image_url=image_urls[0] if len(image_urls) == 1 else None,
+        )
+        batch_tasks = self._start_image_batch_tasks(image_urls) if len(image_urls) > 1 else []
         if role_id:
             await channel.send(
                 content=f"<@&{role_id}>",
@@ -2437,7 +2646,11 @@ class NewsCog(commands.Cog):
         attach_photos: bool = True,
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
-        embed = _embed_for_twitter_post(post)
+        image_urls = _twitter_image_urls(post) if attach_photos else []
+        embed = _embed_for_twitter_post(
+            post,
+            image_url=image_urls[0] if len(image_urls) == 1 else None,
+        )
         sent_messages.append(
             await interaction.followup.send(
                 embed=embed,
@@ -2446,8 +2659,7 @@ class NewsCog(commands.Cog):
                 wait=True,
             )
         )
-        image_urls = _twitter_image_urls(post) if attach_photos else []
-        if image_urls:
+        if len(image_urls) > 1:
             batch_tasks = self._start_image_batch_tasks(image_urls)
             task = asyncio.create_task(
                 self._send_twitter_interaction_image_followups(
@@ -2541,7 +2753,7 @@ class NewsCog(commands.Cog):
         fallback_url: str,
     ) -> None:
         for urls in video_url_groups:
-            best_url = urls[0] if urls else fallback_url
+            best_url = _select_twitter_video_url(urls) or fallback_url
             file = await self._download_twitter_video(best_url)
             if file:
                 try:
@@ -2553,7 +2765,11 @@ class NewsCog(commands.Cog):
                 except discord.HTTPException as exc:
                     if not _is_payload_too_large(exc):
                         raise
-                    LOGGER.warning("Discord 업로드 제한으로 X 최고화질 영상을 링크로 보냅니다.")
+                    LOGGER.warning("Discord 업로드 제한으로 X 1080p 영상을 링크로 보냅니다.")
+            else:
+                LOGGER.warning("X 1080p 영상을 첨부할 수 없어 링크로 보냅니다: %s", best_url)
+            if not best_url:
+                continue
             await channel.send(
                 content=best_url,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -2572,7 +2788,7 @@ class NewsCog(commands.Cog):
         fallback_url: str,
     ) -> None:
         for urls in video_url_groups:
-            best_url = urls[0] if urls else fallback_url
+            best_url = _select_twitter_video_url(urls) or fallback_url
             file = await self._download_twitter_video(best_url)
             if file:
                 try:
@@ -2586,7 +2802,11 @@ class NewsCog(commands.Cog):
                 except discord.HTTPException as exc:
                     if not _is_payload_too_large(exc):
                         raise
-                    LOGGER.warning("Discord 업로드 제한으로 X 최고화질 영상을 링크로 보냅니다.")
+                    LOGGER.warning("Discord 업로드 제한으로 X 1080p 영상을 링크로 보냅니다.")
+            else:
+                LOGGER.warning("X 1080p 영상을 첨부할 수 없어 링크로 보냅니다: %s", best_url)
+            if not best_url:
+                continue
             await interaction.followup.send(
                 content=best_url,
                 ephemeral=private,
@@ -2890,6 +3110,213 @@ class NewsCog(commands.Cog):
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @app_commands.command(name="치지직알림설정", description="ProjectMoon Official 치지직 라이브 시작 알림을 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(enabled="허용", channel="채널")
+    @app_commands.describe(
+        enabled="ProjectMoon Official 치지직 라이브 시작 알림을 켜거나 끕니다.",
+        channel="알림을 보낼 채널입니다. 비워두면 현재 채널 또는 기존 치지직 알림 채널을 사용합니다.",
+    )
+    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    async def configure_chzzk_notifications(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        current = self.storage.get_chzzk_target(interaction.guild_id)
+        if channel is None and current is not None:
+            channel = interaction.guild.get_channel(current.channel_id) if interaction.guild else None
+        if channel is None:
+            channel = (
+                interaction.channel
+                if isinstance(interaction.channel, discord.TextChannel)
+                else None
+            )
+        if channel is None:
+            await interaction.followup.send(
+                "치지직 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        live = None
+        last_live_id = None
+        if enabled_value:
+            try:
+                live = await self.chzzk_client.fetch_live()
+            except aiohttp.ClientError as exc:
+                LOGGER.warning("치지직 현재 라이브 확인 실패: %s", exc)
+            if live is not None:
+                last_live_id = live.live_id
+
+        target = self.storage.upsert_chzzk_target(
+            interaction.guild_id,
+            channel_id=channel.id,
+            enabled=enabled_value,
+            last_live_id=last_live_id,
+        )
+        channel_text = f"<#{target.channel_id}>"
+        live_text = (
+            f"\n현재 라이브 기준선: {live.title}" if live is not None else ""
+        )
+        await interaction.followup.send(
+            (
+                f"치지직 라이브 알림: {_bool_label(target.enabled)}\n"
+                f"채널: {channel_text}{live_text}"
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="치지직방송현황", description="ProjectMoon Official 치지직 라이브 현황과 링크를 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def chzzk_live_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            live = await self.chzzk_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("치지직 방송 현황 확인 실패: %s", exc)
+            await interaction.followup.send(
+                "치지직 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if live is None:
+            await interaction.followup.send(
+                f"현재 ProjectMoon Official 치지직 라이브는 켜져 있지 않아요.\n{PROJECT_MOON_CHZZK_LIVE_URL}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        youtube_url = await self._youtube_latest_live_url()
+        await interaction.followup.send(
+            content=PROJECT_MOON_CHZZK_LIVE_URL,
+            embed=_embed_for_chzzk_live(live),
+            view=_chzzk_live_view(youtube_url),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="치지직방송보내기", description="현재 ProjectMoon Official 치지직 라이브를 지정 채널에 보냅니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.rename(channel="채널", role="역할")
+    @app_commands.describe(
+        channel="보낼 채널입니다. 비워두면 /서버설정 채널 또는 치지직 알림 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
+    )
+    async def send_chzzk_live(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            live = await self.chzzk_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("치지직 수동 전송용 방송 확인 실패: %s", exc)
+            await interaction.followup.send(
+                "치지직 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if live is None:
+            await interaction.followup.send(
+                "현재 ProjectMoon Official 치지직 라이브가 켜져 있지 않아요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        target_channel = channel
+        if target_channel is None and settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None and chzzk_target is not None:
+            resolved = await self._resolve_chzzk_target_channel(chzzk_target)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None:
+            target_channel = (
+                interaction.channel
+                if isinstance(interaction.channel, discord.TextChannel)
+                else None
+            )
+        if target_channel is None:
+            await interaction.followup.send(
+                "치지직 방송을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        role_id = role.id if role else settings.role_id
+        try:
+            message = await self._send_chzzk_live_to_channel(
+                target_channel,
+                live,
+                role_id=role_id,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "지정한 채널에 치지직 방송을 보낼 권한이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        except discord.HTTPException:
+            LOGGER.exception("치지직 라이브 수동 전송 실패.")
+            await interaction.followup.send(
+                "치지직 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        if chzzk_target is not None:
+            self.storage.mark_chzzk_target_seen(interaction.guild_id, live.live_id)
+
+        await interaction.followup.send(
+            f"{target_channel.mention}에 치지직 방송을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _youtube_latest_live_url(self) -> str:
+        try:
+            return await self.chzzk_client.fetch_youtube_latest_live_url()
+        except Exception as exc:
+            LOGGER.warning("유튜브 최신 라이브 링크 확인 실패: %s", exc)
+            return PROJECT_MOON_YOUTUBE_STREAMS_URL
 
     @app_commands.command(name="유저설정", description="앱에서 사용할 봇 개인 설정을 변경합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -3413,6 +3840,27 @@ class NewsCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name="/치지직알림설정",
+            value=(
+                "ProjectMoon Official 치지직 라이브 시작 알림을 설정합니다.\n"
+                "채널을 비우면 현재 채널 또는 기존 치지직 알림 채널을 사용합니다. (서버 관리 권한 필요)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="/치지직방송현황",
+            value="ProjectMoon Official 치지직 라이브 현황과 바로가기 링크를 봅니다.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/치지직방송보내기",
+            value=(
+                "현재 ProjectMoon Official 치지직 라이브를 지정 채널에 보냅니다.\n"
+                "채널과 역할을 비우면 /서버설정 또는 치지직 알림 설정 값을 사용합니다. (서버 관리 권한 필요)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="/유저설정",
             value="앱으로 사용할 때의 개인 언어와 /최근소식보기·/이전소식보기 배너를 설정합니다.",
             inline=False,
@@ -3479,7 +3927,8 @@ class NewsCog(commands.Cog):
             title="크레딧",
             description=(
                 "림피(Limpi) 봇 By. 2P\n"
-                "알림 배너 그림 By. @gamstergd7"
+                "알림 배너 그림 By. @gamstergd7\n"
+                "치지직 알림 구현 참고: [junah201/chzzk-discord-bot](https://github.com/junah201/chzzk-discord-bot)"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
         )
@@ -3676,7 +4125,11 @@ def _thumbnail_url_for_post(post: NewsPost) -> str | None:
     if isinstance(raw_thumbnail, str) and raw_thumbnail:
         return raw_thumbnail
 
-    for url in _filter_image_urls(post.image_urls):
+    image_urls = _filter_image_urls(post.image_urls)
+    if _is_twitter_news_post(post) and len(image_urls) == 1:
+        return image_urls[0]
+
+    for url in image_urls:
         if _is_steam_card_thumbnail_url(url):
             return url
     return None
@@ -3782,7 +4235,14 @@ def _twitter_video_urls(post: TwitterPost) -> list[str]:
 
 
 def _twitter_video_url_groups(post: TwitterPost) -> list[list[str]]:
-    value = post.raw.get("video_variant_groups")
+    groups = _twitter_video_url_groups_from_raw(post.raw)
+    if groups:
+        return groups
+    return [[url] for url in _twitter_video_urls(post)]
+
+
+def _twitter_video_url_groups_from_raw(raw: dict[str, object]) -> list[list[str]]:
+    value = raw.get("video_variant_groups")
     if isinstance(value, list):
         groups = [
             [str(url) for url in group if url]
@@ -3792,12 +4252,44 @@ def _twitter_video_url_groups(post: TwitterPost) -> list[list[str]]:
         groups = [group for group in groups if group]
         if groups:
             return groups
-    return [[url] for url in _twitter_video_urls(post)]
+    value = raw.get("video_urls")
+    urls = [str(u) for u in value] if isinstance(value, list) else []
+    return [[url] for url in urls]
 
 
 def _twitter_video_fallback_url(post: TwitterPost) -> str | None:
-    value = post.raw.get("video_fallback_url")
+    return _twitter_video_fallback_url_from_raw(post.raw)
+
+
+def _twitter_video_fallback_url_from_raw(raw: dict[str, object]) -> str | None:
+    value = raw.get("video_fallback_url")
     return str(value) if value else None
+
+
+def _select_twitter_video_url(urls: list[str]) -> str | None:
+    if not urls:
+        return None
+    parsed = [(_twitter_video_resolution(url), url) for url in urls]
+    for resolution, url in parsed:
+        if resolution == (1920, 1080):
+            return url
+    with_resolution = [(resolution, url) for resolution, url in parsed if resolution is not None]
+    if with_resolution:
+        below_1080 = [
+            (resolution, url)
+            for resolution, url in with_resolution
+            if resolution[1] <= 1080
+        ]
+        candidates = below_1080 or with_resolution
+        return max(candidates, key=lambda item: item[0][0] * item[0][1])[1]
+    return urls[0]
+
+
+def _twitter_video_resolution(url: str) -> tuple[int, int] | None:
+    match = re.search(r"/(\d{3,4})x(\d{3,4})/", url)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _is_payload_too_large(exc: discord.HTTPException) -> bool:
@@ -3848,7 +4340,11 @@ def _is_steam_news_url(url: str) -> bool:
     return parsed.path.lower().startswith("/news/app/")
 
 
-def _embed_for_twitter_post(post: TwitterPost) -> discord.Embed:
+def _embed_for_twitter_post(
+    post: TwitterPost,
+    *,
+    image_url: str | None = None,
+) -> discord.Embed:
     embed = discord.Embed(
         title=post.title[:256],
         description=_truncate_component_text(post.text or post.url, EMBED_DESCRIPTION_LIMIT),
@@ -3861,8 +4357,56 @@ def _embed_for_twitter_post(post: TwitterPost) -> discord.Embed:
     else:
         embed.set_footer(text="출처: X(트위터)")
     embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
+    if image_url:
+        embed.set_image(url=image_url)
     embed.add_field(name="원문", value=f"[X에서 보기]({post.url})", inline=False)
     return embed
+
+
+def _embed_for_chzzk_live(live: ChzzkLive) -> discord.Embed:
+    embed = discord.Embed(
+        title=live.title[:256],
+        description=(
+            f"{live.channel_name} 방송이 시작되었습니다.\n"
+            "유튜브에서도 볼수 있어요!"
+        ),
+        url=PROJECT_MOON_CHZZK_LIVE_URL,
+        color=discord.Color.from_rgb(0, 232, 149),
+    )
+    if live.category:
+        embed.add_field(name="카테고리", value=live.category[:1024], inline=True)
+    if live.image_url:
+        embed.set_image(url=live.image_url)
+    if live.open_date is not None:
+        embed.timestamp = live.open_date.replace(tzinfo=KST)
+        embed.set_footer(text=f"출처: CHZZK · 시작: {_format_kst(embed.timestamp)}")
+    else:
+        embed.set_footer(text="출처: CHZZK")
+    embed.set_author(
+        name=live.channel_name,
+        url=PROJECT_MOON_CHZZK_LIVE_URL,
+        icon_url=live.channel_image_url,
+    )
+    return embed
+
+
+def _chzzk_live_view(youtube_url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="CHZZK 바로가기",
+            style=discord.ButtonStyle.link,
+            url=PROJECT_MOON_CHZZK_LIVE_URL,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            label="YouTube 바로가기",
+            style=discord.ButtonStyle.link,
+            url=youtube_url,
+        )
+    )
+    return view
 
 
 def _build_layout_view_for_post(
@@ -4378,8 +4922,10 @@ async def main() -> None:
         LOGGER.info("테스트 모드: DISCORD_TOKEN_TEST 토큰으로 실행합니다.")
     config = AppConfig.from_env(test=test_mode)
     storage = SQLiteStorage(config.database_path)
-
-    async with aiohttp.ClientSession() as session:
+    session: aiohttp.ClientSession | None = None
+    bot: LimpiBot | None = None
+    try:
+        session = aiohttp.ClientSession()
         news_source = build_news_source(config, session)
         x_source = LimbusXClient(config, session)
         bot = LimpiBot(config)
@@ -4389,6 +4935,7 @@ async def main() -> None:
         @bot.event
         async def on_ready() -> None:
             LOGGER.info("%s (%s)로 로그인했습니다.", bot.user, bot.user.id if bot.user else "unknown")
+            await cog.update_presence_status(show_servers=True)
             if not bot._logged_startup_summary:
                 cog.log_startup_summary()
                 bot._logged_startup_summary = True
@@ -4397,6 +4944,7 @@ async def main() -> None:
 
         @bot.event
         async def on_guild_join(guild: discord.Guild) -> None:
+            await cog.update_presence_status(show_servers=True)
             LOGGER.info(
                 "서버 참가: name=%s, guild_id=%s, owner_id=%s, member_count=%s",
                 guild.name,
@@ -4438,6 +4986,7 @@ async def main() -> None:
 
         @bot.event
         async def on_guild_remove(guild: discord.Guild) -> None:
+            await cog.update_presence_status(show_servers=True)
             LOGGER.info(
                 "서버 퇴장: name=%s, guild_id=%s — DB 데이터 삭제.",
                 guild.name,
@@ -4448,8 +4997,18 @@ async def main() -> None:
         await bot.add_cog(cog)
         try:
             await bot.start(config.discord_token)
-        finally:
-            storage.close()
+        except asyncio.CancelledError:
+            LOGGER.info("종료 요청을 받아 봇을 정리합니다.")
+    finally:
+        if bot is not None and not bot.is_closed():
+            try:
+                await bot.change_presence(status=discord.Status.invisible, activity=None)
+            except Exception:
+                LOGGER.debug("종료 전 오프라인 상태 전환을 건너뜁니다.", exc_info=True)
+            await bot.close()
+        if session is not None and not session.closed:
+            await session.close()
+        storage.close()
 
 
 if __name__ == "__main__":
