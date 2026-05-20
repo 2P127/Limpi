@@ -76,6 +76,7 @@ class GuildChzzkTarget:
     channel_id: int
     enabled: bool
     last_live_id: str | None
+    is_live: bool
     created_at: datetime | None
     updated_at: datetime | None
 

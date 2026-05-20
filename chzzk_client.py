@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -42,21 +43,10 @@ class ChzzkClient:
         self.channel_id = channel_id
 
     async def fetch_live(self) -> ChzzkLive | None:
-        if "/" in self.channel_id:
-            return None
-
-        url = f"https://api.chzzk.naver.com/service/v2/channels/{self.channel_id}/live-detail"
-        async with self.session.get(
-            url,
-            headers={"User-Agent": CHZZK_USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=5),
-        ) as response:
-            if response.status != 200:
-                return None
-            payload = await response.json(content_type=None)
-
-        content = payload.get("content")
+        content = await self.fetch_live_detail()
         if not isinstance(content, dict):
+            return None
+        if not _is_live_content_active(content):
             return None
 
         live_id = content.get("liveId")
@@ -76,6 +66,23 @@ class ChzzkClient:
             ),
             raw=content,
         )
+
+    async def fetch_live_detail(self) -> dict[str, Any] | None:
+        if "/" in self.channel_id:
+            return None
+
+        url = f"https://api.chzzk.naver.com/service/v2/channels/{self.channel_id}/live-detail"
+        async with self.session.get(
+            url,
+            headers={"User-Agent": CHZZK_USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as response:
+            if response.status != 200:
+                return None
+            payload = await response.json(content_type=None)
+
+        content = payload.get("content")
+        return content if isinstance(content, dict) else None
 
     async def fetch_youtube_latest_live_url(self) -> str:
         async with self.session.get(
@@ -109,6 +116,25 @@ def _parse_open_date(value: object) -> datetime | None:
         return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
+
+
+def _is_live_content_active(content: dict[str, Any]) -> bool:
+    status = str(content.get("status") or "").upper()
+    if status and status != "OPEN":
+        return False
+
+    playback_json = content.get("livePlaybackJson")
+    if playback_json:
+        try:
+            playback = json.loads(str(playback_json))
+        except json.JSONDecodeError:
+            playback = {}
+        live = playback.get("live") if isinstance(playback, dict) else None
+        playback_status = str(live.get("status") or "").upper() if isinstance(live, dict) else ""
+        if playback_status and playback_status != "OPEN":
+            return False
+
+    return True
 
 
 def _youtube_video_id(path: str) -> str | None:

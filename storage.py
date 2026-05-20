@@ -154,6 +154,7 @@ class SQLiteStorage:
                 channel_id INTEGER NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_live_id TEXT,
+                is_live INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -980,7 +981,7 @@ class SQLiteStorage:
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                SELECT guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
                 FROM guild_chzzk_targets
                 WHERE guild_id = ?
                 """,
@@ -992,7 +993,7 @@ class SQLiteStorage:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                SELECT guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
                 FROM guild_chzzk_targets
                 WHERE enabled = 1
                 ORDER BY guild_id
@@ -1007,6 +1008,7 @@ class SQLiteStorage:
         channel_id: int,
         enabled: bool = True,
         last_live_id: str | None = None,
+        is_live: bool | None = None,
     ) -> GuildChzzkTarget:
         current = self.get_chzzk_target(guild_id)
         now = _now_iso()
@@ -1015,13 +1017,16 @@ class SQLiteStorage:
                 current.last_live_id if current is not None else None
             )
         )
+        next_is_live = is_live if is_live is not None else (
+            current.is_live if current is not None else False
+        )
         with self._lock:
             self._connection.execute(
                 """
                 INSERT INTO guild_chzzk_targets (
-                    guild_id, channel_id, enabled, last_live_id, created_at, updated_at
+                    guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     enabled = excluded.enabled,
@@ -1029,9 +1034,18 @@ class SQLiteStorage:
                         excluded.last_live_id,
                         guild_chzzk_targets.last_live_id
                     ),
+                    is_live = excluded.is_live,
                     updated_at = excluded.updated_at
                 """,
-                (guild_id, channel_id, int(enabled), next_last_live_id, now, now),
+                (
+                    guild_id,
+                    channel_id,
+                    int(enabled),
+                    next_last_live_id,
+                    int(next_is_live),
+                    now,
+                    now,
+                ),
             )
             self._connection.commit()
         target = self.get_chzzk_target(guild_id)
@@ -1045,10 +1059,23 @@ class SQLiteStorage:
             self._connection.execute(
                 """
                 UPDATE guild_chzzk_targets
-                SET last_live_id = ?, updated_at = ?
+                SET last_live_id = ?, is_live = 1, updated_at = ?
                 WHERE guild_id = ?
                 """,
                 (live_id, now, guild_id),
+            )
+            self._connection.commit()
+
+    def mark_chzzk_target_offline(self, guild_id: int) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_chzzk_targets
+                SET is_live = 0, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (now, guild_id),
             )
             self._connection.commit()
 
@@ -1976,6 +2003,7 @@ class SQLiteStorage:
             channel_id=int(row["channel_id"]),
             enabled=bool(row["enabled"]),
             last_live_id=row["last_live_id"],
+            is_live=bool(row["is_live"]),
             created_at=_datetime_from_iso(row["created_at"]),
             updated_at=_datetime_from_iso(row["updated_at"]),
         )

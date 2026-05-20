@@ -48,6 +48,8 @@ TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 30
 CHZZK_POLL_INTERVAL_SECONDS = 60
+CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
+CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
@@ -2463,7 +2465,42 @@ class NewsCog(commands.Cog):
 
         live = await self.chzzk_client.fetch_live()
         if live is None:
-            return 0
+            live_detail = await self.chzzk_client.fetch_live_detail()
+            ended = 0
+            for target in targets:
+                if not target.enabled or not target.is_live:
+                    continue
+                if not _is_chzzk_live_recently_closed(live_detail, target.last_live_id):
+                    self.storage.mark_chzzk_target_offline(target.guild_id)
+                    LOGGER.info(
+                        "치지직 라이브 종료 공지 건너뜀: 종료 후 10분 이상 경과 또는 종료 시간 확인 불가 (guild %s, live_id=%s).",
+                        target.guild_id,
+                        target.last_live_id,
+                    )
+                    continue
+                channel = await self._resolve_chzzk_target_channel(target)
+                if channel is None:
+                    continue
+                try:
+                    message = await self._send_chzzk_live_end_to_channel(channel)
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "치지직 라이브 종료 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
+                        target.guild_id,
+                        target.channel_id,
+                        target.last_live_id,
+                    )
+                    continue
+                self.storage.mark_chzzk_target_offline(target.guild_id)
+                await self._track_manual_message(target.guild_id, target.channel_id, message)
+                LOGGER.info(
+                    "치지직 라이브 종료 공지 (guild %s, channel %s, live_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    target.last_live_id,
+                )
+                ended += 1
+            return ended
 
         announced = 0
         for target in targets:
@@ -2473,6 +2510,17 @@ class NewsCog(commands.Cog):
                 self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
                 continue
             if str(target.last_live_id) == live.live_id:
+                if not target.is_live:
+                    self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+                continue
+            if _is_chzzk_live_too_old(live):
+                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+                LOGGER.info(
+                    "치지직 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, live_id=%s, title=%r).",
+                    target.guild_id,
+                    live.live_id,
+                    live.title,
+                )
                 continue
 
             channel = await self._resolve_chzzk_target_channel(target)
@@ -2550,6 +2598,17 @@ class NewsCog(commands.Cog):
         return await channel.send(
             embed=embed,
             view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _send_chzzk_live_end_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+    ) -> discord.Message:
+        youtube_url = await self._youtube_latest_live_url()
+        return await channel.send(
+            embed=_embed_for_chzzk_live_end(),
+            view=_chzzk_live_view(youtube_url),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -3167,6 +3226,7 @@ class NewsCog(commands.Cog):
             channel_id=channel.id,
             enabled=enabled_value,
             last_live_id=last_live_id,
+            is_live=live is not None if enabled_value else False,
         )
         channel_text = f"<#{target.channel_id}>"
         live_text = (
@@ -3198,8 +3258,14 @@ class NewsCog(commands.Cog):
             return
 
         if live is None:
+            if interaction.guild_id is not None:
+                target = self.storage.get_chzzk_target(interaction.guild_id)
+                if target is not None and target.is_live:
+                    self.storage.mark_chzzk_target_offline(interaction.guild_id)
+            youtube_url = await self._youtube_latest_live_url()
             await interaction.followup.send(
-                f"현재 ProjectMoon Official 치지직 라이브는 켜져 있지 않아요.\n{PROJECT_MOON_CHZZK_LIVE_URL}",
+                embed=_embed_for_chzzk_offline(),
+                view=_chzzk_live_view(youtube_url),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -3249,14 +3315,24 @@ class NewsCog(commands.Cog):
 
         if live is None:
             await interaction.followup.send(
-                "현재 ProjectMoon Official 치지직 라이브가 켜져 있지 않아요.",
+                "현재 ProjectMoon Official 치지직 채널은 방송이 없고 오프라인 상태예요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        if _is_chzzk_live_too_old(live):
+            if chzzk_target is not None:
+                self.storage.mark_chzzk_target_seen(interaction.guild_id, live.live_id)
+            await interaction.followup.send(
+                "방송 시작 후 10분 이상 지나서 공지하지 않았어요.",
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
         settings = self.storage.get_settings(interaction.guild_id)
-        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         target_channel = channel
         if target_channel is None and settings.channel_id is not None:
             resolved = await self._resolve_target_channel(None, settings.channel_id)
@@ -3422,6 +3498,7 @@ class NewsCog(commands.Cog):
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
                 f"공개 소식 전송: {_bool_label(settings.public_news_lookup_allowed)}\n"
                 f"알림 배너: {_banner_display_name(settings.notification_banner)}\n"
+                "치지직 알림: 미설정\n"
                 "점검 알림: 꺼짐"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
@@ -3442,8 +3519,19 @@ class NewsCog(commands.Cog):
             await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
             return
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         settings = self.storage.get_settings(interaction.guild_id)
         targets = self.storage.list_news_targets(interaction.guild_id)
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        try:
+            live = await self.chzzk_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("서버 설정 상태용 치지직 방송 확인 실패: %s", exc)
+        else:
+            if live is None and chzzk_target is not None and chzzk_target.is_live:
+                self.storage.mark_chzzk_target_offline(interaction.guild_id)
+                chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         target_languages = sorted({target.language for target in targets})
         if not target_languages:
             target_languages = [settings.language]
@@ -3486,8 +3574,13 @@ class NewsCog(commands.Cog):
             ),
             inline=False,
         )
+        embed.add_field(
+            name="치지직 알림",
+            value=_format_chzzk_target(chzzk_target, settings.role_id),
+            inline=False,
+        )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -3867,12 +3960,12 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/서버설정상태",
-            value="현재 봇 서버 설정과 뉴스 소스를 보여줍니다. (서버 전용)",
+            value="현재 봇 서버 설정, 뉴스 소스, 치지직 알림 설정을 보여줍니다. (서버 전용)",
             inline=False,
         )
         embed.add_field(
             name="/서버설정초기화",
-            value="서버 공통 설정, 언어별 소식 채널, 읽음 기준선을 초기 상태로 되돌립니다. (서버 관리 권한 필요)",
+            value="서버 공통 설정, 언어별 소식 채널, 치지직 알림 설정, 읽음 기준선을 초기 상태로 되돌립니다. (서버 관리 권한 필요)",
             inline=False,
         )
         embed.add_field(
@@ -3951,6 +4044,7 @@ class NewsCog(commands.Cog):
 
         settings, created = self.storage.ensure_guild_settings(interaction.guild_id)
         targets = self.storage.list_news_targets(interaction.guild_id)
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
 
         try:
             synced_commands = await self.bot.tree.sync()
@@ -3997,6 +4091,11 @@ class NewsCog(commands.Cog):
                 f"새 게시물 자동 알림: {'켜짐' if settings.enabled else '꺼짐'}\n"
                 f"알림 배너: {_banner_display_name(settings.notification_banner)}"
             ),
+            inline=False,
+        )
+        embed.add_field(
+            name="치지직 알림",
+            value=_format_chzzk_target(chzzk_target, settings.role_id),
             inline=False,
         )
         embed.add_field(
@@ -4390,6 +4489,30 @@ def _embed_for_chzzk_live(live: ChzzkLive) -> discord.Embed:
     return embed
 
 
+def _embed_for_chzzk_live_end() -> discord.Embed:
+    embed = discord.Embed(
+        title="ProjectMoon Official 방송이 종료되었습니다.",
+        description="치지직 라이브가 종료되었습니다.\n다음 방송이 시작되면 다시 알려드릴게요.",
+        url=PROJECT_MOON_CHZZK_LIVE_URL,
+        color=discord.Color.dark_gray(),
+    )
+    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_CHZZK_LIVE_URL)
+    embed.set_footer(text="출처: CHZZK")
+    return embed
+
+
+def _embed_for_chzzk_offline() -> discord.Embed:
+    embed = discord.Embed(
+        title="ProjectMoon Official은 현재 오프라인 상태입니다.",
+        description="현재 치지직 채널에 진행 중인 방송이 없어요.",
+        url=PROJECT_MOON_CHZZK_LIVE_URL,
+        color=discord.Color.dark_gray(),
+    )
+    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_CHZZK_LIVE_URL)
+    embed.set_footer(text="출처: CHZZK")
+    return embed
+
+
 def _chzzk_live_view(youtube_url: str) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
@@ -4573,6 +4696,25 @@ def _format_news_targets(targets: list[GuildNewsTarget]) -> str:
     return "\n".join(lines) if lines else "미설정"
 
 
+def _format_chzzk_target(target: GuildChzzkTarget | None, role_id: int | None) -> str:
+    role_text = f"<@&{role_id}>" if role_id else "없음"
+    if target is None:
+        return (
+            "상태: 미설정\n"
+            "채널: 미설정\n"
+            f"역할 핑: 시작 알림만 {role_text}\n"
+            "최근 라이브 기준선: 없음"
+        )
+
+    return (
+        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
+        f"채널: <#{target.channel_id}>\n"
+        f"역할 핑: 시작 알림만 {role_text}\n"
+        f"현재 방송 상태: {'방송중' if target.is_live else '방송 없음 / 오프라인'}\n"
+        f"최근 라이브 기준선: {target.last_live_id or '없음'}"
+    )
+
+
 
 
 def _choice_bool(choice: app_commands.Choice[str] | None, default: bool | None = None) -> bool | None:
@@ -4747,6 +4889,43 @@ def _format_kst(value: datetime) -> str:
     return value.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
 
 
+def _is_chzzk_live_too_old(live: ChzzkLive) -> bool:
+    if live.open_date is None:
+        return False
+    opened_at = live.open_date
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=KST)
+    return datetime.now(KST) - opened_at.astimezone(KST) >= CHZZK_LIVE_ANNOUNCE_MAX_AGE
+
+
+def _is_chzzk_live_recently_closed(
+    live_detail: dict[str, object] | None,
+    last_live_id: str | None,
+) -> bool:
+    if not isinstance(live_detail, dict):
+        return False
+    live_id = live_detail.get("liveId")
+    if live_id is None or str(live_id) != str(last_live_id):
+        return False
+    status = str(live_detail.get("status") or "").upper()
+    if status and status not in {"CLOSE", "ENDED"}:
+        return False
+    close_date = _parse_chzzk_datetime(live_detail.get("closeDate"))
+    if close_date is None:
+        return False
+    return datetime.now(KST) - close_date.astimezone(KST) < CHZZK_LIVE_END_ANNOUNCE_MAX_AGE
+
+
+def _parse_chzzk_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=KST)
+
+
 def _choice_name(
     post: NewsPost,
     *,
@@ -4915,8 +5094,17 @@ async def main() -> None:
                     return False
             return "10062" not in record.getMessage()
 
+    class _DropDiscordReconnectDnsError(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.name != "discord.client" or "Attempting a reconnect" not in record.getMessage():
+                return True
+            if not record.exc_info:
+                return True
+            return not isinstance(record.exc_info[1], aiohttp.ClientConnectorDNSError)
+
     logging.getLogger("discord.app_commands.tree").addFilter(_DropExpiredInteraction())
     logging.getLogger("discord.client").addFilter(_DropExpiredInteraction())
+    logging.getLogger("discord.client").addFilter(_DropDiscordReconnectDnsError())
     test_mode = "--test" in sys.argv
     if test_mode:
         LOGGER.info("테스트 모드: DISCORD_TOKEN_TEST 토큰으로 실행합니다.")
