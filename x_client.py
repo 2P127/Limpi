@@ -1,24 +1,98 @@
 from __future__ import annotations
 
-import asyncio
-import html
 import json
+import logging
 import re
 from dataclasses import replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
-from xml.etree import ElementTree
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from config import AppConfig
 from models import TwitterPost
+
+LOGGER = logging.getLogger(__name__)
 
 _VIDEO_THUMBNAIL_URL_FRAGMENTS = (
     "/ext_tw_video_thumb/",
     "/amplify_video_thumb/",
     "/tweet_video_thumb/",
 )
+
+_X_BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D"
+    "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+_GQL_USER_BY_SCREEN_NAME_QID = "NimuplG1OB7Fd2btCLdBOw"
+_GQL_USER_TWEETS_AND_REPLIES_QID = "D5eKzDa5ZoJuC1TCeAXbWA"
+_GQL_USER_BY_SCREEN_NAME_FEATURES = {
+    "hidden_profile_likes_enabled": True,
+    "hidden_profile_subscriptions_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "subscriptions_verification_info_is_identity_verified_enabled": True,
+    "subscriptions_verification_info_verified_since_enabled": True,
+    "highlights_tweets_tab_ui_enabled": True,
+    "responsive_web_twitter_article_notes_tab_enabled": True,
+    "subscriptions_feature_can_gift_premium": True,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
+_GQL_USER_TWEETS_FEATURES = {
+    "rweb_video_screen_enabled": True,
+    "rweb_cashtags_enabled": True,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": True,
+    "rweb_cashtags_composer_attachment_enabled": True,
+    "responsive_web_jetfuel_frame": True,
+    "responsive_web_grok_share_attachment_enabled": True,
+    "responsive_web_grok_annotations_enabled": True,
+    "articles_preview_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "rweb_conversational_replies_downvote_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "content_disclosure_indicator_enabled": True,
+    "content_disclosure_ai_generated_indicator_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+    "responsive_web_grok_analysis_button_from_backend": True,
+    "post_ctas_fetch_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_grok_image_annotation_enabled": True,
+    "responsive_web_grok_imagine_annotation_enabled": True,
+    "responsive_web_grok_community_note_auto_translation_is_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+}
+_GQL_USER_TWEETS_FIELD_TOGGLES = {
+    "withPayments": True,
+    "withAuxiliaryUserLabels": True,
+    "withArticleRichContentState": True,
+    "withArticlePlainText": True,
+    "withArticleSummaryText": True,
+    "withArticleVoiceOver": True,
+    "withGrokAnalyze": True,
+    "withDisallowedReplyControls": True,
+}
 
 
 class XClientError(RuntimeError):
@@ -29,83 +103,121 @@ class LimbusXClient:
     def __init__(self, config: AppConfig, session: Any) -> None:
         self.config = config
         self.session = session
-        self._playwright = None
-        self._browser = None
+        self._x_user_id: str | None = None
 
-    async def _get_browser(self):
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            raise XClientError(
-                "playwright가 설치되어 있지 않아요. "
-                "`pip install playwright && playwright install chromium` 를 실행해주세요."
-            ) from exc
+    def _has_twitter_auth(self) -> bool:
+        cfg = self.config
+        return bool(cfg.x_auth_token and cfg.x_ct0)
 
-        if self._playwright is None:
-            self._playwright = await async_playwright().start()
-        if self._browser is None or not self._browser.is_connected():
-            self._browser = await self._playwright.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-            )
-        return self._browser
+    def _twitter_api_headers(self) -> dict[str, str]:
+        cfg = self.config
+        return {
+            "authorization": f"Bearer {_X_BEARER}",
+            "x-csrf-token": cfg.x_ct0 or "",
+            "cookie": f"auth_token={cfg.x_auth_token}; ct0={cfg.x_ct0}",
+            "content-type": "application/json",
+            "user-agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+            ),
+            "x-twitter-active-user": "yes",
+            "x-twitter-auth-type": "OAuth2Session",
+            "x-twitter-client-language": "ko",
+        }
+
+    async def _fetch_user_id(self, username: str) -> str:
+        if self._x_user_id:
+            return self._x_user_id
+        params = {
+            "variables": json.dumps({
+                "screen_name": username,
+                "withSafetyModeUserFields": False,
+            }),
+            "features": json.dumps(_GQL_USER_BY_SCREEN_NAME_FEATURES),
+        }
+        async with self.session.get(
+            _graphql_url(
+                self.config.x_qid_user_by_screen_name or _GQL_USER_BY_SCREEN_NAME_QID,
+                "UserByScreenName",
+            ),
+            headers=self._twitter_api_headers(),
+            params=params,
+            timeout=30,
+        ) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise XClientError(f"UserByScreenName {resp.status}: {body[:200]}")
+            data = await resp.json(content_type=None)
+        user = data.get("data", {}).get("user", {}).get("result", {})
+        user_id = str(user.get("rest_id") or "").strip()
+        if not user_id:
+            raise XClientError(f"유저 ID를 찾을 수 없음: {username}")
+        self._x_user_id = user_id
+        LOGGER.debug("Twitter API: 유저 ID 조회 완료 %s → %s", username, user_id)
+        return user_id
 
     async def fetch_recent_posts(self, *, limit: int = 20) -> list[TwitterPost]:
-        rss_posts = await self._fetch_recent_posts_from_rss(limit=limit)
-        if rss_posts:
-            return await self._enrich_posts_with_graphql_media(rss_posts, limit=limit)
-        browser = await self._get_browser()
-        return await _playwright_fetch(browser, self.config.x_account_username, limit)
-
-    async def _fetch_recent_posts_from_rss(self, *, limit: int) -> list[TwitterPost]:
-        if self.session is None:
-            return []
-        url = f"https://nitter.net/{self.config.x_account_username}/rss"
-        try:
-            async with self.session.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 LimpiBot/1.0"},
-                timeout=30,
-            ) as response:
-                if response.status >= 400:
-                    return []
-                text = await response.text()
-        except Exception:
-            return []
-        return _parse_nitter_rss(text, self.config.x_account_username, limit)
-
-    async def _enrich_posts_with_graphql_media(
-        self, posts: list[TwitterPost], *, limit: int
-    ) -> list[TwitterPost]:
-        posts = await self._enrich_posts_with_fx_media(posts)
-        try:
-            browser = await self._get_browser()
-            media_posts = await _playwright_fetch(
-                browser,
-                self.config.x_account_username,
-                max(limit, 100),
+        if not self._has_twitter_auth():
+            raise XClientError(
+                "X_AUTH_TOKEN 또는 X_CT0가 설정되지 않아 Twitter 게시물을 가져올 수 없습니다."
             )
-        except Exception:
-            return posts
+        return await self._fetch_via_twitter_api(limit=limit)
 
-        media_by_id = {post.post_id: post for post in media_posts}
-        enriched: list[TwitterPost] = []
-        for post in posts:
-            media_post = media_by_id.get(post.post_id)
-            if media_post is None:
-                enriched.append(post)
-                continue
+    async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
+        username = self.config.x_account_username
+        user_id = await self._fetch_user_id(username)
+        posts: list[TwitterPost] = []
+        cursor: str | None = None
 
-            raw = dict(post.raw)
-            for key in ("video_urls", "video_variant_groups", "youtube_urls"):
-                value = media_post.raw.get(key)
-                if value and not raw.get(key):
-                    raw[key] = value
-            if media_post.raw.get("video_urls") and not raw.get("video_urls"):
-                raw["video_fallback_url"] = str(media_post.raw["video_urls"][0])
+        for page in range(20):
+            variables: dict[str, Any] = {
+                "userId": user_id,
+                "count": min(limit, 100),
+                "includePromotedContent": True,
+                "withCommunity": True,
+                "withQuickPromoteEligibilityTweetFields": True,
+                "withVoice": True,
+                "withV2Timeline": True,
+            }
+            if cursor:
+                variables["cursor"] = cursor
 
-            enriched.append(replace(post, raw=raw))
-        return enriched
+            payload = {
+                "variables": variables,
+                "features": _GQL_USER_TWEETS_FEATURES,
+                "fieldToggles": _GQL_USER_TWEETS_FIELD_TOGGLES,
+            }
+            async with self.session.post(
+                _graphql_url(
+                    self.config.x_qid_user_tweets_and_replies
+                    or _GQL_USER_TWEETS_AND_REPLIES_QID,
+                    "UserTweetsAndReplies",
+                ),
+                headers=self._twitter_api_headers(),
+                json=payload,
+                timeout=30,
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise XClientError(f"UserTweetsAndReplies {resp.status}: {body[:200]}")
+                data = await resp.json(content_type=None)
+
+            page_posts = _extract_twitter_posts(data, username)
+            _extend_unique_posts(posts, page_posts)
+            LOGGER.debug("Twitter API: 페이지 %d — %d개 수집 (누적 %d개)", page + 1, len(page_posts), len(posts))
+
+            if len(posts) >= limit:
+                break
+
+            cursor = _next_cursor_from_payload(data)
+            if not cursor:
+                break
+
+        posts.sort(key=_tweet_sort_key, reverse=True)
+        if not posts:
+            raise XClientError("Twitter API에서 게시물을 가져오지 못했습니다.")
+        LOGGER.info("Twitter API: %d개 게시물 수집 완료.", len(posts))
+        return posts[:limit]
 
     async def _enrich_posts_with_fx_media(
         self, posts: list[TwitterPost]
@@ -150,64 +262,35 @@ class LimbusXClient:
         return _fx_video_variant_groups(payload)
 
 
-async def _playwright_fetch(browser: Any, username: str, limit: int) -> list[TwitterPost]:
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
-        locale="en-US",
-    )
-    page = await context.new_page()
-    payloads: list[dict] = []
-
-    async def on_response(response: Any) -> None:
-        if _is_user_tweets_response(response.url):
-            try:
-                data = await response.json()
-                payloads.append(data)
-            except Exception:
-                pass
-
-    page.on("response", on_response)
-
-    try:
-        await page.goto(
-            f"https://x.com/{username}",
-            wait_until="domcontentloaded",
-            timeout=30_000,
-        )
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + 15
-        first_posts_at: float | None = None
-        while loop.time() < deadline:
-            if payloads and _extract_twitter_posts_from_payloads(payloads, username):
-                if first_posts_at is None:
-                    first_posts_at = loop.time()
-                if loop.time() - first_posts_at >= 3:
-                    break
-            await asyncio.sleep(0.5)
-
-        if not payloads:
-            raise XClientError(
-                "X 타임라인 데이터를 받지 못했어요. "
-                "X가 차단했거나 X_ACCOUNT_USERNAME 계정명을 확인해야 해요."
-            )
-
-        posts = _extract_twitter_posts_from_payloads(payloads, username)
-        posts.sort(
-            key=lambda p: p.created_at or datetime.min.replace(tzinfo=timezone.utc),
-            reverse=True,
-        )
-        return posts[:limit]
-    finally:
-        await page.close()
-        await context.close()
+def _graphql_url(query_id: str, operation_name: str) -> str:
+    return f"https://x.com/i/api/graphql/{query_id}/{operation_name}"
 
 
-def _is_user_tweets_response(url: str) -> bool:
-    return "/UserTweets" in url or "UserTweets?" in url
+def _next_cursor_from_payload(payload: dict[str, Any]) -> str | None:
+    for instruction in _timeline_instructions(payload):
+        entries = instruction.get("entries")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_id = str(entry.get("entryId") or "")
+            if not entry_id.startswith("cursor-bottom"):
+                continue
+            content = entry.get("content", {})
+            value = content.get("value") or content.get("itemContent", {}).get("value")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _extend_unique_posts(posts: list[TwitterPost], new_posts: list[TwitterPost]) -> None:
+    seen = {post.post_id for post in posts}
+    for post in new_posts:
+        if post.post_id in seen:
+            continue
+        seen.add(post.post_id)
+        posts.append(post)
 
 
 def _extract_twitter_posts_from_payloads(
@@ -228,8 +311,6 @@ def _extract_twitter_posts(payload: dict[str, Any], username: str) -> list[Twitt
     posts: list[TwitterPost] = []
     seen: set[str] = set()
     results = _timeline_tweet_results(payload)
-    if not results:
-        results = _fallback_tweet_results(payload)
     for result in results:
         tweet = _unwrap_tweet_result(result)
         if tweet is None:
@@ -243,11 +324,7 @@ def _extract_twitter_posts(payload: dict[str, Any], username: str) -> list[Twitt
 
 def _timeline_tweet_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    for instruction in _walk(payload):
-        if not isinstance(instruction, dict) or "entries" not in instruction:
-            continue
-        if str(instruction.get("type") or "") == "TimelinePinEntry":
-            continue
+    for instruction in _timeline_instructions(payload):
         entries = instruction.get("entries")
         if not isinstance(entries, list):
             continue
@@ -255,40 +332,93 @@ def _timeline_tweet_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(entry, dict):
                 continue
             entry_id = str(entry.get("entryId") or entry.get("entry_id") or "")
-            if not entry_id.startswith("tweet-"):
+            if entry_id.startswith("cursor-"):
                 continue
-            result = _entry_tweet_result(entry)
-            if isinstance(result, dict):
-                results.append(result)
+            if _entry_is_pinned(entry):
+                continue
+            results.extend(_entry_tweet_results(entry))
     return results
 
 
+def _timeline_instructions(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    timelines = []
+    user = payload.get("data", {}).get("user", {}).get("result")
+    if isinstance(user, dict):
+        timeline = user.get("timeline_v2", {}).get("timeline")
+        if isinstance(timeline, dict):
+            timelines.append(timeline)
+        timeline = user.get("timeline", {}).get("timeline")
+        if isinstance(timeline, dict):
+            timelines.append(timeline)
+
+    instructions: list[dict[str, Any]] = []
+    for timeline in timelines:
+        value = timeline.get("instructions")
+        if isinstance(value, list):
+            instructions.extend(
+                instruction
+                for instruction in value
+                if isinstance(instruction, dict)
+                and str(instruction.get("type") or "") != "TimelinePinEntry"
+            )
+    return instructions
+
+
 def _entry_tweet_result(entry: dict[str, Any]) -> dict[str, Any] | None:
+    results = _entry_tweet_results(entry)
+    return results[0] if results else None
+
+
+def _entry_tweet_results(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
     content = entry.get("content")
     if not isinstance(content, dict):
-        return None
+        return results
+
+    item_contents: list[dict[str, Any]] = []
     item_content = content.get("itemContent")
-    if not isinstance(item_content, dict):
-        return None
-    tweet_results = item_content.get("tweet_results")
-    if not isinstance(tweet_results, dict):
-        return None
-    result = tweet_results.get("result")
-    return result if isinstance(result, dict) else None
+    if isinstance(item_content, dict):
+        item_contents.append(item_content)
 
+    items = content.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_content = item.get("item", {}).get("itemContent")
+            if isinstance(item_content, dict):
+                item_contents.append(item_content)
 
-def _fallback_tweet_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    for item in _walk(payload):
-        if not isinstance(item, dict):
-            continue
-        tweet_results = item.get("tweet_results")
+    for item_content in item_contents:
+        tweet_results = item_content.get("tweet_results")
         if not isinstance(tweet_results, dict):
             continue
         result = tweet_results.get("result")
         if isinstance(result, dict):
             results.append(result)
     return results
+
+
+def _entry_is_pinned(entry: dict[str, Any]) -> bool:
+    for value in _walk(entry):
+        if not isinstance(value, dict):
+            continue
+        text = value.get("text")
+        if isinstance(text, str) and text.strip().lower() in {"pinned", "pinned tweet", "고정된 게시물"}:
+            return True
+        if value.get("type") == "TimelinePinEntry":
+            return True
+    return False
+
+
+def _tweet_sort_key(post: TwitterPost) -> tuple[int, datetime]:
+    tweet_id = str(post.raw.get("tweet_id") or post.post_id.removeprefix("x:"))
+    try:
+        numeric_id = int(tweet_id)
+    except ValueError:
+        numeric_id = 0
+    created_at = post.created_at or datetime.min.replace(tzinfo=timezone.utc)
+    return numeric_id, created_at
 
 
 def _walk(value: Any) -> list[Any]:
@@ -317,6 +447,8 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     if not isinstance(legacy, dict):
         return None
     author_username = _tweet_author_username(tweet) or username
+    if author_username.lower() != username.lower():
+        return None
     tweet_id = str(tweet.get("rest_id") or legacy.get("id_str") or "").strip()
     if not tweet_id:
         return None
@@ -324,7 +456,7 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     link_urls = _external_link_urls(legacy, username, tweet_id)
     text = _strip_tco_links(text, legacy)
     text = _clean_tweet_text(text)
-    if text in {"메인에 올림", "Pinned", "Pinned Tweet"}:
+    if text in {"고정된 게시물", "Pinned", "Pinned Tweet"}:
         return None
     title = _title_from_text(text) or f"X 게시물 {tweet_id}"
     created_at = _parse_twitter_datetime(legacy.get("created_at"))
@@ -340,6 +472,8 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
         "tweet_id": tweet_id,
         "username": username,
         "created_at": legacy.get("created_at"),
+        "in_reply_to_status_id_str": legacy.get("in_reply_to_status_id_str"),
+        "in_reply_to_screen_name": legacy.get("in_reply_to_screen_name"),
     }
     if video_urls:
         raw["video_urls"] = video_urls
@@ -378,7 +512,7 @@ def _strip_tco_links(text: str, legacy: dict[str, Any]) -> str:
 
 def _clean_tweet_text(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    lines = [re.sub(r"[ \t\u3000]+", " ", line).strip() for line in text.split("\n")]
+    lines = [re.sub(r"[ \t　]+", " ", line).strip() for line in text.split("\n")]
     cleaned = "\n".join(lines).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
@@ -539,6 +673,7 @@ def _dedupe_video_variant_groups(groups: list[list[str]]) -> list[list[str]]:
 
 
 def _iter_media_entities(tweet: dict[str, Any]) -> list[dict[str, Any]]:
+    import json as _json
     media: list[dict[str, Any]] = []
     legacy = tweet.get("legacy")
     if isinstance(legacy, dict):
@@ -646,108 +781,3 @@ def _is_tweet_self_url(url: str, username: str, tweet_id: str) -> bool:
         and parts[1] == "status"
         and parts[2] == tweet_id
     )
-
-
-def _parse_nitter_rss(xml_text: str, username: str, limit: int) -> list[TwitterPost]:
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except ElementTree.ParseError:
-        return []
-
-    posts: list[TwitterPost] = []
-    for item in root.findall("./channel/item"):
-        creator = item.findtext("{http://purl.org/dc/elements/1.1/}creator") or ""
-        tweet_id = (item.findtext("guid") or "").strip()
-        if not tweet_id.isdigit():
-            continue
-
-        title = html.unescape(item.findtext("title") or "").strip()
-        title = _strip_rss_reply_prefix(title, username)
-        if title in {"메인에 올림", "Pinned", "Pinned Tweet"}:
-            continue
-        description = item.findtext("description") or ""
-        created_at = _parse_twitter_datetime(item.findtext("pubDate"))
-        author_username = creator.strip().lstrip("@") or username
-        post_url = _rss_post_url(item.findtext("link"), author_username, tweet_id)
-        image_urls = _rss_image_urls(description)
-        link_urls = _rss_link_urls(description, author_username, tweet_id)
-        raw: dict[str, Any] = {
-            "source": "x-rss",
-            "language": "koreana",
-            "tweet_id": tweet_id,
-            "username": username,
-            "created_at": item.findtext("pubDate"),
-        }
-        if link_urls:
-            raw["link_urls"] = link_urls
-        if _rss_has_video(description):
-            raw["video_fallback_url"] = post_url
-
-        posts.append(
-            TwitterPost(
-                post_id=f"x:{tweet_id}",
-                author_username=author_username,
-                url=post_url,
-                text=_clean_tweet_text(title) or post_url,
-                title=_title_from_text(title) or f"X 게시물 {tweet_id}",
-                created_at=created_at,
-                image_urls=image_urls,
-                raw=raw,
-            )
-        )
-        if len(posts) >= limit:
-            break
-    return posts
-
-
-def _strip_rss_reply_prefix(text: str, username: str) -> str:
-    return re.sub(r"^R to @[A-Za-z0-9_]+:\s*", "", text).strip()
-
-
-def _rss_post_url(value: str | None, username: str, tweet_id: str) -> str:
-    if value:
-        parsed = urlparse(html.unescape(value).strip())
-        parts = [part for part in parsed.path.split("/") if part]
-        if len(parts) >= 3 and parts[1] == "status":
-            return f"https://x.com/{parts[0]}/status/{parts[2]}"
-    return f"https://x.com/{username}/status/{tweet_id}"
-
-
-def _rss_has_video(description: str) -> bool:
-    return re.search(r">\s*Video\s*<", description, flags=re.IGNORECASE) is not None
-
-
-def _rss_image_urls(description: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.finditer(r'<img\s+[^>]*src=["\']([^"\']+)["\']', description, flags=re.IGNORECASE):
-        url = html.unescape(match.group(1))
-        normalized = _normalize_nitter_image_url(url)
-        if _is_video_thumbnail_url(normalized):
-            continue
-        urls.append(_highest_quality_photo_url(normalized))
-    return list(dict.fromkeys(urls))
-
-
-def _normalize_nitter_image_url(url: str) -> str:
-    parsed = urlparse(url)
-    if "nitter.net" not in parsed.netloc or not parsed.path.startswith("/pic/"):
-        return url
-    decoded = unquote(parsed.path.removeprefix("/pic/"))
-    if decoded.startswith("https://") or decoded.startswith("http://"):
-        return decoded
-    if decoded.startswith(("media/", "card_img/", "amplify_video_thumb/", "ext_tw_video_thumb/")):
-        return f"https://pbs.twimg.com/{decoded}"
-    return url
-
-
-def _rss_link_urls(description: str, username: str, tweet_id: str) -> list[str]:
-    urls: list[str] = []
-    for match in re.finditer(r'<a\s+[^>]*href=["\']([^"\']+)["\']', description, flags=re.IGNORECASE):
-        url = html.unescape(match.group(1)).strip()
-        if not url or _is_tweet_self_url(url, username, tweet_id):
-            continue
-        parsed = urlparse(url)
-        if parsed.netloc.endswith("nitter.net"):
-            continue
-        urls.append(url)
-    return list(dict.fromkeys(urls))

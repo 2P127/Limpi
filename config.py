@@ -150,6 +150,10 @@ class AppConfig:
     command_sync_mode: str
     announce_existing_on_first_run: bool
     x_account_username: str
+    x_auth_token: str | None
+    x_ct0: str | None
+    x_qid_user_by_screen_name: str | None
+    x_qid_user_tweets_and_replies: str | None
 
     @classmethod
     def from_env(cls, *, test: bool = False) -> "AppConfig":
@@ -166,6 +170,12 @@ class AppConfig:
 
         command_guild_id = _get_optional_int("COMMAND_GUILD_ID")
         x_account_username = os.getenv("X_ACCOUNT_USERNAME", "LimbusCompany_B").strip() or "LimbusCompany_B"
+        x_auth_token = os.getenv("X_AUTH_TOKEN", "").strip() or None
+        x_ct0 = os.getenv("X_CT0", "").strip() or None
+        x_qid_user_by_screen_name = os.getenv("X_QID_USER_BY_SCREEN_NAME", "").strip() or None
+        x_qid_user_tweets_and_replies = (
+            os.getenv("X_QID_USER_TWEETS_AND_REPLIES", "").strip() or None
+        )
         return cls(
             discord_token=discord_token,
             database_path=Path(os.getenv("DATABASE_PATH", "limpi.sqlite3")),
@@ -187,4 +197,8 @@ class AppConfig:
             command_sync_mode=_get_command_sync_mode(command_guild_id),
             announce_existing_on_first_run=_get_bool("ANNOUNCE_EXISTING_ON_FIRST_RUN", False),
             x_account_username=x_account_username,
+            x_auth_token=x_auth_token,
+            x_ct0=x_ct0,
+            x_qid_user_by_screen_name=x_qid_user_by_screen_name,
+            x_qid_user_tweets_and_replies=x_qid_user_tweets_and_replies,
         )

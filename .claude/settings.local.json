@@ -14,7 +14,13 @@
       "mcp__plugin_claude-mem_mcp-search__smart_unfold",
       "Bash(py -m py_compile storage.py)",
       "Bash(py -c ' *)",
-      "Bash(py -m py_compile storage.py bot.py)"
+      "Bash(py -m py_compile storage.py bot.py)",
+      "PowerShell(Get-Content \"C:\\\\Users\\\\Haryu5412\\\\Documents\\\\Github\\\\Limpi\\\\x_client.py\" -Raw | Select-String -Pattern \"def \" -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { $_.Value })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\Haryu5412\\\\Documents\\\\Github\\\\Limpi\\\\x_client.py\" -Encoding UTF8; $lines[38..125] | ForEach-Object -Begin {$i=39} -Process { \"$i`: $_\"; $i++ })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\Haryu5412\\\\Documents\\\\Github\\\\Limpi\\\\bot.py\" -Encoding UTF8; $lines[517..545] | ForEach-Object -Begin {$i=518} -Process { \"$i`: $_\"; $i++ })",
+      "PowerShell($lines = Get-Content \"C:\\\\Users\\\\Haryu5412\\\\Documents\\\\Github\\\\Limpi\\\\storage.py\" -Encoding UTF8; $i=1; $lines | ForEach-Object { if\\($_ -match \"replace_twitter|twitter_post|upsert\"\\) { \"$i`: $_\" }; $i++ })",
+      "PowerShell(py -m pip index versions twitter-scraper 2>&1)",
+      "PowerShell(py -m pip index versions twikit 2>&1)"
     ]
   }
 }

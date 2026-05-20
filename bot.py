@@ -37,7 +37,9 @@ from x_client import LimbusXClient, XClientError
 POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
-NEWS_POST_LIMIT = 30
+NEWS_POST_LIMIT = 80
+TWITTER_POST_LIMIT = 80
+AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
@@ -68,9 +70,13 @@ NEWS_SOURCE_BOTH = "both"
 NEWS_SOURCE_STEAM = "steam"
 NEWS_SOURCE_TWITTER = "twitter"
 NEWS_SOURCE_CHOICES = [
-    app_commands.Choice(name="둘 다", value=NEWS_SOURCE_BOTH),
+    app_commands.Choice(name="Steam & X(트위터)", value=NEWS_SOURCE_BOTH),
     app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
     app_commands.Choice(name="X(트위터)", value=NEWS_SOURCE_TWITTER),
+]
+NEWS_LOOKUP_SOURCE_CHOICES = [
+    app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
+    app_commands.Choice(name="트위터", value=NEWS_SOURCE_TWITTER),
 ]
 LANGUAGE_CHOICES = [
     app_commands.Choice(name="한국어", value="koreana"),
@@ -797,8 +803,13 @@ class NewsCog(commands.Cog):
         self,
         posts: list[NewsPost],
         settings: GuildSettings | None = None,
+        source_mode: str | None = None,
     ) -> list[NewsPost]:
-        mode = (settings.news_source_mode if settings else DEFAULT_NEWS_SOURCE_MODE) or DEFAULT_NEWS_SOURCE_MODE
+        mode = (
+            source_mode
+            or (settings.news_source_mode if settings else DEFAULT_NEWS_SOURCE_MODE)
+            or DEFAULT_NEWS_SOURCE_MODE
+        )
         if mode == NEWS_SOURCE_STEAM:
             return [post for post in posts if not _is_twitter_news_post(post)]
         if mode == NEWS_SOURCE_TWITTER:
@@ -812,11 +823,16 @@ class NewsCog(commands.Cog):
         limit: int = 25,
         language: str | None = None,
         settings: GuildSettings | None = None,
+        source_mode: str | None = None,
     ) -> list[NewsPost]:
         steam_posts = self.storage.search_posts(query, limit=limit, language=language)
         twitter_posts = self.storage.search_twitter_posts(query, limit=limit)
         posts = [*steam_posts, *_twitter_posts_as_news_posts(twitter_posts, steam_posts)]
-        return self._posts_for_source_mode(_sort_posts_newest_first(posts), settings)[:limit]
+        return self._posts_for_source_mode(
+            _sort_posts_newest_first(posts),
+            settings,
+            source_mode=source_mode,
+        )[:limit]
 
     def _get_combined_post(
         self,
@@ -824,6 +840,7 @@ class NewsCog(commands.Cog):
         *,
         language: str | None = None,
         settings: GuildSettings | None = None,
+        source_mode: str | None = None,
     ) -> NewsPost | None:
         steam_post = self.storage.get_post_by_id_or_title(value, language=language)
         if steam_post is None:
@@ -838,7 +855,7 @@ class NewsCog(commands.Cog):
         candidates = [*steam_posts]
         if twitter_post is not None:
             candidates.extend(_twitter_posts_as_news_posts([twitter_post], steam_posts))
-        filtered = self._posts_for_source_mode(candidates, settings)
+        filtered = self._posts_for_source_mode(candidates, settings, source_mode=source_mode)
         return filtered[0] if filtered else None
 
     def _latest_combined_post(
@@ -2215,32 +2232,32 @@ class NewsCog(commands.Cog):
             self._zip_cache.pop(oldest_post_id, None)
 
     async def run_startup_sync(self) -> None:
-        if self.news_source is None or self._startup_synced:
+        if self._startup_synced:
             return
-        try:
-            posts_by_language, _ = await self._sync_global_news_cache()
-            self._startup_synced = True
-            synced_posts = [
-                post
-                for posts in posts_by_language.values()
-                for post in posts
-            ]
-            latest = max(
-                synced_posts,
-                key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
-                default=None,
-            )
-            if latest is not None:
-                LOGGER.info(
-                    "시작 시 Steam 뉴스 동기화 완료: %d개 등록. 최신 소식: %s (%s)",
-                    len(synced_posts),
-                    latest.title,
-                    latest.url,
+        if self.news_source is not None:
+            try:
+                posts_by_language, _ = await self._sync_global_news_cache()
+                self._startup_synced = True
+                synced_posts = posts_by_language.get(self.config.steam_language) or next(
+                    iter(posts_by_language.values()),
+                    [],
                 )
-            else:
-                LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
-        except Exception:
-            LOGGER.exception("시작 시 뉴스 동기화 실패.")
+                latest = max(
+                    synced_posts,
+                    key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
+                    default=None,
+                )
+                if latest is not None:
+                    LOGGER.info(
+                        "시작 시 Steam 뉴스 동기화 완료: %d개 등록. 최신 소식: %s (%s)",
+                        len(synced_posts),
+                        latest.title,
+                        latest.url,
+                    )
+                else:
+                    LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
+            except Exception:
+                LOGGER.exception("시작 시 뉴스 동기화 실패.")
         try:
             saved, _ = await self._sync_twitter_posts()
             latest = self.storage.get_latest_twitter_post()
@@ -2267,13 +2284,47 @@ class NewsCog(commands.Cog):
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
     async def _sync_twitter_posts(self) -> tuple[int, list[TwitterPost]]:
-        posts = await self.x_source.fetch_recent_posts(limit=NEWS_POST_LIMIT)
-        saved = self.storage.replace_twitter_posts(posts)
+        posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+        saved = self.storage.save_twitter_posts(posts)
         return saved, posts
 
     async def _poll_twitter_once(self) -> int:
-        await self._sync_twitter_posts()
-        return 0
+        _, posts = await self._sync_twitter_posts()
+        if not posts:
+            return 0
+
+        announced = 0
+        posts = posts[:TWITTER_POST_LIMIT]
+        for target in self.storage.list_twitter_targets():
+            if not target.enabled:
+                continue
+            channel = await self._resolve_twitter_target_channel(target)
+            if channel is None:
+                continue
+            new_posts = self._new_twitter_posts_for_target(target, posts)
+            if not new_posts:
+                self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
+                continue
+            for post in new_posts:
+                try:
+                    await self._send_twitter_post_to_channel(channel, post)
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                        target.guild_id,
+                        target.channel_id,
+                        post.post_id,
+                    )
+                    continue
+                self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
+                LOGGER.info(
+                    "새 X 게시물 공지 (guild %s, channel %s): %s",
+                    target.guild_id,
+                    target.channel_id,
+                    post.title,
+                )
+                announced += 1
+        return announced
 
     def _new_twitter_posts_for_target(
         self,
@@ -2686,14 +2737,6 @@ class NewsCog(commands.Cog):
             interaction.guild_id,
             channel_id=channel.id,
         )
-        previous_language_target = next(
-            (
-                target
-                for target in self.storage.list_news_targets(interaction.guild_id)
-                if target.language == language.value
-            ),
-            None,
-        )
         self.storage.upsert_news_target(
             interaction.guild_id,
             channel_id=channel.id,
@@ -2701,13 +2744,7 @@ class NewsCog(commands.Cog):
         )
         targets = self.storage.list_news_targets(interaction.guild_id)
         if previous_target is None:
-            if previous_language_target is None:
-                result_text = f"{_language_label(language.value)} 소식을 {channel.mention}에 보낼게요."
-            else:
-                result_text = (
-                    f"{_language_label(language.value)} 소식 채널을 "
-                    f"<#{previous_language_target.channel_id}>에서 {channel.mention}로 바꿨어요."
-                )
+            result_text = f"{_language_label(language.value)} 소식을 {channel.mention}에 보낼게요."
         elif previous_target.language == language.value:
             result_text = f"{channel.mention}은 이미 {_language_label(language.value)} 소식 채널로 설정되어 있어요."
         else:
@@ -3032,16 +3069,18 @@ class NewsCog(commands.Cog):
     @app_commands.command(name="이전소식보기", description="저장된 림버스 컴퍼니 이전 소식을 다시 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    @app_commands.rename(title="게시물", private="나만보기", attach_photos="사진첨부")
+    @app_commands.rename(source="소스", title="게시물", private="나만보기", attach_photos="사진첨부")
     @app_commands.describe(
+        source="게시물을 가져온 소스입니다.",
         title="게시물의 첫 번째 줄을 선택합니다.",
         private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
         attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
     )
-    @app_commands.choices(private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
+    @app_commands.choices(source=NEWS_LOOKUP_SOURCE_CHOICES, private=BOOLEAN_CHOICES, attach_photos=BOOLEAN_CHOICES)
     async def previous_news(
         self,
         interaction: discord.Interaction,
+        source: app_commands.Choice[str],
         title: str,
         private: app_commands.Choice[str] | None = None,
         attach_photos: app_commands.Choice[str] | None = None,
@@ -3053,7 +3092,12 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        post = self._get_combined_post(title, language=language, settings=settings)
+        post = self._get_combined_post(
+            title,
+            language=language,
+            settings=settings,
+            source_mode=source.value,
+        )
         if post is None:
             await interaction.response.send_message(
                 "아직 저장된 게시물을 찾지 못했어요. 림피가 자동 동기화한 뒤 다시 선택해 주세요.",
@@ -3084,14 +3128,16 @@ class NewsCog(commands.Cog):
     ) -> list[app_commands.Choice[str]]:
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
+        source_mode = _selected_source_mode(interaction)
         posts = self._combined_cached_posts(
             current,
-            limit=25,
+            limit=AUTOCOMPLETE_CHOICE_LIMIT,
             language=language,
             settings=settings,
+            source_mode=source_mode,
         )
         return [
-            app_commands.Choice(name=_choice_name(post, include_language=False), value=post.post_id)
+            app_commands.Choice(name=_choice_name(post, include_language=False, include_source=False), value=post.post_id)
             for post in posts
         ]
 
@@ -3177,15 +3223,18 @@ class NewsCog(commands.Cog):
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
-    @app_commands.rename(title="게시물", channel="채널", role="역할")
+    @app_commands.rename(source="소스", title="게시물", channel="채널", role="역할")
     @app_commands.describe(
+        source="게시물을 가져온 소스입니다.",
         title="보낼 게시물을 선택합니다.",
         channel="보낼 채널입니다. 비워두면 /소식채널설정 채널 전체에 각 채널 언어 버전으로 보냅니다.",
         role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
     )
+    @app_commands.choices(source=NEWS_LOOKUP_SOURCE_CHOICES)
     async def send_news(
         self,
         interaction: discord.Interaction,
+        source: app_commands.Choice[str],
         title: str,
         channel: discord.TextChannel | None = None,
         role: discord.Role | None = None,
@@ -3198,7 +3247,12 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id)
-        post = self._get_combined_post(title, language=language, settings=settings)
+        post = self._get_combined_post(
+            title,
+            language=language,
+            settings=settings,
+            source_mode=source.value,
+        )
         if post is None:
             await interaction.response.send_message(
                 "해당 게시물을 찾지 못했어요.", ephemeral=True
@@ -3293,10 +3347,17 @@ class NewsCog(commands.Cog):
     ) -> list[app_commands.Choice[str]]:
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        posts = self._combined_cached_posts(current, limit=25, language=language, settings=settings)
+        source_mode = _selected_source_mode(interaction)
+        posts = self._combined_cached_posts(
+            current,
+            limit=AUTOCOMPLETE_CHOICE_LIMIT,
+            language=language,
+            settings=settings,
+            source_mode=source_mode,
+        )
         return [
             app_commands.Choice(
-                name=_choice_name(post, include_language=False),
+                name=_choice_name(post, include_language=False, include_source=False),
                 value=post.post_id,
             )
             for post in posts
@@ -3642,7 +3703,7 @@ def _image_embed_batches_from_urls(
 ) -> list[list[discord.Embed]]:
     embeds: list[discord.Embed] = []
     for image_url in image_urls:
-        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(179, 28, 28))
+        embed = discord.Embed(url=post.url, color=_post_embed_color(post))
         embed.set_image(url=image_url)
         embeds.append(embed)
 
@@ -3682,14 +3743,16 @@ def _description_for_post(post: NewsPost) -> str:
         EMBED_DESCRIPTION_LIMIT,
     )
     description = chunks[0] if chunks else post.url
-    source_block = f"\n\n**출처**\n{_post_source_label(post)}"
-    schedule_text = _schedule_text_for_post(post)
-    if schedule_text:
-        schedule_label = _news_ui_text(_post_language(post), "schedule")
-        schedule_block = f"\n\n**{schedule_label}**\n{schedule_text}{source_block}"
-        if len(description) + len(schedule_block) <= EMBED_DESCRIPTION_LIMIT:
-            description = f"{description}{schedule_block}"
-    elif len(description) + len(source_block) <= EMBED_DESCRIPTION_LIMIT:
+    is_twitter = _is_twitter_news_post(post)
+    date_block = (
+        f"**작성일**\n{_format_kst(post.created_at)}\n\n"
+        if post.created_at and not is_twitter
+        else ""
+    )
+    if date_block and len(date_block) + len(description) <= EMBED_DESCRIPTION_LIMIT:
+        description = f"{date_block}{description}"
+    source_block = "" if is_twitter else f"\n\n**출처**\n{_post_source_label(post)}"
+    if len(description) + len(source_block) <= EMBED_DESCRIPTION_LIMIT:
         description = f"{description}{source_block}"
     return description
 
@@ -3699,8 +3762,13 @@ def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
         title=_display_title_for_post(post)[:256],
         description=_description_for_post(post),
         url=post.url,
-        color=discord.Color.from_rgb(179, 28, 28),
+        color=_post_embed_color(post),
     )
+    if _is_twitter_news_post(post):
+        footer = "출처: X(트위터)"
+        if post.created_at is not None:
+            footer = f"{footer} · 작성일: {_format_kst(post.created_at)}"
+        fallback.set_footer(text=footer)
     return [[fallback]]
 
 
@@ -3789,6 +3857,9 @@ def _embed_for_twitter_post(post: TwitterPost) -> discord.Embed:
     )
     if post.created_at is not None:
         embed.timestamp = post.created_at
+        embed.set_footer(text=f"출처: X(트위터) · 작성일: {_format_kst(post.created_at)}")
+    else:
+        embed.set_footer(text="출처: X(트위터)")
     embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
     embed.add_field(name="원문", value=f"[X에서 보기]({post.url})", inline=False)
     return embed
@@ -3803,7 +3874,7 @@ def _build_layout_view_for_post(
     is_update: bool = False,
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
-    container = discord.ui.Container(accent_color=discord.Color.from_rgb(179, 28, 28))
+    container = discord.ui.Container(accent_color=_post_embed_color(post))
     language = _post_language(post)
 
     if is_update:
@@ -3817,15 +3888,8 @@ def _build_layout_view_for_post(
         container.add_item(banner_gallery)
 
     update_badge = _news_ui_text(language, "updated")
-    schedule_text = _schedule_text_for_post(post)
-    schedule_display = (
-        f"**{_news_ui_text(language, 'schedule')}**\n{schedule_text}"
-        if schedule_text
-        else ""
-    )
     overhead = (
         (len(update_badge) if is_update else 0)
-        + (len(schedule_display) if schedule_display else 0)
         + (len(leading_text) if leading_text else 0)
     )
     body_limit = max(100, 4000 - overhead)
@@ -3833,7 +3897,7 @@ def _build_layout_view_for_post(
     container.add_item(
         discord.ui.TextDisplay(
             _truncate_component_text(
-                f"### {_display_title_for_post(post).strip() or post.url}\n\n{(post.text or post.url).strip()}",
+                f"### {_display_title_for_post(post).strip() or post.url}\n{_post_date_line(post)}\n\n{(post.text or post.url).strip()}",
                 body_limit,
             )
         )
@@ -3845,10 +3909,6 @@ def _build_layout_view_for_post(
         thumbnail_gallery = discord.ui.MediaGallery()
         thumbnail_gallery.add_item(media=thumbnail_url)
         container.add_item(thumbnail_gallery)
-
-    if schedule_display:
-        container.add_item(discord.ui.Separator())
-        container.add_item(discord.ui.TextDisplay(schedule_display))
 
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(f"**출처**\n{_post_source_label(post)}"))
@@ -3870,6 +3930,12 @@ def _build_layout_view_for_post(
 
     view.add_item(container)
     return view
+
+
+def _post_embed_color(post: NewsPost) -> discord.Color:
+    if _is_twitter_news_post(post):
+        return discord.Color.from_rgb(29, 155, 240)
+    return discord.Color.from_rgb(179, 28, 28)
 
 
 def _truncate_component_text(text: str, limit: int) -> str:
@@ -4005,12 +4071,48 @@ def _display_title_for_post(post: NewsPost) -> str:
     return f"[{_post_source_label(post)}] {title}"
 
 
+def _post_date_line(post: NewsPost) -> str:
+    if post.created_at is None:
+        return ""
+    return f"-# 작성일: {_format_kst(post.created_at)}"
+
+
 def _news_source_mode_label(mode: str | None) -> str:
     if mode == NEWS_SOURCE_STEAM:
         return "Steam"
     if mode == NEWS_SOURCE_TWITTER:
         return "X(트위터)"
     return "둘 다"
+
+
+def _selected_source_mode(interaction: discord.Interaction) -> str:
+    source = getattr(interaction.namespace, "source", None)
+    if isinstance(source, app_commands.Choice):
+        return str(source.value)
+    if source in {NEWS_SOURCE_STEAM, NEWS_SOURCE_TWITTER}:
+        return str(source)
+    data_source = _selected_source_mode_from_options(
+        (interaction.data or {}).get("options") if isinstance(interaction.data, dict) else None
+    )
+    if data_source is not None:
+        return data_source
+    return NEWS_SOURCE_STEAM
+
+
+def _selected_source_mode_from_options(options: object) -> str | None:
+    if not isinstance(options, list):
+        return None
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        name = str(option.get("name") or "")
+        value = option.get("value")
+        if name in {"source", "소스"} and value in {NEWS_SOURCE_STEAM, NEWS_SOURCE_TWITTER}:
+            return str(value)
+        nested = _selected_source_mode_from_options(option.get("options"))
+        if nested is not None:
+            return nested
+    return None
 
 
 def _sort_posts_newest_first(posts: list[NewsPost]) -> list[NewsPost]:
@@ -4101,13 +4203,20 @@ def _format_kst(value: datetime) -> str:
     return value.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
 
 
-def _choice_name(post: NewsPost, *, include_language: bool = False) -> str:
-    title = _display_title_for_post(post)
+def _choice_name(
+    post: NewsPost,
+    *,
+    include_language: bool = False,
+    include_source: bool = True,
+) -> str:
+    title = _display_title_for_post(post) if include_source else (post.title.strip() or post.post_id)
     prefix = ""
+    if post.created_at:
+        prefix = f"[{_format_kst(post.created_at)}] "
     if include_language:
         language = _post_language(post)
         if language:
-            prefix = f"[{_language_label(language)}] "
+            prefix = f"{prefix}[{_language_label(language)}] "
 
     max_title_length = max(1, 100 - len(prefix))
     if len(title) <= max_title_length:
@@ -4345,3 +4454,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

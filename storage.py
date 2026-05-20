@@ -1513,12 +1513,11 @@ class SQLiteStorage:
         posts_list = list(posts)
         now = _now_iso()
         with self._lock:
-            self._connection.execute("DELETE FROM twitter_posts")
             saved = 0
             for post in posts_list:
-                self._connection.execute(
+                cursor = self._connection.execute(
                     """
-                    INSERT INTO twitter_posts (
+                    INSERT OR IGNORE INTO twitter_posts (
                         post_id, author_username, url, text, title, created_at,
                         image_urls, raw_json, saved_at
                     )
@@ -1536,9 +1535,14 @@ class SQLiteStorage:
                         now,
                     ),
                 )
-                saved += 1
+                saved += cursor.rowcount
             self._connection.commit()
         return saved
+
+    def clear_twitter_posts(self) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM twitter_posts")
+            self._connection.commit()
 
     def get_twitter_post(self, post_id: str) -> TwitterPost | None:
         with self._lock:
