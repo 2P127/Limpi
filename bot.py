@@ -2380,6 +2380,23 @@ class NewsCog(commands.Cog):
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
 
+    async def _refresh_recent_news_cache(self, language: str) -> None:
+        if self.news_source is not None:
+            try:
+                fresh = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
+            except Exception:
+                LOGGER.exception("최신 뉴스 조회 실패. 캐시를 유지합니다.")
+            else:
+                if fresh:
+                    self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
+                    self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
+
+        if self.x_source is not None:
+            try:
+                await self._sync_twitter_posts()
+            except XClientError as exc:
+                LOGGER.warning("X 게시물 조회 실패: %s", exc)
+
     async def _track_manual_message(
         self,
         guild_id: int | None,
@@ -3689,32 +3706,13 @@ class NewsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=private_value, thinking=True)
 
-        post: NewsPost | None = None
-        if self.news_source is not None:
-            try:
-                fresh = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
-            except Exception:
-                LOGGER.exception("최신 뉴스 조회 실패. 캐시를 사용합니다.")
-                fresh = []
-            if fresh:
-                self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
-                self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
-                post = fresh[0]
-        if self.x_source is not None:
-            try:
-                _, twitter_posts = await self._sync_twitter_posts()
-            except XClientError as exc:
-                LOGGER.warning("X 게시물 조회 실패: %s", exc)
-                twitter_posts = []
-            candidates = ([post] if post is not None else []) + _twitter_posts_as_news_posts(
-                twitter_posts[:NEWS_POST_LIMIT],
-                [post] if post is not None else [],
-            )
-            filtered = self._posts_for_source_mode(_sort_posts_newest_first(candidates), settings)
-            post = filtered[0] if filtered else post
-
+        post = self._latest_combined_post(language=language, settings=settings)
         if post is None:
+            await self._refresh_recent_news_cache(language)
             post = self._latest_combined_post(language=language, settings=settings)
+        else:
+            task = asyncio.create_task(self._refresh_recent_news_cache(language))
+            task.add_done_callback(self._log_background_task_result)
 
         if post is None:
             await interaction.followup.send(
