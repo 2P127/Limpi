@@ -21,13 +21,13 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from chzzk_client import (
+    ChzzkBroadcast,
     ChzzkClient,
     ChzzkLive,
     PROJECT_MOON_CHZZK_LIVE_URL,
-    PROJECT_MOON_YOUTUBE_STREAMS_URL,
 )
 from config import AppConfig
-from models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, NewsPost, TwitterPost
+from models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, GuildYoutubeTarget, NewsPost, TwitterPost
 from storage import (
     DEFAULT_NOTIFICATION_BANNER,
     DEFAULT_NEWS_SOURCE_MODE,
@@ -38,6 +38,7 @@ from storage import (
 )
 from steam_client import NewsSource, build_news_source
 from x_client import LimbusXClient, XClientError
+from youtube_client import PROJECT_MOON_YOUTUBE_STREAMS_URL, YoutubeClient, YoutubeLive, YoutubeStream
 
 
 POST_FORMAT_RICH = "rich"
@@ -50,6 +51,7 @@ TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 30
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
+YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
@@ -75,6 +77,14 @@ BOOLEAN_FALSE = "false"
 BOOLEAN_CHOICES = [
     app_commands.Choice(name="허용", value=BOOLEAN_TRUE),
     app_commands.Choice(name="비허용", value=BOOLEAN_FALSE),
+]
+BROADCAST_SOURCE_BOTH = "both"
+BROADCAST_SOURCE_CHZZK = "chzzk"
+BROADCAST_SOURCE_YOUTUBE = "youtube"
+BROADCAST_SOURCE_CHOICES = [
+    app_commands.Choice(name="치지직 & 유튜브", value=BROADCAST_SOURCE_BOTH),
+    app_commands.Choice(name="치지직", value=BROADCAST_SOURCE_CHZZK),
+    app_commands.Choice(name="유튜브", value=BROADCAST_SOURCE_YOUTUBE),
 ]
 NEWS_SOURCE_BOTH = "both"
 NEWS_SOURCE_STEAM = "steam"
@@ -146,7 +156,7 @@ MAINTENANCE_START_DESCRIPTION = (
 MAINTENANCE_UPDATE_TITLE = "림버스 컴퍼니 업데이트"
 MAINTENANCE_UPDATE_DESCRIPTION = (
     "지금 림버스 컴퍼니가 점검이 끝나고 업데이트가 되었어요! "
-    "스팀에 들어가서 림버스를 업데이트 해주세요! <3"
+    "스팀 또는 앱 스토어에 들어가서 림버스를 업데이트 해주세요! <3"
 )
 
 
@@ -391,9 +401,11 @@ class NewsCog(commands.Cog):
         self.x_source = x_source
         self.session = session
         self.chzzk_client = ChzzkClient(session)
+        self.youtube_client = YoutubeClient(session)
         self._poll_lock = asyncio.Lock()
         self._twitter_poll_lock = asyncio.Lock()
         self._chzzk_poll_lock = asyncio.Lock()
+        self._youtube_poll_lock = asyncio.Lock()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
@@ -410,6 +422,7 @@ class NewsCog(commands.Cog):
         self.cleanup_messages.start()
         self.poll_twitter_posts.start()
         self.poll_chzzk_live.start()
+        self.poll_youtube_live.start()
 
         if self.news_source is None and self.x_source is None:
             LOGGER.warning("뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -426,6 +439,8 @@ class NewsCog(commands.Cog):
             self.poll_twitter_posts.cancel()
         if self.poll_chzzk_live.is_running():
             self.poll_chzzk_live.cancel()
+        if self.poll_youtube_live.is_running():
+            self.poll_youtube_live.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
 
@@ -604,6 +619,20 @@ class NewsCog(commands.Cog):
     async def before_poll_chzzk_live(self) -> None:
         await self.bot.wait_until_ready()
 
+    @tasks.loop(seconds=CHZZK_POLL_INTERVAL_SECONDS)
+    async def poll_youtube_live(self) -> None:
+        async with self._youtube_poll_lock:
+            try:
+                await self._poll_youtube_once()
+            except aiohttp.ClientError as exc:
+                LOGGER.warning("유튜브 라이브 자동 확인 실패: %s", exc)
+            except Exception:
+                LOGGER.exception("유튜브 라이브 자동 확인 실패.")
+
+    @poll_youtube_live.before_loop
+    async def before_poll_youtube_live(self) -> None:
+        await self.bot.wait_until_ready()
+
     @tasks.loop(seconds=60)
     async def maintenance_notifications(self) -> None:
         try:
@@ -691,6 +720,7 @@ class NewsCog(commands.Cog):
                 embed = _maintenance_embed(
                     MAINTENANCE_START_TITLE,
                     MAINTENANCE_START_DESCRIPTION,
+                    color=discord.Color.dark_gray(),
                 )
             else:
                 if settings.last_maintenance_update_notice == notice_key:
@@ -698,6 +728,7 @@ class NewsCog(commands.Cog):
                 embed = _maintenance_embed(
                     MAINTENANCE_UPDATE_TITLE,
                     MAINTENANCE_UPDATE_DESCRIPTION,
+                    color=discord.Color.yellow(),
                 )
 
             sent = await self._send_maintenance_notice(settings, embed, notice_type)
@@ -763,9 +794,15 @@ class NewsCog(commands.Cog):
             return False
 
         try:
+            role = discord.Object(id=settings.role_id) if settings.role_id else None
             await channel.send(
+                content=f"<@&{settings.role_id}>" if settings.role_id else None,
                 embed=embed,
-                allowed_mentions=discord.AllowedMentions.none(),
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[role] if role else [],
+                ),
             )
         except (discord.Forbidden, discord.NotFound):
             LOGGER.warning(
@@ -2359,6 +2396,7 @@ class NewsCog(commands.Cog):
                     LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
             except Exception:
                 LOGGER.exception("시작 시 뉴스 동기화 실패.")
+        await self._sync_youtube_startup_baseline()
         try:
             if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
                 LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
@@ -2379,6 +2417,45 @@ class NewsCog(commands.Cog):
             LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
+
+    async def _sync_youtube_startup_baseline(self) -> None:
+        targets = self.storage.list_youtube_targets()
+        if not targets:
+            return
+
+        try:
+            latest = await self.youtube_client.fetch_latest_stream()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("시작 시 유튜브 기준선 동기화 실패: %s", exc)
+            return
+        except Exception:
+            LOGGER.exception("시작 시 유튜브 기준선 동기화 실패.")
+            return
+
+        if latest is None:
+            LOGGER.info("시작 시 유튜브 기준선 동기화 생략: 최근 방송을 찾지 못했습니다.")
+            return
+
+        updated = 0
+        for target in targets:
+            if target.last_live_id == latest.video_id:
+                continue
+            self.storage.upsert_youtube_target(
+                target.guild_id,
+                channel_id=target.channel_id,
+                enabled=target.enabled,
+                last_live_id=latest.video_id,
+                is_live=False,
+            )
+            updated += 1
+
+        LOGGER.info(
+            "시작 시 유튜브 기준선 동기화 완료: targets=%d updated=%d latest=%s (%s)",
+            len(targets),
+            updated,
+            latest.title,
+            latest.url,
+        )
 
     async def _refresh_recent_news_cache(self, language: str) -> None:
         if self.news_source is not None:
@@ -2523,9 +2600,6 @@ class NewsCog(commands.Cog):
         for target in targets:
             if not target.enabled:
                 continue
-            if target.last_live_id is None:
-                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
-                continue
             if str(target.last_live_id) == live.live_id:
                 if not target.is_live:
                     self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
@@ -2545,10 +2619,12 @@ class NewsCog(commands.Cog):
                 continue
             try:
                 settings = self.storage.get_settings(target.guild_id)
+                youtube_target = self.storage.get_youtube_target(target.guild_id)
                 message = await self._send_chzzk_live_to_channel(
                     channel,
                     live,
                     role_id=settings.role_id,
+                    include_youtube_button=not (youtube_target is not None and youtube_target.enabled),
                 )
             except discord.HTTPException:
                 LOGGER.exception(
@@ -2563,6 +2639,68 @@ class NewsCog(commands.Cog):
             await self._track_manual_message(target.guild_id, target.channel_id, message)
             LOGGER.info(
                 "새 치지직 라이브 공지 (guild %s, channel %s): %s",
+                target.guild_id,
+                target.channel_id,
+                live.title,
+            )
+            announced += 1
+        return announced
+
+    async def _poll_youtube_once(self) -> int:
+        targets = self.storage.list_youtube_targets()
+        if not targets:
+            return 0
+
+        live = await self.youtube_client.fetch_live()
+        if live is None:
+            for target in targets:
+                if target.enabled and target.is_live:
+                    self.storage.mark_youtube_target_offline(target.guild_id)
+            return 0
+
+        announced = 0
+        for target in targets:
+            if not target.enabled:
+                continue
+            if str(target.last_live_id) == live.video_id:
+                if not target.is_live:
+                    self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+                continue
+            if _is_youtube_live_too_old(live):
+                self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+                LOGGER.info(
+                    "유튜브 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, video_id=%s, title=%r).",
+                    target.guild_id,
+                    live.video_id,
+                    live.title,
+                )
+                continue
+
+            channel = await self._resolve_youtube_target_channel(target)
+            if channel is None:
+                continue
+            try:
+                settings = self.storage.get_settings(target.guild_id)
+                chzzk_target = self.storage.get_chzzk_target(target.guild_id)
+                message = await self._send_youtube_live_to_channel(
+                    channel,
+                    live,
+                    role_id=settings.role_id,
+                    include_chzzk_button=not (chzzk_target is not None and chzzk_target.enabled),
+                )
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "유튜브 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, video_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    live.video_id,
+                )
+                continue
+
+            self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+            await self._track_manual_message(target.guild_id, target.channel_id, message)
+            LOGGER.info(
+                "새 유튜브 라이브 공지 (guild %s, channel %s): %s",
                 target.guild_id,
                 target.channel_id,
                 live.title,
@@ -2593,16 +2731,42 @@ class NewsCog(commands.Cog):
                 return None
         return channel if isinstance(channel, discord.abc.Messageable) else None
 
+    async def _resolve_youtube_target_channel(
+        self, target: GuildYoutubeTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "유튜브 라이브 자동 전송 건너뜀: 채널 접근 불가 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "유튜브 라이브 자동 전송 채널 조회 실패 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
     async def _send_chzzk_live_to_channel(
         self,
         channel: discord.abc.Messageable,
         live: ChzzkLive,
         *,
         role_id: int | None = None,
+        youtube_url: str | None = None,
+        include_youtube_button: bool = True,
     ) -> discord.Message:
         embed = _embed_for_chzzk_live(live)
-        youtube_url = await self._youtube_latest_live_url()
-        view = _chzzk_live_view(youtube_url)
+        if include_youtube_button:
+            youtube_url = youtube_url or await self._youtube_latest_live_url()
+        view = _chzzk_live_view(youtube_url, include_youtube=include_youtube_button)
         if role_id:
             await channel.send(
                 content=f"<@&{role_id}>",
@@ -2626,6 +2790,29 @@ class NewsCog(commands.Cog):
         return await channel.send(
             embed=_embed_for_chzzk_live_end(),
             view=_chzzk_live_view(youtube_url),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _send_youtube_live_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        live: YoutubeLive,
+        *,
+        role_id: int | None = None,
+        include_chzzk_button: bool = False,
+    ) -> discord.Message:
+        if role_id:
+            await channel.send(
+                content=f"<@&{role_id}>",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
+                ),
+            )
+        return await channel.send(
+            embed=_embed_for_youtube_live(live),
+            view=_youtube_live_view(live.url, include_chzzk=include_chzzk_button),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -2993,7 +3180,7 @@ class NewsCog(commands.Cog):
                 f"알림 배너: {banner_text}\n"
                 f"뉴스 소스: {source_text}"
             ),
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
 
         await interaction.response.send_message(
@@ -3054,7 +3241,7 @@ class NewsCog(commands.Cog):
                 f"{result_text}\n\n"
                 f"언어별 소식 채널\n{_format_news_targets(targets)}"
             ),
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
         await interaction.response.send_message(
             embed=embed,
@@ -3067,43 +3254,75 @@ class NewsCog(commands.Cog):
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
-    @app_commands.rename(channel="채널", language="언어")
-    @app_commands.describe(
-        channel="해제할 소식 채널입니다.",
-        language="이 채널에서 해제할 소식 언어입니다.",
-    )
-    @app_commands.choices(language=LANGUAGE_CHOICES)
+    @app_commands.rename(target="대상")
+    @app_commands.describe(target="해제할 소식 채널입니다. 현재 설정된 채널과 언어 중에서 고릅니다.")
     async def remove_news_channel(
         self,
         interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        language: app_commands.Choice[str],
+        target: str,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
             return
 
+        parsed = _parse_news_target_choice(target)
+        if parsed is None:
+            targets = self.storage.list_news_targets(interaction.guild_id)
+            await interaction.response.send_message(
+                "해제할 소식 채널을 현재 설정 목록에서 골라주세요.\n\n언어별 소식 채널\n"
+                f"{_format_news_targets(targets)}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        channel_id, language = parsed
         removed = self.storage.delete_news_target(
             interaction.guild_id,
-            channel_id=channel.id,
-            language=language.value,
+            channel_id=channel_id,
+            language=language,
         )
         targets = self.storage.list_news_targets(interaction.guild_id)
         if removed:
-            message = f"{channel.mention}의 {_language_label(language.value)} 소식 자동 발송을 해제했어요."
+            message = f"<#{channel_id}>의 {_language_label(language)} 소식 자동 발송을 해제했어요."
         else:
-            message = f"{channel.mention}에는 {_language_label(language.value)} 소식 채널 설정이 없어요."
+            message = f"<#{channel_id}>에는 {_language_label(language)} 소식 채널 설정이 없어요."
 
         embed = discord.Embed(
             title="소식 채널 설정",
             description=f"{message}\n\n언어별 소식 채널\n{_format_news_targets(targets)}",
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
         await interaction.response.send_message(
             embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    @remove_news_channel.autocomplete("target")
+    async def remove_news_channel_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if interaction.guild_id is None:
+            return []
+        targets = self.storage.list_news_targets(interaction.guild_id)
+        choices: list[app_commands.Choice[str]] = []
+        current_lower = current.casefold()
+        for target in targets:
+            channel = interaction.guild.get_channel(target.channel_id) if interaction.guild else None
+            channel_name = f"#{channel.name}" if isinstance(channel, discord.TextChannel) else f"채널 {target.channel_id}"
+            label = f"{channel_name} · {_language_label(target.language)}"
+            if current_lower and current_lower not in label.casefold():
+                continue
+            choices.append(
+                app_commands.Choice(
+                    name=label[:100],
+                    value=_news_target_choice_value(target.channel_id, target.language),
+                )
+            )
+            if len(choices) >= 25:
+                break
+        return choices
 
     @app_commands.command(name="누락소식설정", description="자동 발송 실패로 누락된 소식을 다음 폴링 때 다시 보낼지 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -3128,11 +3347,16 @@ class NewsCog(commands.Cog):
             interaction.guild_id,
             missed_news_recovery_enabled=_choice_bool(enabled, False),
         )
-        await interaction.response.send_message(
-            (
+        embed = discord.Embed(
+            title="누락 소식 설정이 완료되었어요",
+            description=(
                 f"누락 소식 자동 재시도: {_bool_label(settings.missed_news_recovery_enabled)}\n"
                 "허용 상태에서는 자동 발송에 실패한 새 소식을 본 것으로 처리하지 않고 다음 확인 때 다시 보냅니다."
             ),
+            color=_success_embed_color(),
+        )
+        await interaction.response.send_message(
+            embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3177,9 +3401,9 @@ class NewsCog(commands.Cog):
             description=(
                 f"점검 알림: {_bool_label(settings.maintenance_notifications_enabled)}\n"
                 f"채널: {channel_text}\n"
-                "매주 목요일 10:00(KST)에 점검 시작 알림, 12:00(KST)에 업데이트 알림을 임베드로 보내요."
+                "매주 목요일 10:00(KST)에 점검 시작 알림, 12:00(KST)에 업데이트 알림을 역할 멘션과 임베드로 보내요."
             ),
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
         await interaction.response.send_message(
             embed=embed,
@@ -3187,17 +3411,503 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="치지직알림설정", description="ProjectMoon Official 치지직 라이브 시작 알림을 설정합니다.")
+    async def _fetch_broadcast_lives(
+        self,
+        source_value: str,
+    ) -> tuple[ChzzkLive | None, YoutubeLive | None, list[str]]:
+        tasks = []
+        if _broadcast_source_allows_chzzk(source_value):
+            tasks.append(("치지직", self.chzzk_client.fetch_live()))
+        if _broadcast_source_allows_youtube(source_value):
+            tasks.append(("유튜브", self.youtube_client.fetch_live()))
+        if not tasks:
+            return None, None, []
+
+        results = await asyncio.gather(
+            *(task for _, task in tasks),
+            return_exceptions=True,
+        )
+        chzzk_live: ChzzkLive | None = None
+        youtube_live: YoutubeLive | None = None
+        errors: list[str] = []
+        for (label, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                LOGGER.warning("%s 방송 현황 확인 실패: %s", label, result)
+                errors.append(label)
+                continue
+            if label == "치지직":
+                chzzk_live = result
+            else:
+                youtube_live = result
+        return chzzk_live, youtube_live, errors
+
+    async def _fetch_chzzk_latest_broadcast(self) -> ChzzkBroadcast | None:
+        try:
+            return await self.chzzk_client.fetch_latest_broadcast()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("치지직 최근 방송 확인 실패: %s", exc)
+        except Exception:
+            LOGGER.exception("치지직 최근 방송 확인 실패.")
+        return None
+
+    async def _fetch_youtube_latest_stream(self) -> YoutubeStream | None:
+        try:
+            return await self.youtube_client.fetch_latest_stream()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("유튜브 최근 방송 확인 실패: %s", exc)
+        except Exception:
+            LOGGER.exception("유튜브 최근 방송 확인 실패.")
+        return None
+
+    async def _resolve_broadcast_target_channel(
+        self,
+        interaction: discord.Interaction,
+        source_value: str,
+        channel: discord.TextChannel | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
+
+        if _broadcast_source_allows_chzzk(source_value):
+            chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+            if chzzk_target is not None:
+                resolved = await self._resolve_chzzk_target_channel(chzzk_target)
+                if isinstance(resolved, discord.TextChannel):
+                    return resolved
+
+        if _broadcast_source_allows_youtube(source_value):
+            youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+            if youtube_target is not None:
+                resolved = await self._resolve_youtube_target_channel(youtube_target)
+                if isinstance(resolved, discord.TextChannel):
+                    return resolved
+
+        return (
+            interaction.channel
+            if isinstance(interaction.channel, discord.TextChannel)
+            else None
+        )
+
+    @app_commands.command(name="방송알림설정", description="ProjectMoon Official 방송 시작 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
-    @app_commands.rename(enabled="허용", channel="채널")
+    @app_commands.rename(source="소스", enabled="허용", channel="채널")
     @app_commands.describe(
-        enabled="ProjectMoon Official 치지직 라이브 시작 알림을 켜거나 끕니다.",
-        channel="알림을 보낼 채널입니다. 비워두면 현재 채널 또는 기존 치지직 알림 채널을 사용합니다.",
+        source="알림을 받을 방송 소스입니다.",
+        enabled="선택한 방송 알림 구성을 켜거나 끕니다.",
+        channel="알림을 보낼 채널입니다. 비워두면 /서버설정 채널, 기존 방송 알림 채널, 현재 채널 순서로 사용합니다.",
     )
-    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    @app_commands.choices(source=BROADCAST_SOURCE_CHOICES, enabled=BOOLEAN_CHOICES)
+    async def configure_broadcast_notifications(
+        self,
+        interaction: discord.Interaction,
+        source: app_commands.Choice[str],
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        source_value = source.value
+        target_channel = await self._resolve_broadcast_target_channel(
+            interaction,
+            source_value,
+            channel,
+        )
+        if target_channel is None:
+            await interaction.followup.send(
+                "방송 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        chzzk_live: ChzzkLive | None = None
+        youtube_live: YoutubeLive | None = None
+        errors: list[str] = []
+        if enabled_value:
+            chzzk_live, youtube_live, errors = await self._fetch_broadcast_lives(source_value)
+
+        chzzk_enabled = bool(enabled_value and _broadcast_source_allows_chzzk(source_value))
+        youtube_enabled = bool(enabled_value and _broadcast_source_allows_youtube(source_value))
+        chzzk_target = self.storage.upsert_chzzk_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=chzzk_enabled,
+            last_live_id=chzzk_live.live_id if chzzk_live is not None else None,
+            is_live=chzzk_live is not None if chzzk_enabled else False,
+        )
+        youtube_target = self.storage.upsert_youtube_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=youtube_enabled,
+            last_live_id=youtube_live.video_id if youtube_live is not None else None,
+            is_live=youtube_live is not None if youtube_enabled else False,
+        )
+
+        lines = [
+            f"방송 알림 모드: {_broadcast_source_label(source_value)}",
+            f"채널: {target_channel.mention}",
+            f"치지직 알림: {_bool_label(chzzk_target.enabled)}",
+            f"유튜브 알림: {_bool_label(youtube_target.enabled)}",
+        ]
+        if chzzk_live is not None:
+            lines.append(f"치지직 현재 라이브 기준선: {chzzk_live.title}")
+        if youtube_live is not None:
+            lines.append(f"유튜브 현재 라이브 기준선: {youtube_live.title}")
+        if errors:
+            lines.append("확인 실패: " + ", ".join(errors))
+
+        embed = discord.Embed(
+            title="방송 알림 설정이 완료되었어요",
+            description="\n".join(lines),
+            color=_success_embed_color(),
+        )
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="방송알림해제", description="ProjectMoon Official 방송 시작 알림 설정을 해제합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(target="대상")
+    @app_commands.describe(target="해제할 방송 알림입니다. 현재 설정된 알림 중에서 고릅니다.")
+    async def remove_broadcast_notifications(
+        self,
+        interaction: discord.Interaction,
+        target: str,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        source_value = target if target in {
+            BROADCAST_SOURCE_BOTH,
+            BROADCAST_SOURCE_CHZZK,
+            BROADCAST_SOURCE_YOUTUBE,
+        } else ""
+        if not source_value:
+            chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+            youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+            await interaction.response.send_message(
+                "해제할 방송 알림을 현재 설정 목록에서 골라주세요.\n\n"
+                f"치지직 알림\n{_format_chzzk_target(chzzk_target, self.storage.get_settings(interaction.guild_id).role_id)}\n\n"
+                f"유튜브 알림\n{_format_youtube_target(youtube_target, self.storage.get_settings(interaction.guild_id).role_id)}",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        removed: list[str] = []
+        missing: list[str] = []
+        if _broadcast_source_allows_chzzk(source_value):
+            if self.storage.delete_chzzk_target(interaction.guild_id):
+                removed.append("치지직")
+            else:
+                missing.append("치지직")
+        if _broadcast_source_allows_youtube(source_value):
+            if self.storage.delete_youtube_target(interaction.guild_id):
+                removed.append("유튜브")
+            else:
+                missing.append("유튜브")
+
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+        settings = self.storage.get_settings(interaction.guild_id)
+        result = "해제한 방송 알림: " + (", ".join(removed) if removed else "없음")
+        if missing:
+            result += "\n이미 설정이 없던 방송 알림: " + ", ".join(missing)
+
+        embed = discord.Embed(
+            title="방송 알림 설정",
+            description=result,
+            color=_success_embed_color(),
+        )
+        embed.add_field(
+            name="치지직 알림",
+            value=_format_chzzk_target(chzzk_target, settings.role_id),
+            inline=False,
+        )
+        embed.add_field(
+            name="유튜브 알림",
+            value=_format_youtube_target(youtube_target, settings.role_id),
+            inline=False,
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @remove_broadcast_notifications.autocomplete("target")
+    async def remove_broadcast_notifications_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if interaction.guild_id is None:
+            return []
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+        choices: list[app_commands.Choice[str]] = []
+        if chzzk_target is not None and youtube_target is not None:
+            choices.append(
+                app_commands.Choice(
+                    name="치지직 & 유튜브 · 방송 알림 전체 해제",
+                    value=BROADCAST_SOURCE_BOTH,
+                )
+            )
+        if chzzk_target is not None:
+            choices.append(
+                app_commands.Choice(
+                    name=_broadcast_target_choice_name("치지직", chzzk_target.channel_id, chzzk_target.enabled, interaction),
+                    value=BROADCAST_SOURCE_CHZZK,
+                )
+            )
+        if youtube_target is not None:
+            choices.append(
+                app_commands.Choice(
+                    name=_broadcast_target_choice_name("유튜브", youtube_target.channel_id, youtube_target.enabled, interaction),
+                    value=BROADCAST_SOURCE_YOUTUBE,
+                )
+            )
+        if current:
+            current_lower = current.casefold()
+            choices = [choice for choice in choices if current_lower in choice.name.casefold()]
+        return choices[:25]
+
+    @app_commands.command(name="방송현황보기", description="ProjectMoon Official 방송 현황과 링크를 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(source="소스")
+    @app_commands.describe(source="확인할 방송 소스입니다. 비워두면 치지직과 유튜브를 모두 확인합니다.")
+    @app_commands.choices(source=BROADCAST_SOURCE_CHOICES)
+    async def broadcast_live_status(
+        self,
+        interaction: discord.Interaction,
+        source: app_commands.Choice[str] | None = None,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        source_value = _broadcast_source_value(source)
+        chzzk_live, youtube_live, errors = await self._fetch_broadcast_lives(source_value)
+        if interaction.guild_id is not None:
+            if _broadcast_source_allows_chzzk(source_value) and chzzk_live is None:
+                target = self.storage.get_chzzk_target(interaction.guild_id)
+                if target is not None and target.is_live:
+                    self.storage.mark_chzzk_target_offline(interaction.guild_id)
+            if _broadcast_source_allows_youtube(source_value) and youtube_live is None:
+                target = self.storage.get_youtube_target(interaction.guild_id)
+                if target is not None and target.is_live:
+                    self.storage.mark_youtube_target_offline(interaction.guild_id)
+
+        if errors and len(errors) == (
+            int(_broadcast_source_allows_chzzk(source_value))
+            + int(_broadcast_source_allows_youtube(source_value))
+        ):
+            await interaction.followup.send(
+                "방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        youtube_url = youtube_live.url if youtube_live is not None else PROJECT_MOON_YOUTUBE_STREAMS_URL
+        if _broadcast_source_allows_chzzk(source_value) and "치지직" not in errors:
+            if chzzk_live is None:
+                latest_chzzk = await self._fetch_chzzk_latest_broadcast()
+                await interaction.followup.send(
+                    embed=_embed_for_chzzk_offline(latest_chzzk),
+                    view=_chzzk_live_view(youtube_url),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await interaction.followup.send(
+                    content=PROJECT_MOON_CHZZK_LIVE_URL,
+                    embed=_embed_for_chzzk_live(chzzk_live),
+                    view=_chzzk_live_view(youtube_url),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+        if _broadcast_source_allows_youtube(source_value) and "유튜브" not in errors:
+            if youtube_live is None:
+                latest_youtube = await self._fetch_youtube_latest_stream()
+                await interaction.followup.send(
+                    embed=_embed_for_youtube_offline(latest_youtube),
+                    view=_youtube_live_view(latest_youtube.url if latest_youtube else PROJECT_MOON_YOUTUBE_STREAMS_URL),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await interaction.followup.send(
+                    content=youtube_live.url,
+                    embed=_embed_for_youtube_live(youtube_live),
+                    view=_youtube_live_view(youtube_live.url),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+
+        if errors:
+            await interaction.followup.send(
+                "확인 실패: " + ", ".join(errors),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @app_commands.command(name="방송알림보내기", description="현재 ProjectMoon Official 방송을 지정 채널에 보냅니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.rename(source="소스", channel="채널", role="역할")
+    @app_commands.describe(
+        source="보낼 방송 소스입니다. 비워두면 치지직과 유튜브를 모두 확인합니다.",
+        channel="보낼 채널입니다. 비워두면 /서버설정 채널 또는 방송 알림 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
+    )
+    @app_commands.choices(source=BROADCAST_SOURCE_CHOICES)
+    async def send_broadcast_live(
+        self,
+        interaction: discord.Interaction,
+        source: app_commands.Choice[str] | None = None,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        source_value = _broadcast_source_value(source)
+        target_channel = await self._resolve_broadcast_target_channel(
+            interaction,
+            source_value,
+            channel,
+        )
+        if target_channel is None:
+            await interaction.followup.send(
+                "방송을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        chzzk_live, youtube_live, errors = await self._fetch_broadcast_lives(source_value)
+        settings = self.storage.get_settings(interaction.guild_id)
+        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+        role_id = role.id if role else settings.role_id
+        sent: list[str] = []
+        skipped: list[str] = []
+
+        if _broadcast_source_allows_chzzk(source_value) and "치지직" not in errors:
+            if chzzk_live is None:
+                skipped.append("치지직: 방송 없음 / 오프라인")
+            elif _is_chzzk_live_too_old(chzzk_live):
+                if chzzk_target is not None:
+                    self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
+                skipped.append("치지직: 방송 시작 후 10분 이상 지남")
+            else:
+                try:
+                    message = await self._send_chzzk_live_to_channel(
+                        target_channel,
+                        chzzk_live,
+                        role_id=role_id if not sent else None,
+                        youtube_url=youtube_live.url if youtube_live is not None else None,
+                        include_youtube_button=not _broadcast_source_allows_youtube(source_value),
+                    )
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        "지정한 채널에 방송을 보낼 권한이 없어요.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                except discord.HTTPException:
+                    LOGGER.exception("치지직 라이브 수동 전송 실패.")
+                    await interaction.followup.send(
+                        "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+                if chzzk_target is not None:
+                    self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
+                sent.append("치지직")
+
+        if _broadcast_source_allows_youtube(source_value) and "유튜브" not in errors:
+            if youtube_live is None:
+                skipped.append("유튜브: 방송 없음 / 오프라인")
+            elif _is_youtube_live_too_old(youtube_live):
+                if youtube_target is not None:
+                    self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
+                skipped.append("유튜브: 방송 시작 후 10분 이상 지남")
+            else:
+                try:
+                    message = await self._send_youtube_live_to_channel(
+                        target_channel,
+                        youtube_live,
+                        role_id=role_id if not sent else None,
+                        include_chzzk_button=not _broadcast_source_allows_chzzk(source_value),
+                    )
+                except discord.Forbidden:
+                    await interaction.followup.send(
+                        "지정한 채널에 방송을 보낼 권한이 없어요.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                except discord.HTTPException:
+                    LOGGER.exception("유튜브 라이브 수동 전송 실패.")
+                    await interaction.followup.send(
+                        "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    return
+                await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+                if youtube_target is not None:
+                    self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
+                sent.append("유튜브")
+
+        for label in errors:
+            skipped.append(f"{label}: 방송 현황 확인 실패")
+
+        if not sent:
+            await interaction.followup.send(
+                "보낼 수 있는 현재 방송이 없어요.\n" + "\n".join(skipped),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        result = f"{target_channel.mention}에 {', '.join(sent)} 방송을 보냈어요."
+        if skipped:
+            result += "\n" + "\n".join(skipped)
+        await interaction.followup.send(
+            result,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     async def configure_chzzk_notifications(
         self,
         interaction: discord.Interaction,
@@ -3258,9 +3968,6 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="치지직방송현황", description="ProjectMoon Official 치지직 라이브 현황과 링크를 확인합니다.")
-    @app_commands.allowed_installs(guilds=True, users=True)
-    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def chzzk_live_status(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -3280,8 +3987,9 @@ class NewsCog(commands.Cog):
                 if target is not None and target.is_live:
                     self.storage.mark_chzzk_target_offline(interaction.guild_id)
             youtube_url = await self._youtube_latest_live_url()
+            latest_chzzk = await self._fetch_chzzk_latest_broadcast()
             await interaction.followup.send(
-                embed=_embed_for_chzzk_offline(),
+                embed=_embed_for_chzzk_offline(latest_chzzk),
                 view=_chzzk_live_view(youtube_url),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -3297,16 +4005,6 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    @app_commands.command(name="치지직방송보내기", description="현재 ProjectMoon Official 치지직 라이브를 지정 채널에 보냅니다.")
-    @app_commands.allowed_installs(guilds=True, users=False)
-    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
-    @app_commands.rename(channel="채널", role="역할")
-    @app_commands.describe(
-        channel="보낼 채널입니다. 비워두면 /서버설정 채널 또는 치지직 알림 채널을 사용합니다.",
-        role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
-    )
     async def send_chzzk_live(
         self,
         interaction: discord.Interaction,
@@ -3404,9 +4102,200 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def configure_youtube_notifications(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        current = self.storage.get_youtube_target(interaction.guild_id)
+        target_channel = channel
+        if target_channel is None and current is not None:
+            resolved = await self._resolve_youtube_target_channel(current)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None:
+            target_channel = (
+                interaction.channel
+                if isinstance(interaction.channel, discord.TextChannel)
+                else None
+            )
+        if target_channel is None:
+            await interaction.followup.send(
+                "유튜브 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        live = None
+        last_live_id = None
+        if enabled_value:
+            try:
+                live = await self.youtube_client.fetch_live()
+            except aiohttp.ClientError as exc:
+                LOGGER.warning("유튜브 현재 라이브 확인 실패: %s", exc)
+            if live is not None:
+                last_live_id = live.video_id
+
+        target = self.storage.upsert_youtube_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=enabled_value,
+            last_live_id=last_live_id,
+            is_live=live is not None if enabled_value else False,
+        )
+        live_text = f"\n현재 라이브 기준선: {live.title}" if live is not None else ""
+        await interaction.followup.send(
+            (
+                f"유튜브 라이브 알림: {_bool_label(target.enabled)}\n"
+                f"채널: <#{target.channel_id}>{live_text}"
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def youtube_live_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            live = await self.youtube_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("유튜브 방송 현황 확인 실패: %s", exc)
+            await interaction.followup.send(
+                "유튜브 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if live is None:
+            if interaction.guild_id is not None:
+                target = self.storage.get_youtube_target(interaction.guild_id)
+                if target is not None and target.is_live:
+                    self.storage.mark_youtube_target_offline(interaction.guild_id)
+            latest_youtube = await self._fetch_youtube_latest_stream()
+            await interaction.followup.send(
+                embed=_embed_for_youtube_offline(latest_youtube),
+                view=_youtube_live_view(latest_youtube.url if latest_youtube else PROJECT_MOON_YOUTUBE_STREAMS_URL),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await interaction.followup.send(
+            content=live.url,
+            embed=_embed_for_youtube_live(live),
+            view=_youtube_live_view(live.url),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def send_youtube_live(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            live = await self.youtube_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("유튜브 수동 전송용 방송 확인 실패: %s", exc)
+            await interaction.followup.send(
+                "유튜브 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        if live is None:
+            await interaction.followup.send(
+                "현재 ProjectMoon Official 유튜브 채널은 방송이 없고 오프라인 상태예요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+        if _is_youtube_live_too_old(live):
+            if youtube_target is not None:
+                self.storage.mark_youtube_target_seen(interaction.guild_id, live.video_id)
+            await interaction.followup.send(
+                "방송 시작 후 10분 이상 지나서 공지하지 않았어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        target_channel = channel
+        if target_channel is None and settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None and youtube_target is not None:
+            resolved = await self._resolve_youtube_target_channel(youtube_target)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None:
+            target_channel = (
+                interaction.channel
+                if isinstance(interaction.channel, discord.TextChannel)
+                else None
+            )
+        if target_channel is None:
+            await interaction.followup.send(
+                "유튜브 방송을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        role_id = role.id if role else settings.role_id
+        try:
+            message = await self._send_youtube_live_to_channel(
+                target_channel,
+                live,
+                role_id=role_id,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "지정한 채널에 유튜브 방송을 보낼 권한이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        except discord.HTTPException:
+            LOGGER.exception("유튜브 라이브 수동 전송 실패.")
+            await interaction.followup.send(
+                "유튜브 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        if youtube_target is not None:
+            self.storage.mark_youtube_target_seen(interaction.guild_id, live.video_id)
+
+        await interaction.followup.send(
+            f"{target_channel.mention}에 유튜브 방송을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     async def _youtube_latest_live_url(self) -> str:
         try:
-            return await self.chzzk_client.fetch_youtube_latest_live_url()
+            return await self.youtube_client.fetch_latest_live_url()
         except Exception as exc:
             LOGGER.warning("유튜브 최신 라이브 링크 확인 실패: %s", exc)
             return PROJECT_MOON_YOUTUBE_STREAMS_URL
@@ -3463,12 +4352,17 @@ class NewsCog(commands.Cog):
                 news_banner=banner_filename,
             )
 
-        await interaction.response.send_message(
-            (
+        embed = discord.Embed(
+            title="개인 설정이 완료되었어요",
+            description=(
                 f"개인 언어를 {_language_label(settings.language)}로 설정했어요.\n"
                 f"개인 알림 배너를 {_banner_display_name(settings.news_banner)}로 설정했어요.\n"
                 "앱으로 사용하는 /최근소식보기와 /이전소식보기에서 이 설정을 사용할게요."
             ),
+            color=_success_embed_color(),
+        )
+        await interaction.response.send_message(
+            embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -3490,7 +4384,16 @@ class NewsCog(commands.Cog):
             return
 
         self.storage.clear_role(interaction.guild_id)
-        await interaction.response.send_message("역할 핑을 제거했어요.", ephemeral=True)
+        embed = discord.Embed(
+            title="역할 핑을 제거했어요",
+            description="새 소식 알림에 역할 핑을 붙이지 않을게요.",
+            color=_success_embed_color(),
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @app_commands.command(name="서버설정초기화", description="이 서버의 림피 설정을 초기 상태로 되돌립니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -3516,9 +4419,10 @@ class NewsCog(commands.Cog):
                 f"공개 소식 전송: {_bool_label(settings.public_news_lookup_allowed)}\n"
                 f"알림 배너: {_banner_display_name(settings.notification_banner)}\n"
                 "치지직 알림: 미설정\n"
+                "유튜브 알림: 미설정\n"
                 "점검 알림: 꺼짐"
             ),
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
         await interaction.response.send_message(
             embed=embed,
@@ -3541,6 +4445,7 @@ class NewsCog(commands.Cog):
         settings = self.storage.get_settings(interaction.guild_id)
         targets = self.storage.list_news_targets(interaction.guild_id)
         chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         try:
             live = await self.chzzk_client.fetch_live()
         except aiohttp.ClientError as exc:
@@ -3549,6 +4454,14 @@ class NewsCog(commands.Cog):
             if live is None and chzzk_target is not None and chzzk_target.is_live:
                 self.storage.mark_chzzk_target_offline(interaction.guild_id)
                 chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        try:
+            youtube_live = await self.youtube_client.fetch_live()
+        except aiohttp.ClientError as exc:
+            LOGGER.warning("서버 설정 상태용 유튜브 방송 확인 실패: %s", exc)
+        else:
+            if youtube_live is None and youtube_target is not None and youtube_target.is_live:
+                self.storage.mark_youtube_target_offline(interaction.guild_id)
+                youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         target_languages = sorted({target.language for target in targets})
         if not target_languages:
             target_languages = [settings.language]
@@ -3594,6 +4507,11 @@ class NewsCog(commands.Cog):
         embed.add_field(
             name="치지직 알림",
             value=_format_chzzk_target(chzzk_target, settings.role_id),
+            inline=False,
+        )
+        embed.add_field(
+            name="유튜브 알림",
+            value=_format_youtube_target(youtube_target, settings.role_id),
             inline=False,
         )
 
@@ -3919,35 +4837,40 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/소식채널해제",
-            value="언어와 채널을 골라 자동 소식 채널 등록을 해제합니다. (서버 관리 권한 필요)",
+            value="현재 설정된 소식 채널 목록에서 채널과 언어를 골라 자동 소식 채널 등록을 해제합니다. (서버 관리 권한 필요)",
             inline=False,
         )
         embed.add_field(
             name="/점검알림설정",
             value=(
                 "매주 목요일 10:00(KST) 점검 시작과 12:00(KST) 업데이트 알림을 임베드로 보낼지 설정합니다.\n"
-                "채널을 비우면 현재 채널 또는 기존 점검 알림 채널을 사용합니다. (서버 관리 권한 필요)"
+                "채널을 비우면 현재 채널 또는 기존 점검 알림 채널을 사용하고, /서버설정 역할을 함께 멘션합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
         embed.add_field(
-            name="/치지직알림설정",
+            name="/방송알림설정",
             value=(
-                "ProjectMoon Official 치지직 라이브 시작 알림을 설정합니다.\n"
-                "채널을 비우면 현재 채널 또는 기존 치지직 알림 채널을 사용합니다. (서버 관리 권한 필요)"
+                "ProjectMoon Official 방송 시작 알림을 설정합니다.\n"
+                "소스에서 `치지직 & 유튜브`, `치지직`, `유튜브` 중 받을 알림을 고릅니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
         embed.add_field(
-            name="/치지직방송현황",
-            value="ProjectMoon Official 치지직 라이브 현황과 바로가기 링크를 봅니다.",
+            name="/방송알림해제",
+            value="현재 설정된 방송 알림 목록에서 치지직, 유튜브, 전체 해제 중 하나를 골라 해제합니다. (서버 관리 권한 필요)",
             inline=False,
         )
         embed.add_field(
-            name="/치지직방송보내기",
+            name="/방송현황보기",
+            value="ProjectMoon Official 치지직·유튜브 방송 현황과 바로가기 링크를 봅니다.",
+            inline=False,
+        )
+        embed.add_field(
+            name="/방송알림보내기",
             value=(
-                "현재 ProjectMoon Official 치지직 라이브를 지정 채널에 보냅니다.\n"
-                "채널과 역할을 비우면 /서버설정 또는 치지직 알림 설정 값을 사용합니다. (서버 관리 권한 필요)"
+                "현재 ProjectMoon Official 방송을 지정 채널에 보냅니다.\n"
+                "소스, 채널, 역할을 비우면 치지직·유튜브를 모두 확인하고 서버 설정 값을 사용합니다. (서버 관리 권한 필요)"
             ),
             inline=False,
         )
@@ -3958,12 +4881,12 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="/서버설정상태",
-            value="현재 봇 서버 설정, 뉴스 소스, 치지직 알림 설정을 보여줍니다. (서버 전용)",
+            value="현재 봇 서버 설정, 뉴스 소스, 치지직·유튜브 알림 설정을 보여줍니다. (서버 전용)",
             inline=False,
         )
         embed.add_field(
             name="/서버설정초기화",
-            value="서버 공통 설정, 언어별 소식 채널, 치지직 알림 설정, 읽음 기준선을 초기 상태로 되돌립니다. (서버 관리 권한 필요)",
+            value="서버 공통 설정, 언어별 소식 채널, 치지직·유튜브 알림 설정, 읽음 기준선을 초기 상태로 되돌립니다. (서버 관리 권한 필요)",
             inline=False,
         )
         embed.add_field(
@@ -4043,6 +4966,7 @@ class NewsCog(commands.Cog):
         settings, created = self.storage.ensure_guild_settings(interaction.guild_id)
         targets = self.storage.list_news_targets(interaction.guild_id)
         chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
+        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
 
         try:
             synced_commands = await self.bot.tree.sync()
@@ -4065,7 +4989,7 @@ class NewsCog(commands.Cog):
                 "현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인했어요.\n"
                 "이 명령어는 Steam 소식을 새로 불러오지 않아요."
             ),
-            color=discord.Color.from_rgb(179, 28, 28),
+            color=_success_embed_color(),
         )
         embed.add_field(
             name="서버 DB",
@@ -4094,6 +5018,11 @@ class NewsCog(commands.Cog):
         embed.add_field(
             name="치지직 알림",
             value=_format_chzzk_target(chzzk_target, settings.role_id),
+            inline=False,
+        )
+        embed.add_field(
+            name="유튜브 알림",
+            value=_format_youtube_target(youtube_target, settings.role_id),
             inline=False,
         )
         embed.add_field(
@@ -4499,19 +5428,74 @@ def _embed_for_chzzk_live_end() -> discord.Embed:
     return embed
 
 
-def _embed_for_chzzk_offline() -> discord.Embed:
+def _embed_for_chzzk_offline(previous: ChzzkBroadcast | None = None) -> discord.Embed:
     embed = discord.Embed(
         title="ProjectMoon Official은 현재 오프라인 상태입니다.",
         description="현재 치지직 채널에 진행 중인 방송이 없어요.",
         url=PROJECT_MOON_CHZZK_LIVE_URL,
         color=discord.Color.dark_gray(),
     )
+    if previous is not None:
+        lines = [f"[{previous.title}]({PROJECT_MOON_CHZZK_LIVE_URL})"]
+        if previous.open_date is not None:
+            lines.append(f"시작: {_format_kst(previous.open_date.replace(tzinfo=KST))}")
+        if previous.close_date is not None:
+            lines.append(f"종료: {_format_kst(previous.close_date.replace(tzinfo=KST))}")
+        embed.add_field(
+            name="전에 하였던 방송",
+            value="\n".join(lines)[:1024],
+            inline=False,
+        )
+        if previous.image_url:
+            embed.set_image(url=previous.image_url)
     embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_CHZZK_LIVE_URL)
     embed.set_footer(text="출처: CHZZK")
     return embed
 
 
-def _chzzk_live_view(youtube_url: str) -> discord.ui.View:
+def _embed_for_youtube_live(live: YoutubeLive) -> discord.Embed:
+    embed = discord.Embed(
+        title=live.title[:256],
+        description="ProjectMoon Official 유튜브 라이브가 시작되었습니다.",
+        url=live.url,
+        color=discord.Color.from_rgb(255, 0, 0),
+    )
+    if live.thumbnail_url:
+        embed.set_image(url=live.thumbnail_url)
+    if live.start_time is not None:
+        embed.timestamp = live.start_time
+        embed.set_footer(text=f"출처: YouTube · 시작: {_format_kst(live.start_time)}")
+    else:
+        embed.set_footer(text="출처: YouTube")
+    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_STREAMS_URL)
+    return embed
+
+
+def _embed_for_youtube_offline(previous: YoutubeStream | None = None) -> discord.Embed:
+    embed = discord.Embed(
+        title="ProjectMoon Official 유튜브는 현재 오프라인 상태입니다.",
+        description="현재 유튜브 채널에 진행 중인 라이브가 없어요.",
+        url=PROJECT_MOON_YOUTUBE_STREAMS_URL,
+        color=discord.Color.dark_gray(),
+    )
+    if previous is not None:
+        embed.add_field(
+            name="전에 하였던 방송",
+            value=f"[{previous.title}]({previous.url})"[:1024],
+            inline=False,
+        )
+        if previous.thumbnail_url:
+            embed.set_image(url=previous.thumbnail_url)
+    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_STREAMS_URL)
+    embed.set_footer(text="출처: YouTube")
+    return embed
+
+
+def _chzzk_live_view(
+    youtube_url: str | None = None,
+    *,
+    include_youtube: bool = True,
+) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
@@ -4520,6 +5504,23 @@ def _chzzk_live_view(youtube_url: str) -> discord.ui.View:
             url=PROJECT_MOON_CHZZK_LIVE_URL,
         )
     )
+    if include_youtube and youtube_url:
+        view.add_item(
+            discord.ui.Button(
+                label="YouTube 바로가기",
+                style=discord.ButtonStyle.link,
+                url=youtube_url,
+            )
+        )
+    return view
+
+
+def _youtube_live_view(
+    youtube_url: str,
+    *,
+    include_chzzk: bool = False,
+) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
     view.add_item(
         discord.ui.Button(
             label="YouTube 바로가기",
@@ -4527,6 +5528,14 @@ def _chzzk_live_view(youtube_url: str) -> discord.ui.View:
             url=youtube_url,
         )
     )
+    if include_chzzk:
+        view.add_item(
+            discord.ui.Button(
+                label="CHZZK 바로가기",
+                style=discord.ButtonStyle.link,
+                url=PROJECT_MOON_CHZZK_LIVE_URL,
+            )
+        )
     return view
 
 
@@ -4603,6 +5612,10 @@ def _post_embed_color(post: NewsPost) -> discord.Color:
     return discord.Color.from_rgb(179, 28, 28)
 
 
+def _success_embed_color() -> discord.Color:
+    return discord.Color.green()
+
+
 def _truncate_component_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -4643,11 +5656,16 @@ def _current_maintenance_notice() -> tuple[str | None, str | None]:
     return None, None
 
 
-def _maintenance_embed(title: str, description: str) -> discord.Embed:
+def _maintenance_embed(
+    title: str,
+    description: str,
+    *,
+    color: discord.Color,
+) -> discord.Embed:
     return discord.Embed(
         title=title,
         description=description,
-        color=discord.Color.from_rgb(179, 28, 28),
+        color=color,
         timestamp=datetime.now(timezone.utc),
     )
 
@@ -4713,12 +5731,74 @@ def _format_chzzk_target(target: GuildChzzkTarget | None, role_id: int | None) -
     )
 
 
+def _format_youtube_target(target: GuildYoutubeTarget | None, role_id: int | None) -> str:
+    role_text = f"<@&{role_id}>" if role_id else "없음"
+    if target is None:
+        return (
+            "상태: 미설정\n"
+            "채널: 미설정\n"
+            f"역할 핑: 시작 알림만 {role_text}\n"
+            "최근 라이브 기준선: 없음"
+        )
+
+    return (
+        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
+        f"채널: <#{target.channel_id}>\n"
+        f"역할 핑: 시작 알림만 {role_text}\n"
+        f"현재 방송 상태: {'방송중' if target.is_live else '방송 없음 / 오프라인'}\n"
+        f"최근 라이브 기준선: {target.last_live_id or '없음'}"
+    )
+
+
 
 
 def _choice_bool(choice: app_commands.Choice[str] | None, default: bool | None = None) -> bool | None:
     if choice is None:
         return default
     return choice.value == BOOLEAN_TRUE
+
+
+def _broadcast_source_value(choice: app_commands.Choice[str] | None) -> str:
+    return choice.value if choice is not None else BROADCAST_SOURCE_BOTH
+
+
+def _broadcast_source_allows_chzzk(value: str) -> bool:
+    return value in {BROADCAST_SOURCE_BOTH, BROADCAST_SOURCE_CHZZK}
+
+
+def _broadcast_source_allows_youtube(value: str) -> bool:
+    return value in {BROADCAST_SOURCE_BOTH, BROADCAST_SOURCE_YOUTUBE}
+
+
+def _broadcast_source_label(value: str) -> str:
+    if value == BROADCAST_SOURCE_CHZZK:
+        return "치지직"
+    if value == BROADCAST_SOURCE_YOUTUBE:
+        return "유튜브"
+    return "치지직 & 유튜브"
+
+
+def _news_target_choice_value(channel_id: int, language: str) -> str:
+    return f"{channel_id}:{language}"
+
+
+def _parse_news_target_choice(value: str) -> tuple[int, str] | None:
+    channel_id_text, separator, language = value.partition(":")
+    if not separator or not channel_id_text.isdigit() or not language:
+        return None
+    return int(channel_id_text), language
+
+
+def _broadcast_target_choice_name(
+    label: str,
+    channel_id: int,
+    enabled: bool,
+    interaction: discord.Interaction,
+) -> str:
+    channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
+    channel_name = f"#{channel.name}" if isinstance(channel, discord.TextChannel) else f"채널 {channel_id}"
+    enabled_text = "켜짐" if enabled else "꺼짐"
+    return f"{label} · {channel_name} · {enabled_text}"[:100]
 
 
 def _bool_label(value: bool) -> str:
@@ -4894,6 +5974,12 @@ def _is_chzzk_live_too_old(live: ChzzkLive) -> bool:
     if opened_at.tzinfo is None:
         opened_at = opened_at.replace(tzinfo=KST)
     return datetime.now(KST) - opened_at.astimezone(KST) >= CHZZK_LIVE_ANNOUNCE_MAX_AGE
+
+
+def _is_youtube_live_too_old(live: YoutubeLive) -> bool:
+    if live.start_time is None:
+        return False
+    return datetime.now(KST) - live.start_time.astimezone(KST) >= YOUTUBE_LIVE_ANNOUNCE_MAX_AGE
 
 
 def _is_chzzk_live_recently_closed(

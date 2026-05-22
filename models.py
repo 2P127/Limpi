@@ -82,6 +82,17 @@ class GuildChzzkTarget:
 
 
 @dataclass(frozen=True)
+class GuildYoutubeTarget:
+    guild_id: int
+    channel_id: int
+    enabled: bool
+    last_live_id: str | None
+    is_live: bool
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
 class UserSettings:
     user_id: int
     username: str

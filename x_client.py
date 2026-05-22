@@ -151,7 +151,7 @@ class LimbusXClient:
         ) as resp:
             if resp.status >= 400:
                 body = await resp.text()
-                raise XClientError(f"UserByScreenName {resp.status}: {body[:200]}")
+                raise XClientError(_format_x_http_error("UserByScreenName", resp, body))
             data = await resp.json(content_type=None)
         user = data.get("data", {}).get("user", {}).get("result", {})
         user_id = str(user.get("rest_id") or "").strip()
@@ -235,7 +235,7 @@ class LimbusXClient:
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    raise XClientError(f"UserTweetsAndReplies {resp.status}: {body[:200]}")
+                    raise XClientError(_format_x_http_error("UserTweetsAndReplies", resp, body))
                 data = await resp.json(content_type=None)
 
             page_posts = _extract_twitter_posts(data, username)
@@ -304,6 +304,28 @@ def _graphql_url(query_id: str, operation_name: str) -> str:
 def _is_rate_limit_error(exc: XClientError) -> bool:
     message = str(exc).lower()
     return " 429" in message or "rate limit" in message
+
+
+def _format_x_http_error(operation: str, response: Any, body: str) -> str:
+    body_text = body.strip()
+    body_summary = body_text[:200] if body_text else "<empty body>"
+    details = [
+        f"reason={response.reason or 'unknown'}",
+        f"body={body_summary}",
+    ]
+    content_type = response.headers.get("content-type")
+    retry_after = response.headers.get("retry-after")
+    rate_limit_reset = response.headers.get("x-rate-limit-reset")
+    rate_limit_remaining = response.headers.get("x-rate-limit-remaining")
+    if content_type:
+        details.append(f"content_type={content_type}")
+    if retry_after:
+        details.append(f"retry_after={retry_after}")
+    if rate_limit_reset:
+        details.append(f"x_rate_limit_reset={rate_limit_reset}")
+    if rate_limit_remaining:
+        details.append(f"x_rate_limit_remaining={rate_limit_remaining}")
+    return f"{operation} {response.status}: " + "; ".join(details)
 
 
 def _next_cursor_from_payload(payload: dict[str, Any]) -> str | None:

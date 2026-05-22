@@ -15,6 +15,7 @@ from models import (
     GuildChzzkTarget,
     GuildNewsTarget,
     GuildTwitterTarget,
+    GuildYoutubeTarget,
     GuildSettings,
     NewsPost,
     TrackedMessage,
@@ -159,6 +160,17 @@ class SQLiteStorage:
                 updated_at TEXT NOT NULL
             )
         """,
+        "guild_youtube_targets": """
+            CREATE TABLE IF NOT EXISTS guild_youtube_targets (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_live_id TEXT,
+                is_live INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
         "guild_news_target_seen_posts": """
             CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
                 target_id INTEGER NOT NULL,
@@ -248,6 +260,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_chzzk_targets_channel
                 ON guild_chzzk_targets(channel_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_youtube_targets_channel
+                ON guild_youtube_targets(channel_id)
                 """
             )
             self._dedupe_news_target_channels()
@@ -892,6 +910,24 @@ class SQLiteStorage:
             self._connection.commit()
             return True
 
+    def delete_chzzk_target(self, guild_id: int) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM guild_chzzk_targets WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.commit()
+        return cursor.rowcount > 0
+
+    def delete_youtube_target(self, guild_id: int) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM guild_youtube_targets WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.commit()
+        return cursor.rowcount > 0
+
     def get_twitter_target(self, guild_id: int) -> GuildTwitterTarget | None:
         with self._lock:
             row = self._connection.execute(
@@ -1072,6 +1108,108 @@ class SQLiteStorage:
             self._connection.execute(
                 """
                 UPDATE guild_chzzk_targets
+                SET is_live = 0, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (now, guild_id),
+            )
+            self._connection.commit()
+
+    def get_youtube_target(self, guild_id: int) -> GuildYoutubeTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
+                FROM guild_youtube_targets
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return self._row_to_youtube_target(row) if row is not None else None
+
+    def list_youtube_targets(self) -> list[GuildYoutubeTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
+                FROM guild_youtube_targets
+                WHERE enabled = 1
+                ORDER BY guild_id
+                """
+            ).fetchall()
+        return [self._row_to_youtube_target(row) for row in rows]
+
+    def upsert_youtube_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        enabled: bool = True,
+        last_live_id: str | None = None,
+        is_live: bool | None = None,
+    ) -> GuildYoutubeTarget:
+        current = self.get_youtube_target(guild_id)
+        now = _now_iso()
+        next_last_live_id = (
+            last_live_id if last_live_id is not None else (
+                current.last_live_id if current is not None else None
+            )
+        )
+        next_is_live = is_live if is_live is not None else (
+            current.is_live if current is not None else False
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO guild_youtube_targets (
+                    guild_id, channel_id, enabled, last_live_id, is_live, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    enabled = excluded.enabled,
+                    last_live_id = COALESCE(
+                        excluded.last_live_id,
+                        guild_youtube_targets.last_live_id
+                    ),
+                    is_live = excluded.is_live,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    int(enabled),
+                    next_last_live_id,
+                    int(next_is_live),
+                    now,
+                    now,
+                ),
+            )
+            self._connection.commit()
+        target = self.get_youtube_target(guild_id)
+        if target is None:
+            raise RuntimeError("Failed to upsert guild youtube target")
+        return target
+
+    def mark_youtube_target_seen(self, guild_id: int, live_id: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_youtube_targets
+                SET last_live_id = ?, is_live = 1, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (live_id, now, guild_id),
+            )
+            self._connection.commit()
+
+    def mark_youtube_target_offline(self, guild_id: int) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_youtube_targets
                 SET is_live = 0, updated_at = ?
                 WHERE guild_id = ?
                 """,
@@ -1930,6 +2068,9 @@ class SQLiteStorage:
                 "DELETE FROM guild_chzzk_targets WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
+                "DELETE FROM guild_youtube_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
@@ -1999,6 +2140,18 @@ class SQLiteStorage:
     @staticmethod
     def _row_to_chzzk_target(row: sqlite3.Row) -> GuildChzzkTarget:
         return GuildChzzkTarget(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            enabled=bool(row["enabled"]),
+            last_live_id=row["last_live_id"],
+            is_live=bool(row["is_live"]),
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_youtube_target(row: sqlite3.Row) -> GuildYoutubeTarget:
+        return GuildYoutubeTarget(
             guild_id=int(row["guild_id"]),
             channel_id=int(row["channel_id"]),
             enabled=bool(row["enabled"]),
