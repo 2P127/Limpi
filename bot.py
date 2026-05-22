@@ -26,7 +26,7 @@ from chzzk_client import (
     ChzzkLive,
     PROJECT_MOON_CHZZK_LIVE_URL,
 )
-from config import AppConfig
+from config import AppConfig, BOT_VERSION
 from models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, GuildYoutubeTarget, NewsPost, TwitterPost
 from storage import (
     DEFAULT_NOTIFICATION_BANNER,
@@ -5964,8 +5964,10 @@ def _datetime_from_raw_timestamp(value: object) -> datetime | None:
 
 
 def _format_kst(value: datetime) -> str:
-    return value.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
-
+    dt = value.astimezone(KST)
+    ampm = "오전" if dt.hour < 12 else "오후"
+    hour = dt.hour % 12 or 12
+    return f"{dt.year}년 {dt.month}월 {dt.day}일 {ampm} {hour}시 {dt.minute:02d}분"
 
 def _is_chzzk_live_too_old(live: ChzzkLive) -> bool:
     if live.open_date is None:
@@ -6206,7 +6208,7 @@ async def main() -> None:
 
         @bot.event
         async def on_ready() -> None:
-            LOGGER.info("%s (%s)로 로그인했습니다.", bot.user, bot.user.id if bot.user else "unknown")
+            LOGGER.info("림피 v%s — %s (%s)로 로그인했습니다.", BOT_VERSION, bot.user, bot.user.id if bot.user else "unknown")
             await cog.update_presence_status(show_servers=True)
             if not bot._logged_startup_summary:
                 cog.log_startup_summary()
@@ -6285,4 +6287,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
 

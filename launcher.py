@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import multiprocessing
 import signal
@@ -27,6 +27,11 @@ from PIL import Image, ImageDraw
 import psutil
 import pystray
 
+
+def _fmt_dt(dt: datetime.datetime) -> str:
+    ampm = "오전" if dt.hour < 12 else "오후"
+    h = dt.hour % 12 or 12
+    return f"{dt.year}년 {dt.month}월 {dt.day}일 {ampm} {h}시 {dt.minute:02d}분 {dt.second:02d}초"
 if getattr(sys, "frozen", False):
     _BASE = os.path.dirname(sys.executable)
     PYTHON = sys.executable
@@ -69,7 +74,7 @@ class BotProcess:
             if self.proc and self.proc.poll() is None:
                 return
             self.start_time = datetime.datetime.now()
-            self.on_log(f"[시스템] 봇 시작 중… ({self.start_time.strftime('%Y-%m-%d %H:%M:%S')})")
+            self.on_log(f"[시스템] 봇 시작 중… ({_fmt_dt(self.start_time)})")
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
@@ -148,7 +153,7 @@ class BotProcess:
     def start_time_str(self) -> str:
         if not self.start_time:
             return ""
-        return self.start_time.strftime("%Y-%m-%d %H:%M:%S")
+        return _fmt_dt(self.start_time)
 
     def metrics(self) -> tuple[float | None, float | None]:
         proc = self._psutil

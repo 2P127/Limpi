@@ -1,5 +1,8 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+$botVersion = (Select-String -Path "$root\config.py" -Pattern '^BOT_VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+if (-not $botVersion) { throw "config.py에서 BOT_VERSION을 찾을 수 없습니다." }
 
 $iconPath = "$root\logo.ico"
 if (-not (Test-Path $iconPath)) {
@@ -21,7 +24,7 @@ $pyInstallerArgs = @(
     "--onefile",
     "--windowed",
     "--icon=$iconPath",
-    "--name=Limpi",
+    "--name=Limpi-$botVersion",
     "--hidden-import=bot",
     "--hidden-import=config",
     "--hidden-import=models",
@@ -48,6 +51,7 @@ $pyInstallerArgs += "$root\launcher.py"
 & "$root\.venv\Scripts\pyinstaller.exe" @pyInstallerArgs
 
 Write-Host ""
-Write-Host "Build complete: $root\dist\Limpi.exe"
-$size = [math]::Round((Get-Item "$root\dist\Limpi.exe").Length / 1MB, 1)
+Write-Host "Build complete: $root\dist\Limpi-$botVersion.exe"
+$size = [math]::Round((Get-Item "$root\dist\Limpi-$botVersion.exe").Length / 1MB, 1)
 Write-Host "Size: $size MB"
+
