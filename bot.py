@@ -47,6 +47,7 @@ KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 80
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
+AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
 TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 30
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -579,18 +580,12 @@ class NewsCog(commands.Cog):
         async with self._twitter_poll_lock:
             try:
                 now = datetime.now(timezone.utc)
-                currently_in_window = self._is_high_frequency_window(now)
-                if currently_in_window and not self._in_high_frequency_twitter_window:
+                if not self._in_high_frequency_twitter_window:
                     LOGGER.info(
-                        "X 고빈도 추적 시작 (KST %s시~%s시, 요일 필터: %s, 간격: %s초).",
-                        self.config.high_frequency_start_hour,
-                        self.config.high_frequency_end_hour,
-                        self.config.high_frequency_weekdays,
+                        "X 24시간 추적 시작 (간격: %s초).",
                         TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS,
                     )
-                elif not currently_in_window and self._in_high_frequency_twitter_window:
-                    LOGGER.info("X 고빈도 추적 종료.")
-                self._in_high_frequency_twitter_window = currently_in_window
+                    self._in_high_frequency_twitter_window = True
 
                 if not self._should_poll_twitter_now(now):
                     return
@@ -933,6 +928,36 @@ class NewsCog(commands.Cog):
             source_mode=source_mode,
         )[:limit]
 
+    def _autocomplete_cached_posts(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[NewsPost]:
+        language = self._interaction_language(interaction)
+        settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
+        source_mode = _selected_source_mode(interaction)
+        return self._combined_cached_posts(
+            current,
+            limit=AUTOCOMPLETE_CHOICE_LIMIT,
+            language=language,
+            settings=settings,
+            source_mode=source_mode,
+        )
+
+    async def _news_post_autocomplete_choices(
+        self, interaction: discord.Interaction, current: str, command_name: str
+    ) -> list[app_commands.Choice[str]]:
+        try:
+            posts = await asyncio.wait_for(
+                asyncio.to_thread(self._autocomplete_cached_posts, interaction, current),
+                timeout=AUTOCOMPLETE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            LOGGER.warning("%s 게시물 자동완성 지연: %.1f초 초과", command_name, AUTOCOMPLETE_TIMEOUT_SECONDS)
+            return []
+        except Exception:
+            LOGGER.exception("%s 게시물 자동완성 실패.", command_name)
+            return []
+        return _post_autocomplete_choices(posts)
+
     def _get_combined_post(
         self,
         value: str,
@@ -1163,9 +1188,7 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
-        if self._is_high_frequency_window(now):
-            return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
-        return self.config.poll_interval_seconds
+        return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
         if self._is_high_frequency_window(now):
@@ -4581,20 +4604,7 @@ class NewsCog(commands.Cog):
     async def previous_news_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        language = self._interaction_language(interaction)
-        settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        source_mode = _selected_source_mode(interaction)
-        posts = self._combined_cached_posts(
-            current,
-            limit=AUTOCOMPLETE_CHOICE_LIMIT,
-            language=language,
-            settings=settings,
-            source_mode=source_mode,
-        )
-        return [
-            app_commands.Choice(name=_choice_name(post, include_language=False, include_source=False), value=post.post_id)
-            for post in posts
-        ]
+        return await self._news_post_autocomplete_choices(interaction, current, "이전소식보기")
 
     @app_commands.command(name="최근소식보기", description="가장 최근 림버스 컴퍼니 소식을 즉시 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -4781,23 +4791,7 @@ class NewsCog(commands.Cog):
     async def send_news_autocomplete(
         self, interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        language = self._interaction_language(interaction)
-        settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        source_mode = _selected_source_mode(interaction)
-        posts = self._combined_cached_posts(
-            current,
-            limit=AUTOCOMPLETE_CHOICE_LIMIT,
-            language=language,
-            settings=settings,
-            source_mode=source_mode,
-        )
-        return [
-            app_commands.Choice(
-                name=_choice_name(post, include_language=False, include_source=False),
-                value=post.post_id,
-            )
-            for post in posts
-        ]
+        return await self._news_post_autocomplete_choices(interaction, current, "소식보내기")
 
     @app_commands.command(name="명령어", description="림피의 모든 명령어 사용법을 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -6036,6 +6030,25 @@ def _choice_name(
     return f"{prefix}{title[: max_title_length - 3]}..."
 
 
+def _post_autocomplete_choices(posts: list[NewsPost]) -> list[app_commands.Choice[str]]:
+    choices: list[app_commands.Choice[str]] = []
+    seen_values: set[str] = set()
+    for post in posts:
+        value = str(post.post_id)
+        if value in seen_values:
+            continue
+        choices.append(
+            app_commands.Choice(
+                name=_choice_name(post, include_language=False, include_source=False),
+                value=value,
+            )
+        )
+        seen_values.add(value)
+        if len(choices) >= AUTOCOMPLETE_CHOICE_LIMIT:
+            break
+    return choices
+
+
 def _twitter_choice_name(post: TwitterPost) -> str:
     title = post.title.strip() or post.post_id
     if post.created_at:
@@ -6149,6 +6162,16 @@ def _safe_zip_filename(post: NewsPost) -> str:
     return f"림버스_소식_({cleaned}).zip"
 
 
+def _log_level_from_env() -> int:
+    raw = os.getenv("LIMPI_LOG_LEVEL", "INFO").strip().upper()
+    if not raw:
+        return logging.INFO
+    if raw.isdigit():
+        return int(raw)
+    level = logging.getLevelName(raw)
+    return level if isinstance(level, int) else logging.INFO
+
+
 async def main() -> None:
     _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
     _log_dir = os.path.join(_base, "logs")
@@ -6158,9 +6181,18 @@ async def main() -> None:
         _log_dir,
         f"limpi_{_now.strftime('%Y-%m-%d')}-{_now.hour}_{_now.strftime('%M_%S')}.log",
     )
+    _debug_log_file = os.path.join(
+        _log_dir,
+        f"limpi_{_now.strftime('%Y-%m-%d')}-{_now.hour}_{_now.strftime('%M_%S')}-debug.log",
+    )
     _fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _log_level = _log_level_from_env()
     _file_handler = logging.FileHandler(_log_file, encoding="utf-8")
+    _file_handler.setLevel(_log_level)
     _file_handler.setFormatter(_fmt)
+    _debug_file_handler = logging.FileHandler(_debug_log_file, encoding="utf-8")
+    _debug_file_handler.setLevel(logging.DEBUG)
+    _debug_file_handler.setFormatter(_fmt)
     import io as _io
     _stdout_stream = (
         _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
@@ -6168,8 +6200,16 @@ async def main() -> None:
         else sys.stdout
     )
     _console_handler = logging.StreamHandler(_stdout_stream)
+    _console_handler.setLevel(_log_level)
     _console_handler.setFormatter(_fmt)
-    logging.basicConfig(level=logging.INFO, handlers=[_file_handler, _console_handler])
+    logging.basicConfig(
+        level=logging.DEBUG,
+        handlers=[_file_handler, _debug_file_handler, _console_handler],
+        force=True,
+    )
+    logging.captureWarnings(True)
+    LOGGER.info("로그 파일: %s (level=%s)", _log_file, logging.getLevelName(_log_level))
+    LOGGER.info("디버그 로그 파일: %s", _debug_log_file)
 
     class _DropExpiredInteraction(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
