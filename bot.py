@@ -48,7 +48,8 @@ NEWS_POST_LIMIT = 80
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
-TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 30
+TWITTER_POLL_INTERVAL_SECONDS = 20
+TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 10
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -582,7 +583,8 @@ class NewsCog(commands.Cog):
                 now = datetime.now(timezone.utc)
                 if not self._in_high_frequency_twitter_window:
                     LOGGER.info(
-                        "X 24시간 추적 시작 (간격: %s초).",
+                        "X 24시간 추적 시작 (기본 간격: %s초, 고빈도 간격: %s초).",
+                        TWITTER_POLL_INTERVAL_SECONDS,
                         TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS,
                     )
                     self._in_high_frequency_twitter_window = True
@@ -867,8 +869,13 @@ class NewsCog(commands.Cog):
 
         posts_by_language: dict[str, list[NewsPost]] = {}
         all_posts: list[NewsPost] = []
-        for language in SYNC_LANGUAGES:
-            posts = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
+        results = await asyncio.gather(
+            *(
+                self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
+                for language in SYNC_LANGUAGES
+            )
+        )
+        for language, posts in zip(SYNC_LANGUAGES, results):
             posts_by_language[language] = posts[:NEWS_POST_LIMIT]
             all_posts.extend(posts_by_language[language])
 
@@ -1188,7 +1195,9 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
-        return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
+        if self._is_high_frequency_window(now):
+            return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
+        return TWITTER_POLL_INTERVAL_SECONDS
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
         if self._is_high_frequency_window(now):
@@ -1267,10 +1276,11 @@ class NewsCog(commands.Cog):
             )
             self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
             LOGGER.info(
-                "새 뉴스 공지 (guild %s, channel %s, language %s): %s",
+                "새 뉴스 공지 (guild %s, channel %s, language %s, delay=%s초): %s",
                 target.guild_id,
                 target.channel_id,
                 target.language,
+                _post_delay_seconds(post),
                 post.title,
             )
             announced += 1
@@ -1430,7 +1440,12 @@ class NewsCog(commands.Cog):
                 )
                 continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
-            LOGGER.info("새 뉴스 공지 (guild %s): %s", settings.guild_id, post.title)
+            LOGGER.info(
+                "새 뉴스 공지 (guild %s, delay=%s초): %s",
+                settings.guild_id,
+                _post_delay_seconds(post),
+                post.title,
+            )
             announced += 1
 
         if failed_post_ids and not settings.missed_news_recovery_enabled:
@@ -1766,22 +1781,31 @@ class NewsCog(commands.Cog):
 
         youtube_content = _youtube_links_content(post)
         if youtube_content:
-            await channel.send(
-                content=youtube_content,
-                allowed_mentions=discord.AllowedMentions.none(),
+            task = asyncio.create_task(
+                channel.send(
+                    content=youtube_content,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
             )
+            task.add_done_callback(self._log_background_task_result)
         if _is_twitter_news_post(post):
             video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
             video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
             if video_url_groups:
-                await self._send_twitter_video_to_channel(
-                    channel, video_url_groups, video_fallback_url or post.url
+                task = asyncio.create_task(
+                    self._send_twitter_video_to_channel(
+                        channel, video_url_groups, video_fallback_url or post.url
+                    )
                 )
+                task.add_done_callback(self._log_background_task_result)
             elif video_fallback_url:
-                await channel.send(
-                    content=video_fallback_url,
-                    allowed_mentions=discord.AllowedMentions.none(),
+                task = asyncio.create_task(
+                    channel.send(
+                        content=video_fallback_url,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 )
+                task.add_done_callback(self._log_background_task_result)
         self._schedule_channel_image_messages(
             channel,
             post,
@@ -2546,9 +2570,10 @@ class NewsCog(commands.Cog):
                     continue
                 self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
                 LOGGER.info(
-                    "새 X 게시물 공지 (guild %s, channel %s): %s",
+                    "새 X 게시물 공지 (guild %s, channel %s, delay=%s초): %s",
                     target.guild_id,
                     target.channel_id,
+                    _twitter_post_delay_seconds(post),
                     post.title,
                 )
                 announced += 1
@@ -5893,6 +5918,22 @@ def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
         if created_at >= cutoff:
             recent.append(post)
     return recent
+
+
+def _delay_seconds(value: datetime | None) -> int | str:
+    if value is None:
+        return "unknown"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - value.astimezone(timezone.utc)).total_seconds()))
+
+
+def _post_delay_seconds(post: NewsPost) -> int | str:
+    return _delay_seconds(post.created_at)
+
+
+def _twitter_post_delay_seconds(post: TwitterPost) -> int | str:
+    return _delay_seconds(post.created_at)
 
 
 def _normalize_news_text(value: str) -> str:

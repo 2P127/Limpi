@@ -14,6 +14,8 @@ from config import AppConfig
 from models import TwitterPost
 
 LOGGER = logging.getLogger(__name__)
+X_POST_CACHE_TTL = timedelta(seconds=5)
+X_RATE_LIMIT_BACKOFF = timedelta(minutes=1)
 
 _VIDEO_THUMBNAIL_URL_FRAGMENTS = (
     "/ext_tw_video_thumb/",
@@ -168,7 +170,7 @@ class LimbusXClient:
             )
         async with self._fetch_lock:
             now = datetime.now(timezone.utc)
-            if self._cached_posts and self._cached_at and now - self._cached_at < timedelta(minutes=2):
+            if self._cached_posts and self._cached_at and now - self._cached_at < X_POST_CACHE_TTL:
                 return self._cached_posts[:limit]
             if self._rate_limited_until and now < self._rate_limited_until:
                 if self._cached_posts:
@@ -185,7 +187,7 @@ class LimbusXClient:
                 posts = await self._fetch_via_twitter_api(limit=limit)
             except XClientError as exc:
                 if _is_rate_limit_error(exc):
-                    self._rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+                    self._rate_limited_until = datetime.now(timezone.utc) + X_RATE_LIMIT_BACKOFF
                     if self._cached_posts:
                         LOGGER.warning(
                             "X API rate limit으로 캐시된 게시물을 사용합니다 (until=%s).",
