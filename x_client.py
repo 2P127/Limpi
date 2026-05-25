@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -10,12 +11,18 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import aiohttp
+
 from config import AppConfig
 from models import TwitterPost
 
 LOGGER = logging.getLogger(__name__)
 X_POST_CACHE_TTL = timedelta(seconds=5)
 X_RATE_LIMIT_BACKOFF = timedelta(minutes=1)
+X_RATE_LIMIT_BACKOFF_MAX = timedelta(minutes=10)
+X_RATE_LIMIT_RESET_CAP = timedelta(minutes=20)
+X_SERVER_ERROR_BACKOFF = timedelta(seconds=30)
+X_SERVER_ERROR_BACKOFF_MAX = timedelta(minutes=5)
 
 _VIDEO_THUMBNAIL_URL_FRAGMENTS = (
     "/ext_tw_video_thumb/",
@@ -102,6 +109,18 @@ class XClientError(RuntimeError):
     pass
 
 
+class XRateLimitError(XClientError):
+    def __init__(self, message: str, reset_at: datetime | None = None) -> None:
+        super().__init__(message)
+        self.reset_at = reset_at
+
+
+class XServerError(XClientError):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class LimbusXClient:
     def __init__(self, config: AppConfig, session: Any) -> None:
         self.config = config
@@ -111,6 +130,9 @@ class LimbusXClient:
         self._cached_posts: list[TwitterPost] = []
         self._cached_at: datetime | None = None
         self._rate_limited_until: datetime | None = None
+        self._rate_limit_failures: int = 0
+        self._server_error_failures: int = 0
+        self._last_backoff_log_until: datetime | None = None
 
     def _has_twitter_auth(self) -> bool:
         cfg = self.config
@@ -153,7 +175,7 @@ class LimbusXClient:
         ) as resp:
             if resp.status >= 400:
                 body = await resp.text()
-                raise XClientError(_format_x_http_error("UserByScreenName", resp, body))
+                raise _build_x_http_error("UserByScreenName", resp, body)
             data = await resp.json(content_type=None)
         user = data.get("data", {}).get("user", {}).get("result", {})
         user_id = str(user.get("rest_id") or "").strip()
@@ -174,32 +196,107 @@ class LimbusXClient:
                 return self._cached_posts[:limit]
             if self._rate_limited_until and now < self._rate_limited_until:
                 if self._cached_posts:
-                    LOGGER.warning(
-                        "X API rate limit 백오프 중이라 캐시된 게시물을 사용합니다 (until=%s).",
-                        self._rate_limited_until.isoformat(),
-                    )
+                    self._log_backoff_active()
                     return self._cached_posts[:limit]
                 raise XClientError(
-                    f"X API rate limit 백오프 중입니다: {self._rate_limited_until.isoformat()}"
+                    f"X API 백오프 중입니다: {self._rate_limited_until.isoformat()}"
                 )
 
             try:
                 posts = await self._fetch_via_twitter_api(limit=limit)
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
+                self._server_error_failures += 1
+                LOGGER.warning(
+                    "X API 네트워크 오류 (%s). 캐시 사용, 다음 시도: %s",
+                    type(exc).__name__,
+                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                )
+                if self._cached_posts:
+                    return self._cached_posts[:limit]
+                raise XClientError(f"X API 네트워크 오류: {exc}") from exc
+            except XRateLimitError as exc:
+                seconds = _rate_limit_backoff_seconds(self._rate_limit_failures)
+                if exc.reset_at is not None:
+                    delta = (exc.reset_at - datetime.now(timezone.utc)).total_seconds()
+                    if delta > 0:
+                        seconds = min(
+                            max(delta + 5, seconds),
+                            X_RATE_LIMIT_RESET_CAP.total_seconds(),
+                        )
+                self._apply_backoff(seconds)
+                self._rate_limit_failures += 1
+                LOGGER.warning(
+                    "X API rate limit. 헤더 reset=%s, 캐시 사용, 다음 시도: %s",
+                    exc.reset_at.isoformat() if exc.reset_at else "n/a",
+                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                )
+                if self._cached_posts:
+                    return self._cached_posts[:limit]
+                raise
+            except XServerError as exc:
+                seconds = _server_error_backoff_seconds(self._server_error_failures)
+                if exc.retry_after is not None and exc.retry_after > 0:
+                    seconds = min(max(exc.retry_after + 1, seconds), X_SERVER_ERROR_BACKOFF_MAX.total_seconds())
+                self._apply_backoff(seconds)
+                self._server_error_failures += 1
+                LOGGER.warning(
+                    "X API 일시 서버 오류 (%s). retry_after=%s, 다음 시도: %s",
+                    exc,
+                    exc.retry_after,
+                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                )
+                if self._cached_posts:
+                    return self._cached_posts[:limit]
+                raise
             except XClientError as exc:
                 if _is_rate_limit_error(exc):
-                    self._rate_limited_until = datetime.now(timezone.utc) + X_RATE_LIMIT_BACKOFF
+                    self._apply_backoff(_rate_limit_backoff_seconds(self._rate_limit_failures))
+                    self._rate_limit_failures += 1
+                    LOGGER.warning(
+                        "X API rate limit. 캐시 사용, 다음 시도: %s",
+                        self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                    )
                     if self._cached_posts:
-                        LOGGER.warning(
-                            "X API rate limit으로 캐시된 게시물을 사용합니다 (until=%s).",
-                            self._rate_limited_until.isoformat(),
-                        )
+                        return self._cached_posts[:limit]
+                elif _is_transient_server_error(exc):
+                    self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
+                    self._server_error_failures += 1
+                    LOGGER.warning(
+                        "X API 일시 서버 오류 (%s). 캐시 사용, 다음 시도: %s",
+                        exc,
+                        self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                    )
+                    if self._cached_posts:
                         return self._cached_posts[:limit]
                 raise
 
             self._cached_posts = posts
             self._cached_at = datetime.now(timezone.utc)
             self._rate_limited_until = None
+            self._rate_limit_failures = 0
+            self._server_error_failures = 0
+            self._last_backoff_log_until = None
             return posts[:limit]
+
+    def _apply_backoff(self, seconds: float) -> None:
+        self._rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        self._last_backoff_log_until = None
+
+    def _log_backoff_active(self) -> None:
+        until = self._rate_limited_until
+        if until is None:
+            return
+        if self._last_backoff_log_until == until:
+            LOGGER.debug(
+                "X API 백오프 중 (until=%s). 캐시 사용.", until.isoformat()
+            )
+            return
+        self._last_backoff_log_until = until
+        LOGGER.warning(
+            "X API 백오프 중이라 캐시된 게시물을 사용합니다 (until=%s).",
+            until.isoformat(),
+        )
 
     async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
         username = self.config.x_account_username
@@ -237,7 +334,7 @@ class LimbusXClient:
             ) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    raise XClientError(_format_x_http_error("UserTweetsAndReplies", resp, body))
+                    raise _build_x_http_error("UserTweetsAndReplies", resp, body)
                 data = await resp.json(content_type=None)
 
             page_posts = _extract_twitter_posts(data, username)
@@ -306,6 +403,70 @@ def _graphql_url(query_id: str, operation_name: str) -> str:
 def _is_rate_limit_error(exc: XClientError) -> bool:
     message = str(exc).lower()
     return " 429" in message or "rate limit" in message
+
+
+def _is_transient_server_error(exc: XClientError) -> bool:
+    msg = str(exc)
+    return any(f" {code}" in msg for code in ("500", "502", "503", "504"))
+
+
+def _rate_limit_backoff_seconds(failures: int) -> float:
+    base = X_RATE_LIMIT_BACKOFF.total_seconds()
+    cap = X_RATE_LIMIT_BACKOFF_MAX.total_seconds()
+    return min(base * (2 ** max(0, failures)), cap)
+
+
+def _server_error_backoff_seconds(failures: int) -> float:
+    base = X_SERVER_ERROR_BACKOFF.total_seconds()
+    cap = X_SERVER_ERROR_BACKOFF_MAX.total_seconds()
+    return min(base * (2 ** max(0, failures)), cap)
+
+
+def _parse_reset_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        epoch = int(float(value.strip()))
+    except (TypeError, ValueError):
+        return None
+    if epoch <= 0:
+        return None
+    return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, delta)
+
+
+def _build_x_http_error(operation: str, response: Any, body: str) -> XClientError:
+    message = _format_x_http_error(operation, response, body)
+    status = getattr(response, "status", 0)
+    headers = getattr(response, "headers", {})
+    retry_after = _parse_retry_after(headers.get("retry-after"))
+    if status == 429:
+        reset_at = _parse_reset_at(headers.get("x-rate-limit-reset"))
+        if reset_at is None and retry_after is not None:
+            reset_at = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+        return XRateLimitError(message, reset_at=reset_at)
+    if status in (500, 502, 503, 504):
+        return XServerError(message, retry_after=retry_after)
+    return XClientError(message)
 
 
 def _format_x_http_error(operation: str, response: Any, body: str) -> str:

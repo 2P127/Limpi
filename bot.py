@@ -1894,15 +1894,14 @@ class NewsCog(commands.Cog):
                     )
                 )
         if image_batch_tasks:
-            followup_tasks.append(
-                asyncio.create_task(
-                    self._send_channel_image_messages(
-                        channel,
-                        post,
-                        batch_tasks=image_batch_tasks,
-                    )
+            image_task = asyncio.create_task(
+                self._send_channel_image_messages(
+                    channel,
+                    post,
+                    batch_tasks=image_batch_tasks,
                 )
             )
+            image_task.add_done_callback(self._log_background_task_result)
         if followup_tasks:
             results = await asyncio.gather(*followup_tasks, return_exceptions=True)
             for result in results:
