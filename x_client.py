@@ -23,6 +23,7 @@ X_RATE_LIMIT_BACKOFF_MAX = timedelta(minutes=10)
 X_RATE_LIMIT_RESET_CAP = timedelta(minutes=20)
 X_SERVER_ERROR_BACKOFF = timedelta(seconds=30)
 X_SERVER_ERROR_BACKOFF_MAX = timedelta(minutes=5)
+KST = timezone(timedelta(hours=9))
 
 _VIDEO_THUMBNAIL_URL_FRAGMENTS = (
     "/ext_tw_video_thumb/",
@@ -208,9 +209,9 @@ class LimbusXClient:
                 self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
                 self._server_error_failures += 1
                 LOGGER.warning(
-                    "X API 네트워크 오류 (%s). 캐시 사용, 다음 시도: %s",
+                    "X API 네트워크 오류 (%s). 캐시를 사용합니다. 다음 시도: %s",
                     type(exc).__name__,
-                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                    _format_kst_datetime(self._rate_limited_until),
                 )
                 if self._cached_posts:
                     return self._cached_posts[:limit]
@@ -227,9 +228,9 @@ class LimbusXClient:
                 self._apply_backoff(seconds)
                 self._rate_limit_failures += 1
                 LOGGER.warning(
-                    "X API rate limit. 헤더 reset=%s, 캐시 사용, 다음 시도: %s",
-                    exc.reset_at.isoformat() if exc.reset_at else "n/a",
-                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                    "X API 호출 제한에 걸렸습니다. 제한 해제 예상 시간: %s. 캐시를 사용합니다. 다음 시도: %s",
+                    _format_kst_datetime(exc.reset_at),
+                    _format_kst_datetime(self._rate_limited_until),
                 )
                 if self._cached_posts:
                     return self._cached_posts[:limit]
@@ -241,10 +242,10 @@ class LimbusXClient:
                 self._apply_backoff(seconds)
                 self._server_error_failures += 1
                 LOGGER.warning(
-                    "X API 일시 서버 오류 (%s). retry_after=%s, 다음 시도: %s",
+                    "X API 일시 서버 오류 (%s). retry_after=%s초. 캐시를 사용합니다. 다음 시도: %s",
                     exc,
                     exc.retry_after,
-                    self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                    _format_kst_datetime(self._rate_limited_until),
                 )
                 if self._cached_posts:
                     return self._cached_posts[:limit]
@@ -254,8 +255,8 @@ class LimbusXClient:
                     self._apply_backoff(_rate_limit_backoff_seconds(self._rate_limit_failures))
                     self._rate_limit_failures += 1
                     LOGGER.warning(
-                        "X API rate limit. 캐시 사용, 다음 시도: %s",
-                        self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                        "X API 호출 제한에 걸렸습니다. 캐시를 사용합니다. 다음 시도: %s",
+                        _format_kst_datetime(self._rate_limited_until),
                     )
                     if self._cached_posts:
                         return self._cached_posts[:limit]
@@ -263,9 +264,9 @@ class LimbusXClient:
                     self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
                     self._server_error_failures += 1
                     LOGGER.warning(
-                        "X API 일시 서버 오류 (%s). 캐시 사용, 다음 시도: %s",
+                        "X API 일시 서버 오류 (%s). 캐시를 사용합니다. 다음 시도: %s",
                         exc,
-                        self._rate_limited_until.isoformat() if self._rate_limited_until else "n/a",
+                        _format_kst_datetime(self._rate_limited_until),
                     )
                     if self._cached_posts:
                         return self._cached_posts[:limit]
@@ -289,13 +290,14 @@ class LimbusXClient:
             return
         if self._last_backoff_log_until == until:
             LOGGER.debug(
-                "X API 백오프 중 (until=%s). 캐시 사용.", until.isoformat()
+                "X API 백오프 중입니다 (해제 예상: %s). 캐시를 사용합니다.",
+                _format_kst_datetime(until),
             )
             return
         self._last_backoff_log_until = until
         LOGGER.warning(
-            "X API 백오프 중이라 캐시된 게시물을 사용합니다 (until=%s).",
-            until.isoformat(),
+            "X API 백오프 중이라 캐시된 게시물을 사용합니다. 다시 시도 가능 예상 시간: %s",
+            _format_kst_datetime(until),
         )
 
     async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
@@ -432,6 +434,18 @@ def _parse_reset_at(value: str | None) -> datetime | None:
     if epoch <= 0:
         return None
     return datetime.fromtimestamp(epoch, tz=timezone.utc)
+
+
+def _format_kst_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "알 수 없음"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    local = value.astimezone(KST)
+    return (
+        f"{local.year}년 {local.month}월 {local.day}일 "
+        f"{local.hour:02d}시 {local.minute:02d}분 {local.second:02d}초"
+    )
 
 
 def _parse_retry_after(value: str | None) -> float | None:

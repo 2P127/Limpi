@@ -51,8 +51,10 @@ TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
 NEWS_POLL_TICK_SECONDS = 10
+TWITTER_POLL_TICK_SECONDS = 5
 TWITTER_POLL_INTERVAL_SECONDS = 10
-TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 5
+TWITTER_TRACKING_WINDOWS = ((0, 30), (10 * 60, 13 * 60), (17 * 60, 19 * 60))
+TWITTER_TRACKING_WINDOW_LABEL = "00:00-00:30, 10:00-13:00, 17:00-19:00"
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -433,7 +435,7 @@ class NewsCog(commands.Cog):
         self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
         self._in_high_frequency_window: bool = False
-        self._in_high_frequency_twitter_window: bool = False
+        self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
 
     async def cog_load(self) -> None:
@@ -594,18 +596,21 @@ class NewsCog(commands.Cog):
     async def before_poll_news(self) -> None:
         await self.bot.wait_until_ready()
 
-    @tasks.loop(seconds=TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS)
+    @tasks.loop(seconds=TWITTER_POLL_TICK_SECONDS)
     async def poll_twitter_posts(self) -> None:
         async with self._twitter_poll_lock:
             try:
                 now = datetime.now(timezone.utc)
-                if not self._in_high_frequency_twitter_window:
+                currently_in_window = self._is_twitter_tracking_window(now)
+                if currently_in_window and not self._in_twitter_tracking_window:
                     LOGGER.info(
-                        "X 24시간 추적 시작 (기본 간격: %s초, 고빈도 간격: %s초).",
+                        "X 게시물 추적 시작 (KST %s, 확인 간격: %s초).",
+                        TWITTER_TRACKING_WINDOW_LABEL,
                         TWITTER_POLL_INTERVAL_SECONDS,
-                        TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS,
                     )
-                    self._in_high_frequency_twitter_window = True
+                elif not currently_in_window and self._in_twitter_tracking_window:
+                    LOGGER.info("X 게시물 추적 일시 중지: 추적 시간대가 아닙니다.")
+                self._in_twitter_tracking_window = currently_in_window
 
                 if not self._should_poll_twitter_now(now):
                     return
@@ -928,16 +933,27 @@ class NewsCog(commands.Cog):
         return posts_by_language, changed
 
     async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
+        now = datetime.now(timezone.utc)
         news_task = asyncio.create_task(self._sync_global_news_cache())
-        twitter_task = asyncio.create_task(self._sync_twitter_posts())
-        news_result, twitter_result = await asyncio.gather(
-            news_task,
-            twitter_task,
-            return_exceptions=True,
-        )
+        if self._is_twitter_tracking_window(now):
+            twitter_task = asyncio.create_task(self._sync_twitter_posts())
+            news_result, twitter_result = await asyncio.gather(
+                news_task,
+                twitter_task,
+                return_exceptions=True,
+            )
+        else:
+            news_result = await news_task
+            twitter_result = (0, [])
         if isinstance(news_result, Exception):
-            raise news_result
-        posts_by_language, changed = news_result
+            LOGGER.warning(
+                "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
+                exc_info=(type(news_result), news_result, news_result.__traceback__),
+            )
+            posts_by_language = self._cached_posts_by_language()
+            changed = []
+        else:
+            posts_by_language, changed = news_result
 
         if isinstance(twitter_result, XClientError):
             LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
@@ -947,17 +963,56 @@ class NewsCog(commands.Cog):
         else:
             _, twitter_posts = twitter_result
 
-        steam_posts = [post for posts in posts_by_language.values() for post in posts]
-        twitter_news = _twitter_posts_as_news_posts(twitter_posts, steam_posts)
-        if twitter_news:
+        cached_linked_steam_posts = self._cached_steam_posts_for_twitter_links(twitter_posts)
+        steam_posts = _dedupe_posts_by_id([
+            post
+            for posts in posts_by_language.values()
+            for post in posts
+        ] + cached_linked_steam_posts)
+        twitter_news = _twitter_news_without_duplicate_steam_links(
+            _twitter_posts_as_news_posts(twitter_posts, steam_posts)
+        )
+        if twitter_news or cached_linked_steam_posts:
             for language in SYNC_LANGUAGES:
+                steam_posts_for_language = _dedupe_posts_by_id(
+                    [
+                        *posts_by_language.get(language, []),
+                        *(
+                            post
+                            for post in cached_linked_steam_posts
+                            if _post_language(post) == language
+                        ),
+                    ]
+                )
                 steam_language_posts = _steam_posts_without_fast_twitter_duplicates(
-                    posts_by_language.get(language, []),
+                    steam_posts_for_language,
                     twitter_news,
                 )
                 combined = [*steam_language_posts, *twitter_news]
                 posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
         return posts_by_language, changed
+
+    def _cached_posts_by_language(self) -> dict[str, list[NewsPost]]:
+        return {
+            language: self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
+            for language in SYNC_LANGUAGES
+        }
+
+    def _cached_steam_posts_for_twitter_links(
+        self,
+        twitter_posts: list[TwitterPost],
+    ) -> list[NewsPost]:
+        post_ids = [
+            f"steam:{language}:{post_key}"
+            for post_key in _steam_news_post_ids_for_twitter_posts(twitter_posts)
+            for language in SYNC_LANGUAGES
+        ]
+        cached_posts: list[NewsPost] = []
+        for post_id in dict.fromkeys(post_ids):
+            cached = self.storage.get_post(post_id)
+            if cached is not None:
+                cached_posts.append(cached)
+        return cached_posts
 
     def _posts_for_source_mode(
         self,
@@ -974,7 +1029,11 @@ class NewsCog(commands.Cog):
             return [post for post in posts if not _is_twitter_news_post(post)]
         if mode == NEWS_SOURCE_TWITTER:
             return [post for post in posts if _is_twitter_news_post(post)]
-        return posts
+        return [
+            post
+            for post in posts
+            if not _twitter_news_prefers_available_steam(post, posts)
+        ]
 
     def _combined_cached_posts(
         self,
@@ -1247,6 +1306,8 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _should_poll_twitter_now(self, now: datetime) -> bool:
+        if not self._is_twitter_tracking_window(now):
+            return False
         if self._last_twitter_poll_at is None:
             return True
         interval = self._current_twitter_poll_interval_seconds(now)
@@ -1254,9 +1315,15 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
-        if self._is_high_frequency_window(now):
-            return TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS
         return TWITTER_POLL_INTERVAL_SECONDS
+
+    def _is_twitter_tracking_window(self, now: datetime) -> bool:
+        local_now = now.astimezone(KST)
+        current_minute = local_now.hour * 60 + local_now.minute
+        return any(
+            start <= current_minute < end
+            for start, end in TWITTER_TRACKING_WINDOWS
+        )
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
         if self._is_high_frequency_window(now):
@@ -2570,6 +2637,12 @@ class NewsCog(commands.Cog):
             if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
                 LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
                 return
+            if not self._is_twitter_tracking_window(datetime.now(timezone.utc)):
+                LOGGER.info(
+                    "시작 시 X 게시물 동기화 생략: 현재 X 추적 시간대가 아닙니다 (KST %s).",
+                    TWITTER_TRACKING_WINDOW_LABEL,
+                )
+                return
 
             saved, _ = await self._sync_twitter_posts()
             latest = self.storage.get_latest_twitter_post()
@@ -2637,7 +2710,7 @@ class NewsCog(commands.Cog):
                     self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
                     self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
 
-        if self.x_source is not None:
+        if self.x_source is not None and self._is_twitter_tracking_window(datetime.now(timezone.utc)):
             try:
                 await self._sync_twitter_posts()
             except XClientError as exc:
@@ -6079,6 +6152,17 @@ def _sort_posts_newest_first(posts: list[NewsPost]) -> list[NewsPost]:
     )
 
 
+def _dedupe_posts_by_id(posts: list[NewsPost]) -> list[NewsPost]:
+    deduped: list[NewsPost] = []
+    seen: set[str] = set()
+    for post in posts:
+        if post.post_id in seen:
+            continue
+        seen.add(post.post_id)
+        deduped.append(post)
+    return deduped
+
+
 def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
     cutoff = datetime.now(timezone.utc) - AUTO_NEWS_MAX_AGE
     recent: list[NewsPost] = []
@@ -6127,11 +6211,7 @@ def _matching_steam_posts_for_twitter(
 ) -> list[NewsPost]:
     raw = post.raw
     link_urls = [str(url) for url in raw.get("link_urls", []) if url] if isinstance(raw.get("link_urls"), list) else []
-    link_keys = {
-        key
-        for key in (_steam_news_url_key(url) for url in link_urls)
-        if key is not None
-    }
+    link_keys = _steam_news_link_keys_for_twitter(post)
     normalized_text = _normalize_news_text(post.text or post.title)
     matched: list[NewsPost] = []
     seen: set[str] = set()
@@ -6152,6 +6232,58 @@ def _matching_steam_posts_for_twitter(
         seen.add(steam_post.post_id)
         matched.append(steam_post)
     return matched
+
+
+def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
+    raw = post.raw
+    link_urls = raw.get("link_urls")
+    if not isinstance(link_urls, list):
+        return set()
+    return {
+        key
+        for key in (_steam_news_url_key(str(url)) for url in link_urls if url)
+        if key is not None
+    }
+
+
+def _steam_news_post_id_from_url(url: str) -> str | None:
+    if not _is_steam_news_url(url):
+        return None
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    if len(parts) >= 5 and parts[0].lower() == "news" and parts[1].lower() == "app":
+        if parts[3].lower() == "view" and parts[4]:
+            return parts[4]
+    return None
+
+
+def _steam_news_post_ids_for_twitter_posts(posts: list[TwitterPost]) -> list[str]:
+    post_ids: list[str] = []
+    seen: set[str] = set()
+    for post in posts:
+        raw_links = post.raw.get("link_urls")
+        if not isinstance(raw_links, list):
+            continue
+        for url in raw_links:
+            post_id = _steam_news_post_id_from_url(str(url))
+            if post_id is None or post_id in seen:
+                continue
+            seen.add(post_id)
+            post_ids.append(post_id)
+    return post_ids
+
+
+def _linked_steam_posts_for_twitter(
+    post: TwitterPost,
+    steam_posts: list[NewsPost],
+) -> list[NewsPost]:
+    link_keys = _steam_news_link_keys_for_twitter(post)
+    if not link_keys:
+        return []
+    return [
+        steam_post
+        for steam_post in steam_posts
+        if (_steam_news_url_key(steam_post.url) or "") in link_keys
+    ]
 
 
 def _twitter_post_is_faster_than_steam(
@@ -6176,12 +6308,22 @@ def _steam_posts_without_fast_twitter_duplicates(
     skip_ids: set[str] = set()
     skip_keys: set[str] = set()
     for post in twitter_news:
+        prefer_ids = _raw_string_set(post.raw.get("prefer_steam_post_ids"))
+        prefer_keys = _raw_string_set(post.raw.get("prefer_steam_post_keys"))
         raw_ids = post.raw.get("overlap_steam_post_ids")
         if isinstance(raw_ids, list):
-            skip_ids.update(str(post_id) for post_id in raw_ids if post_id)
+            skip_ids.update(
+                str(post_id)
+                for post_id in raw_ids
+                if post_id and str(post_id) not in prefer_ids
+            )
         raw_keys = post.raw.get("overlap_steam_post_keys")
         if isinstance(raw_keys, list):
-            skip_keys.update(str(post_key) for post_key in raw_keys if post_key)
+            skip_keys.update(
+                str(post_key)
+                for post_key in raw_keys
+                if post_key and str(post_key) not in prefer_keys
+            )
     if not skip_ids and not skip_keys:
         return steam_posts
     return [
@@ -6200,7 +6342,12 @@ def _twitter_posts_as_news_posts(
     for post in posts:
         raw = dict(post.raw)
         matching_steam_posts = _matching_steam_posts_for_twitter(post, steam_posts)
-        if matching_steam_posts and not _twitter_post_is_faster_than_steam(post, matching_steam_posts):
+        linked_steam_posts = _linked_steam_posts_for_twitter(post, matching_steam_posts)
+        if (
+            matching_steam_posts
+            and not linked_steam_posts
+            and not _twitter_post_is_faster_than_steam(post, matching_steam_posts)
+        ):
             continue
         if matching_steam_posts:
             raw["overlap_steam_post_ids"] = [
@@ -6211,6 +6358,18 @@ def _twitter_posts_as_news_posts(
                 for post_key in (
                     _post_language_independent_id(steam_post)
                     for steam_post in matching_steam_posts
+                )
+                if post_key is not None
+            ]
+        if linked_steam_posts:
+            raw["prefer_steam_post_ids"] = [
+                steam_post.post_id for steam_post in linked_steam_posts
+            ]
+            raw["prefer_steam_post_keys"] = [
+                post_key
+                for post_key in (
+                    _post_language_independent_id(steam_post)
+                    for steam_post in linked_steam_posts
                 )
                 if post_key is not None
             ]
@@ -6229,6 +6388,85 @@ def _twitter_posts_as_news_posts(
             )
         )
     return converted
+
+
+def _twitter_news_without_duplicate_steam_links(posts: list[NewsPost]) -> list[NewsPost]:
+    selected_by_key: dict[str, NewsPost] = {}
+    for post in posts:
+        link_keys = _steam_news_link_keys_for_news_post(post)
+        if not link_keys:
+            continue
+        for link_key in link_keys:
+            selected = selected_by_key.get(link_key)
+            if selected is None or _news_post_is_earlier(post, selected):
+                selected_by_key[link_key] = post
+
+    if not selected_by_key:
+        return posts
+
+    selected_ids = {post.post_id for post in selected_by_key.values()}
+    deduped: list[NewsPost] = []
+    seen_ids: set[str] = set()
+    for post in posts:
+        link_keys = _steam_news_link_keys_for_news_post(post)
+        if not link_keys:
+            deduped.append(post)
+            continue
+        if post.post_id not in selected_ids or post.post_id in seen_ids:
+            continue
+        seen_ids.add(post.post_id)
+        deduped.append(post)
+    return deduped
+
+
+def _steam_news_link_keys_for_news_post(post: NewsPost) -> set[str]:
+    raw_links = post.raw.get("link_urls")
+    if not isinstance(raw_links, list):
+        return set()
+    return {
+        key
+        for key in (_steam_news_url_key(str(url)) for url in raw_links if url)
+        if key is not None
+    }
+
+
+def _news_post_is_earlier(left: NewsPost, right: NewsPost) -> bool:
+    left_at = _as_utc_datetime(left.created_at)
+    right_at = _as_utc_datetime(right.created_at)
+    if left_at is not None and right_at is not None and left_at != right_at:
+        return left_at < right_at
+    if left_at is not None and right_at is None:
+        return True
+    if left_at is None and right_at is not None:
+        return False
+    return left.post_id < right.post_id
+
+
+def _raw_string_set(value: object) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value if item}
+
+
+def _twitter_news_prefers_available_steam(
+    post: NewsPost,
+    available_posts: list[NewsPost],
+) -> bool:
+    if not _is_twitter_news_post(post):
+        return False
+    prefer_ids = _raw_string_set(post.raw.get("prefer_steam_post_ids"))
+    prefer_keys = _raw_string_set(post.raw.get("prefer_steam_post_keys"))
+    if not prefer_ids and not prefer_keys:
+        return False
+    for available_post in available_posts:
+        if _is_twitter_news_post(available_post):
+            continue
+        if available_post.post_id in prefer_ids:
+            return True
+        post_key = _post_language_independent_id(available_post)
+        if post_key is not None and post_key in prefer_keys:
+            return True
+    return False
 
 
 def _schedule_text_for_post(post: NewsPost) -> str | None:
