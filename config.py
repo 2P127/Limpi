@@ -81,6 +81,26 @@ def _get_int(name: str, default: int, minimum: int | None = None) -> int:
     return value
 
 
+def _get_int_or_default(name: str, default: int, minimum: int | None = None) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+
+    if minimum is not None and value < minimum:
+        return minimum
+
+    return value
+
+
+def _get_hour(name: str, default: int, *, maximum: int) -> int:
+    return min(maximum, _get_int_or_default(name, default, minimum=0))
+
+
 def _get_optional_int(name: str) -> int | None:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -90,6 +110,17 @@ def _get_optional_int(name: str) -> int | None:
         return int(raw)
     except ValueError as exc:
         raise ValueError(f"{name} must be an integer.") from exc
+
+
+def _get_optional_int_or_none(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def _get_steam_language(name: str, default: str) -> str:
@@ -133,6 +164,13 @@ def _get_weekdays(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(days)
 
 
+def _get_weekdays_or_default(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    try:
+        return _get_weekdays(name, default)
+    except ValueError:
+        return default
+
+
 @dataclass(frozen=True)
 class AppConfig:
     discord_token: str
@@ -169,7 +207,7 @@ class AppConfig:
             if not discord_token:
                 raise RuntimeError("DISCORD_TOKEN is required.")
 
-        command_guild_id = _get_optional_int("COMMAND_GUILD_ID")
+        command_guild_id = _get_optional_int_or_none("COMMAND_GUILD_ID")
         x_account_username = os.getenv("X_ACCOUNT_USERNAME", "LimbusCompany_B").strip() or "LimbusCompany_B"
         x_auth_token = os.getenv("X_AUTH_TOKEN", "").strip() or None
         x_ct0 = os.getenv("X_CT0", "").strip() or None
@@ -184,16 +222,16 @@ class AppConfig:
             steam_language=_get_steam_language("STEAM_LANGUAGE", "koreana"),
             steam_country=os.getenv("STEAM_COUNTRY", "KR").strip() or "KR",
             steam_news_url=os.getenv("STEAM_NEWS_URL") or None,
-            poll_interval_seconds=_get_int("POLL_INTERVAL_SECONDS", 300, minimum=60),
-            max_posts_per_poll=_get_int("MAX_POSTS_PER_POLL", 10, minimum=5),
-            high_frequency_poll_interval_seconds=_get_int(
-                "HIGH_FREQUENCY_POLL_INTERVAL_SECONDS", 60, minimum=60
+            poll_interval_seconds=_get_int_or_default("POLL_INTERVAL_SECONDS", 30, minimum=1),
+            max_posts_per_poll=_get_int_or_default("MAX_POSTS_PER_POLL", 10, minimum=1),
+            high_frequency_poll_interval_seconds=_get_int_or_default(
+                "HIGH_FREQUENCY_POLL_INTERVAL_SECONDS", 10, minimum=1
             ),
-            high_frequency_weekdays=_get_weekdays(
+            high_frequency_weekdays=_get_weekdays_or_default(
                 "HIGH_FREQUENCY_POLL_DAYS", (0, 1, 2, 3, 4, 5, 6)
             ),
-            high_frequency_start_hour=_get_int("HIGH_FREQUENCY_START_HOUR", 18, minimum=0),
-            high_frequency_end_hour=_get_int("HIGH_FREQUENCY_END_HOUR", 20, minimum=1),
+            high_frequency_start_hour=_get_hour("HIGH_FREQUENCY_START_HOUR", 18, maximum=23),
+            high_frequency_end_hour=_get_hour("HIGH_FREQUENCY_END_HOUR", 20, maximum=24),
             command_guild_id=command_guild_id,
             command_sync_mode=_get_command_sync_mode(command_guild_id),
             announce_existing_on_first_run=_get_bool("ANNOUNCE_EXISTING_ON_FIRST_RUN", False),

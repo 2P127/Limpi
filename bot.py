@@ -6524,6 +6524,22 @@ def _restore_windows_sleep() -> None:
         LOGGER.exception("Windows 절전 방지 해제 실패.")
 
 
+def _build_aiohttp_connector() -> aiohttp.TCPConnector:
+    options = {
+        "keepalive_timeout": AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS,
+        "ttl_dns_cache": 300,
+        "enable_cleanup_closed": True,
+    }
+    try:
+        return aiohttp.TCPConnector(
+            **options,
+            socket_factory=_keepalive_socket_factory,
+        )
+    except TypeError:
+        LOGGER.warning("aiohttp 버전이 TCP socket_factory를 지원하지 않아 기본 keepalive로 실행합니다.")
+        return aiohttp.TCPConnector(**options)
+
+
 async def main() -> None:
     _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
     _log_dir = os.path.join(_base, "logs")
@@ -6592,12 +6608,7 @@ async def main() -> None:
     bot: LimpiBot | None = None
     sleep_prevented = _prevent_windows_sleep()
     try:
-        connector = aiohttp.TCPConnector(
-            keepalive_timeout=AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS,
-            socket_factory=_keepalive_socket_factory,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-        )
+        connector = _build_aiohttp_connector()
         session = aiohttp.ClientSession(connector=connector)
         news_source = build_news_source(config, session)
         x_source = LimbusXClient(config, session)

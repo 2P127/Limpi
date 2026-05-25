@@ -20,6 +20,7 @@ from models import NewsPost
 LOGGER = logging.getLogger(__name__)
 STEAM_NEWS_BASE_URL = "https://store.steampowered.com/news/app"
 STEAM_RSS_BASE_URL = "https://store.steampowered.com/feeds/news/app"
+STEAM_REQUEST_TIMEOUT_SECONDS = 20
 STEAM_CLAN_IMAGE_BASE_URL = "https://clan.fastly.steamstatic.com/images"
 STEAM_LANGUAGE_INDEXES = {
     "english": 0,
@@ -90,7 +91,11 @@ class SteamNewsSource:
             "Accept-Language": _accept_language_header(language),
             "User-Agent": "Limpi Discord Bot (Steam news poller)",
         }
-        async with self.session.get(url, headers=headers) as response:
+        async with self.session.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=STEAM_REQUEST_TIMEOUT_SECONDS),
+        ) as response:
             if response.status >= 400:
                 body = await response.text()
                 raise RuntimeError(f"Steam news RSS request failed ({response.status}): {body[:500]}")
@@ -107,7 +112,11 @@ class SteamNewsSource:
             "Accept-Language": _accept_language_header(language),
             "User-Agent": "Limpi Discord Bot (Steam news poller)",
         }
-        async with self.session.get(url, headers=headers) as response:
+        async with self.session.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=STEAM_REQUEST_TIMEOUT_SECONDS),
+        ) as response:
             if response.status >= 400:
                 body = await response.text()
                 raise RuntimeError(f"Steam news hub request failed ({response.status}): {body[:500]}")
