@@ -7,6 +7,7 @@ import io
 import logging
 import logging.handlers
 import os
+import signal
 import socket
 import sys
 import re
@@ -2607,7 +2608,9 @@ class NewsCog(commands.Cog):
 
     async def run_startup_sync(self) -> None:
         if self._startup_synced:
+            LOGGER.info("시작 시 동기화 생략: 이미 완료되었습니다.")
             return
+        LOGGER.info("시작 시 동기화 시작: Steam 뉴스, 유튜브 기준선, X 게시물을 확인합니다.")
         if self.news_source is not None:
             try:
                 posts_by_language, _ = await self._sync_global_news_cache()
@@ -2659,6 +2662,7 @@ class NewsCog(commands.Cog):
             LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
+        LOGGER.info("시작 시 동기화 처리 완료.")
 
     async def _sync_youtube_startup_baseline(self) -> None:
         targets = self.storage.list_youtube_targets()
@@ -6843,6 +6847,24 @@ async def main() -> None:
     storage = SQLiteStorage(config.database_path)
     session: aiohttp.ClientSession | None = None
     bot: LimpiBot | None = None
+    bot_task: asyncio.Task[None] | None = None
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(signum: int, _frame: object | None = None) -> None:
+        LOGGER.info("종료 신호를 받았습니다 (signal=%s). Discord 상태를 오프라인으로 전환합니다.", signum)
+        loop.call_soon_threadsafe(stop_event.set)
+
+    previous_signal_handlers: dict[int, object] = {}
+    for signum in (getattr(signal, "SIGBREAK", None), signal.SIGTERM, signal.SIGINT):
+        if signum is None:
+            continue
+        try:
+            previous_signal_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _request_shutdown)
+        except (ValueError, OSError):
+            continue
+
     sleep_prevented = _prevent_windows_sleep()
     try:
         connector = _build_aiohttp_connector()
@@ -6860,8 +6882,9 @@ async def main() -> None:
             if not bot._logged_startup_summary:
                 cog.log_startup_summary()
                 bot._logged_startup_summary = True
+            startup_sync_task = asyncio.create_task(cog.run_startup_sync())
             await bot.sync_connected_guild_commands()
-            await cog.run_startup_sync()
+            await startup_sync_task
 
         @bot.event
         async def on_guild_join(guild: discord.Guild) -> None:
@@ -6916,8 +6939,19 @@ async def main() -> None:
             storage.delete_guild_data(guild.id)
 
         await bot.add_cog(cog)
+        bot_task = asyncio.create_task(bot.start(config.discord_token))
         try:
-            await bot.start(config.discord_token)
+            stop_task = asyncio.create_task(stop_event.wait())
+            done, pending = await asyncio.wait(
+                {bot_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if stop_task in done and not bot_task.done():
+                LOGGER.info("봇 종료 요청 처리 중: Discord 연결을 닫습니다.")
+            else:
+                await bot_task
         except asyncio.CancelledError:
             LOGGER.info("종료 요청을 받아 봇을 정리합니다.")
     finally:
@@ -6927,11 +6961,21 @@ async def main() -> None:
             except Exception:
                 LOGGER.debug("종료 전 오프라인 상태 전환을 건너뜁니다.", exc_info=True)
             await bot.close()
+        if bot_task is not None and not bot_task.done():
+            try:
+                await asyncio.wait_for(bot_task, timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
         if session is not None and not session.closed:
             await session.close()
         if sleep_prevented:
             _restore_windows_sleep()
         storage.close()
+        for signum, handler in previous_signal_handlers.items():
+            try:
+                signal.signal(signum, handler)
+            except (ValueError, OSError):
+                pass
 
 
 if __name__ == "__main__":

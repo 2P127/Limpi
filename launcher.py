@@ -125,12 +125,14 @@ class BotProcess:
             except (ValueError, OSError):
                 self.proc.terminate()
         try:
-            self.proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self.proc.terminate()
-        try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
+            self.on_log("[시스템] 정상 종료가 지연되어 프로세스를 종료합니다.")
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            self.on_log("[시스템] 프로세스가 응답하지 않아 강제 종료합니다.")
             self.proc.kill()
         self._psutil = None
 
