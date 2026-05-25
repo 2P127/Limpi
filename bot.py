@@ -1,11 +1,13 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import ctypes
 import gc
 import io
 import logging
 import logging.handlers
 import os
+import socket
 import sys
 import re
 import zipfile
@@ -48,21 +50,32 @@ NEWS_POST_LIMIT = 80
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
-TWITTER_POLL_INTERVAL_SECONDS = 20
-TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 10
+NEWS_POLL_TICK_SECONDS = 10
+TWITTER_POLL_INTERVAL_SECONDS = 10
+TWITTER_HIGH_FREQUENCY_POLL_INTERVAL_SECONDS = 5
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
+NEWS_TARGET_SEND_CONCURRENCY = 12
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
-ZIP_IMAGE_CONCURRENCY = 10
+ZIP_IMAGE_CONCURRENCY = 20
 ZIP_CACHE_MAX_ITEMS = 8
-IMAGE_CACHE_MAX_ITEMS = 64
-IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
+IMAGE_CACHE_MAX_ITEMS = 128
+IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
-IMAGE_CACHE_WARM_POST_LIMIT = 5
+IMAGE_CACHE_WARM_POST_LIMIT = 10
+DISCORD_HEARTBEAT_TIMEOUT_SECONDS = 120.0
+AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS = 90
+TCP_KEEPALIVE_IDLE_SECONDS = 30
+TCP_KEEPALIVE_INTERVAL_SECONDS = 10
+TCP_KEEPALIVE_PROBES = 3
+WINDOWS_KEEPALIVE_TIME_MS = TCP_KEEPALIVE_IDLE_SECONDS * 1000
+WINDOWS_KEEPALIVE_INTERVAL_MS = TCP_KEEPALIVE_INTERVAL_SECONDS * 1000
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
 NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -234,7 +247,12 @@ class LoggingCommandTree(app_commands.CommandTree):
 class LimpiBot(commands.Bot):
     def __init__(self, config: AppConfig) -> None:
         intents = discord.Intents.default()
-        super().__init__(command_prefix="!", intents=intents, tree_cls=LoggingCommandTree)
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            tree_cls=LoggingCommandTree,
+            heartbeat_timeout=DISCORD_HEARTBEAT_TIMEOUT_SECONDS,
+        )
         self.config = config
         self._synced_connected_guilds = False
         self._cleared_global_commands = False
@@ -547,7 +565,7 @@ class NewsCog(commands.Cog):
                 ", ".join(str(settings.guild_id) for settings in orphan_settings),
             )
 
-    @tasks.loop(seconds=60)
+    @tasks.loop(seconds=NEWS_POLL_TICK_SECONDS)
     async def poll_news(self) -> None:
         async with self._poll_lock:
             try:
@@ -621,7 +639,7 @@ class NewsCog(commands.Cog):
         async with self._youtube_poll_lock:
             try:
                 await self._poll_youtube_once()
-            except aiohttp.ClientError as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
                 LOGGER.warning("유튜브 라이브 자동 확인 실패: %s", exc)
             except Exception:
                 LOGGER.exception("유튜브 라이브 자동 확인 실패.")
@@ -841,6 +859,17 @@ class NewsCog(commands.Cog):
         posts_by_language, changed_post_ids = await self._combined_posts_by_language()
 
         announced_count = 0
+        target_tasks: list[asyncio.Task[int]] = []
+        send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
+
+        async def process_target(
+            settings: GuildSettings,
+            target: GuildNewsTarget,
+            guild_posts: list[NewsPost],
+        ) -> int:
+            async with send_semaphore:
+                return await self._process_news_target(settings, target, guild_posts)
+
         for language, target_list in targets_by_language.items():
             posts = posts_by_language.get(language, [])
             if not posts:
@@ -853,11 +882,25 @@ class NewsCog(commands.Cog):
                     continue
                 newest_post_id = guild_posts[0].post_id
                 fetched_post_ids = [post.post_id for post in guild_posts]
-                announced_count += await self._process_news_target(settings, target, guild_posts)
                 if not settings.enabled:
                     self.storage.mark_news_target_posts_seen(target.target_id, fetched_post_ids)
                     self.storage.mark_posts_seen(target.guild_id, fetched_post_ids)
                     self.storage.set_last_seen_post_id(target.guild_id, newest_post_id)
+                    continue
+                target_tasks.append(
+                    asyncio.create_task(process_target(settings, target, guild_posts))
+                )
+
+        if target_tasks:
+            results = await asyncio.gather(*target_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    LOGGER.error(
+                        "뉴스 자동 전송 대상 처리 실패.",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    continue
+                announced_count += result
 
         if changed_post_ids:
             await self._broadcast_post_updates(changed_post_ids)
@@ -885,18 +928,34 @@ class NewsCog(commands.Cog):
         return posts_by_language, changed
 
     async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
-        posts_by_language, changed = await self._sync_global_news_cache()
-        try:
-            _, twitter_posts = await self._sync_twitter_posts()
-        except XClientError as exc:
-            LOGGER.warning("X 게시물 자동 확인 실패: %s", exc)
+        news_task = asyncio.create_task(self._sync_global_news_cache())
+        twitter_task = asyncio.create_task(self._sync_twitter_posts())
+        news_result, twitter_result = await asyncio.gather(
+            news_task,
+            twitter_task,
+            return_exceptions=True,
+        )
+        if isinstance(news_result, Exception):
+            raise news_result
+        posts_by_language, changed = news_result
+
+        if isinstance(twitter_result, XClientError):
+            LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
             twitter_posts = []
+        elif isinstance(twitter_result, Exception):
+            raise twitter_result
+        else:
+            _, twitter_posts = twitter_result
 
         steam_posts = [post for posts in posts_by_language.values() for post in posts]
         twitter_news = _twitter_posts_as_news_posts(twitter_posts, steam_posts)
         if twitter_news:
             for language in SYNC_LANGUAGES:
-                combined = [*posts_by_language.get(language, []), *twitter_news]
+                steam_language_posts = _steam_posts_without_fast_twitter_duplicates(
+                    posts_by_language.get(language, []),
+                    twitter_news,
+                )
+                combined = [*steam_language_posts, *twitter_news]
                 posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
         return posts_by_language, changed
 
@@ -1253,8 +1312,15 @@ class NewsCog(commands.Cog):
 
         announced = 0
         failed_post_ids: set[str] = set()
+        image_batches_by_post_id = self._start_image_batch_tasks_for_posts(new_posts)
         for post in new_posts:
-            sent = await self._send_news_post_to_target(channel, settings, target, post)
+            sent = await self._send_news_post_to_target(
+                channel,
+                settings,
+                target,
+                post,
+                batch_tasks=image_batches_by_post_id.get(post.post_id),
+            )
             if not sent:
                 failed_post_ids.add(post.post_id)
                 LOGGER.warning(
@@ -1424,8 +1490,14 @@ class NewsCog(commands.Cog):
 
         announced = 0
         failed_post_ids: set[str] = set()
+        image_batches_by_post_id = self._start_image_batch_tasks_for_posts(new_posts)
         for post in new_posts:
-            sent = await self._send_news_post(channel, settings, post)
+            sent = await self._send_news_post(
+                channel,
+                settings,
+                post,
+                batch_tasks=image_batches_by_post_id.get(post.post_id),
+            )
             if not sent:
                 failed_post_ids.add(post.post_id)
                 LOGGER.warning(
@@ -1572,6 +1644,8 @@ class NewsCog(commands.Cog):
         channel: discord.abc.Messageable,
         settings: GuildSettings,
         post: NewsPost,
+        *,
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> bool:
         channel_id = getattr(channel, "id", settings.channel_id)
         try:
@@ -1580,6 +1654,7 @@ class NewsCog(commands.Cog):
                 post,
                 settings.role_id,
                 banner_filename=settings.notification_banner,
+                batch_tasks=batch_tasks,
             )
             return True
         except discord.Forbidden as exc:
@@ -1639,6 +1714,8 @@ class NewsCog(commands.Cog):
         settings: GuildSettings,
         target: GuildNewsTarget,
         post: NewsPost,
+        *,
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> bool:
         try:
             await self._broadcast_post(
@@ -1646,6 +1723,7 @@ class NewsCog(commands.Cog):
                 post,
                 settings.role_id,
                 banner_filename=settings.notification_banner,
+                batch_tasks=batch_tasks,
             )
             return True
         except discord.Forbidden as exc:
@@ -1748,6 +1826,7 @@ class NewsCog(commands.Cog):
         *,
         banner_filename: str | None = None,
         is_update: bool = False,
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -1764,7 +1843,11 @@ class NewsCog(commands.Cog):
             include_banner=banner_file is not None,
             is_update=is_update,
         )
-        batch_tasks = self._start_image_batch_tasks(standalone_urls) if standalone_urls else []
+        image_batch_tasks = (
+            batch_tasks
+            if batch_tasks is not None
+            else (self._start_image_batch_tasks(standalone_urls) if standalone_urls else [])
+        )
 
         if mention:
             await channel.send(
@@ -1779,39 +1862,57 @@ class NewsCog(commands.Cog):
             send_kwargs["file"] = banner_file
         await channel.send(**send_kwargs)
 
+        followup_tasks = []
         youtube_content = _youtube_links_content(post)
         if youtube_content:
-            task = asyncio.create_task(
-                channel.send(
-                    content=youtube_content,
-                    allowed_mentions=discord.AllowedMentions.none(),
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content=youtube_content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 )
             )
-            task.add_done_callback(self._log_background_task_result)
         if _is_twitter_news_post(post):
             video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
             video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
             if video_url_groups:
-                task = asyncio.create_task(
-                    self._send_twitter_video_to_channel(
-                        channel, video_url_groups, video_fallback_url or post.url
+                followup_tasks.append(
+                    asyncio.create_task(
+                        self._send_twitter_video_to_channel(
+                            channel, video_url_groups, video_fallback_url or post.url
+                        )
                     )
                 )
-                task.add_done_callback(self._log_background_task_result)
             elif video_fallback_url:
-                task = asyncio.create_task(
-                    channel.send(
-                        content=video_fallback_url,
-                        allowed_mentions=discord.AllowedMentions.none(),
+                followup_tasks.append(
+                    asyncio.create_task(
+                        channel.send(
+                            content=video_fallback_url,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
                     )
                 )
-                task.add_done_callback(self._log_background_task_result)
-        self._schedule_channel_image_messages(
-            channel,
-            post,
-            batch_tasks=batch_tasks,
-            image_urls=standalone_urls,
-        )
+        if image_batch_tasks:
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_channel_image_messages(
+                        channel,
+                        post,
+                        batch_tasks=image_batch_tasks,
+                    )
+                )
+            )
+        if followup_tasks:
+            results = await asyncio.gather(*followup_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    LOGGER.error(
+                        "뉴스 후속 메시지 전송 실패 (post_id=%s, title=%r).",
+                        post.post_id,
+                        post.title,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
     async def _send_news_post_followups(
         self,
@@ -2282,6 +2383,28 @@ class NewsCog(commands.Cog):
             tasks.append(task)
         return tasks
 
+    def _start_image_batch_tasks_for_posts(
+        self,
+        posts: list[NewsPost],
+    ) -> dict[str, list[asyncio.Task[list[discord.File]]]]:
+        batches: dict[str, list[asyncio.Task[list[discord.File]]]] = {}
+        for post in posts:
+            urls = _standalone_image_urls(post, attach_images=True)
+            if urls:
+                batches[post.post_id] = self._start_image_batch_tasks(urls)
+        return batches
+
+    def _start_twitter_image_batch_tasks_for_posts(
+        self,
+        posts: list[TwitterPost],
+    ) -> dict[str, list[asyncio.Task[list[discord.File]]]]:
+        batches: dict[str, list[asyncio.Task[list[discord.File]]]] = {}
+        for post in posts:
+            urls = _twitter_image_urls(post)
+            if len(urls) > 1:
+                batches[post.post_id] = self._start_image_batch_tasks(urls)
+        return batches
+
     async def _download_file_batch(
         self,
         semaphore: asyncio.Semaphore,
@@ -2545,38 +2668,61 @@ class NewsCog(commands.Cog):
         if not posts:
             return 0
 
-        announced = 0
         posts = posts[:TWITTER_POST_LIMIT]
-        for target in targets:
+        send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
+
+        async def process_target(target: GuildTwitterTarget) -> int:
             if not target.enabled:
-                continue
-            channel = await self._resolve_twitter_target_channel(target)
-            if channel is None:
-                continue
-            new_posts = self._new_twitter_posts_for_target(target, posts)
-            if not new_posts:
-                self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
-                continue
-            for post in new_posts:
-                try:
-                    await self._send_twitter_post_to_channel(channel, post)
-                except discord.HTTPException:
-                    LOGGER.exception(
-                        "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                return 0
+            async with send_semaphore:
+                channel = await self._resolve_twitter_target_channel(target)
+                if channel is None:
+                    return 0
+                new_posts = self._new_twitter_posts_for_target(target, posts)
+                if not new_posts:
+                    self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
+                    return 0
+                announced = 0
+                image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
+                for post in new_posts:
+                    try:
+                        await self._send_twitter_post_to_channel(
+                            channel,
+                            post,
+                            batch_tasks=image_batches_by_post_id.get(post.post_id),
+                        )
+                    except discord.HTTPException:
+                        LOGGER.exception(
+                            "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                            target.guild_id,
+                            target.channel_id,
+                            post.post_id,
+                        )
+                        continue
+                    self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
+                    LOGGER.info(
+                        "새 X 게시물 공지 (guild %s, channel %s, delay=%s초): %s",
                         target.guild_id,
                         target.channel_id,
-                        post.post_id,
+                        _twitter_post_delay_seconds(post),
+                        post.title,
                     )
-                    continue
-                self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
-                LOGGER.info(
-                    "새 X 게시물 공지 (guild %s, channel %s, delay=%s초): %s",
-                    target.guild_id,
-                    target.channel_id,
-                    _twitter_post_delay_seconds(post),
-                    post.title,
+                    announced += 1
+                return announced
+
+        announced = 0
+        results = await asyncio.gather(
+            *(asyncio.create_task(process_target(target)) for target in targets),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.error(
+                    "X 게시물 자동 전송 대상 처리 실패.",
+                    exc_info=(type(result), result, result.__traceback__),
                 )
-                announced += 1
+                continue
+            announced += result
         return announced
 
     def _new_twitter_posts_for_target(
@@ -2894,13 +3040,18 @@ class NewsCog(commands.Cog):
         *,
         attach_photos: bool = True,
         role_id: int | None = None,
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> discord.Message:
         image_urls = _twitter_image_urls(post) if attach_photos else []
         embed = _embed_for_twitter_post(
             post,
             image_url=image_urls[0] if len(image_urls) == 1 else None,
         )
-        batch_tasks = self._start_image_batch_tasks(image_urls) if len(image_urls) > 1 else []
+        image_batch_tasks = (
+            batch_tasks
+            if batch_tasks is not None
+            else (self._start_image_batch_tasks(image_urls) if len(image_urls) > 1 else [])
+        )
         if role_id:
             await channel.send(
                 content=f"<@&{role_id}>",
@@ -2914,38 +3065,55 @@ class NewsCog(commands.Cog):
             embed=embed,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        if batch_tasks:
-            self._schedule_twitter_channel_image_messages(
-                channel,
-                post,
-                batch_tasks=batch_tasks,
+        followup_tasks = []
+        if image_batch_tasks:
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_twitter_channel_image_messages(
+                        channel,
+                        batch_tasks=image_batch_tasks,
+                    )
+                )
             )
         link_urls = _twitter_link_urls(post)
         if link_urls:
-            task = asyncio.create_task(
-                channel.send(
-                    content="\n".join(link_urls),
-                    allowed_mentions=discord.AllowedMentions.none(),
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content="\n".join(link_urls),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 )
             )
-            task.add_done_callback(self._log_background_task_result)
         video_url_groups = _twitter_video_url_groups(post)
         video_fallback_url = _twitter_video_fallback_url(post)
         if video_url_groups:
-            task = asyncio.create_task(
-                self._send_twitter_video_to_channel(
-                    channel, video_url_groups, video_fallback_url or post.url
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_twitter_video_to_channel(
+                        channel, video_url_groups, video_fallback_url or post.url
+                    )
                 )
             )
-            task.add_done_callback(self._log_background_task_result)
         elif video_fallback_url:
-            task = asyncio.create_task(
-                channel.send(
-                    content=video_fallback_url,
-                    allowed_mentions=discord.AllowedMentions.none(),
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content=video_fallback_url,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
                 )
             )
-            task.add_done_callback(self._log_background_task_result)
+        if followup_tasks:
+            results = await asyncio.gather(*followup_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    LOGGER.error(
+                        "X 게시물 후속 메시지 전송 실패 (post_id=%s, title=%r).",
+                        post.post_id,
+                        post.title,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
         return message
 
     async def _send_twitter_post_followups(
@@ -5385,6 +5553,12 @@ def _is_steam_news_url(url: str) -> bool:
     return parsed.path.lower().startswith("/news/app/")
 
 
+def _steam_news_url_key(url: str) -> str | None:
+    if not _is_steam_news_url(url):
+        return None
+    return urlparse(url).path.lower().rstrip("/")
+
+
 def _embed_for_twitter_post(
     post: TwitterPost,
     *,
@@ -5940,24 +6114,107 @@ def _normalize_news_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _matching_steam_posts_for_twitter(
+    post: TwitterPost,
+    steam_posts: list[NewsPost],
+) -> list[NewsPost]:
+    raw = post.raw
+    link_urls = [str(url) for url in raw.get("link_urls", []) if url] if isinstance(raw.get("link_urls"), list) else []
+    link_keys = {
+        key
+        for key in (_steam_news_url_key(url) for url in link_urls)
+        if key is not None
+    }
+    normalized_text = _normalize_news_text(post.text or post.title)
+    matched: list[NewsPost] = []
+    seen: set[str] = set()
+    for steam_post in steam_posts:
+        steam_key = _steam_news_url_key(steam_post.url)
+        text_matches = (
+            normalized_text
+            and normalized_text == _normalize_news_text(steam_post.text or steam_post.title)
+        )
+        if not (
+            steam_post.url in link_urls
+            or (steam_key is not None and steam_key in link_keys)
+            or text_matches
+        ):
+            continue
+        if steam_post.post_id in seen:
+            continue
+        seen.add(steam_post.post_id)
+        matched.append(steam_post)
+    return matched
+
+
+def _twitter_post_is_faster_than_steam(
+    post: TwitterPost,
+    steam_posts: list[NewsPost],
+) -> bool:
+    twitter_at = _as_utc_datetime(post.created_at)
+    if twitter_at is None:
+        return False
+    steam_times = [
+        created_at
+        for created_at in (_as_utc_datetime(steam_post.created_at) for steam_post in steam_posts)
+        if created_at is not None
+    ]
+    return not steam_times or twitter_at <= min(steam_times)
+
+
+def _steam_posts_without_fast_twitter_duplicates(
+    steam_posts: list[NewsPost],
+    twitter_news: list[NewsPost],
+) -> list[NewsPost]:
+    skip_ids: set[str] = set()
+    skip_keys: set[str] = set()
+    for post in twitter_news:
+        raw_ids = post.raw.get("overlap_steam_post_ids")
+        if isinstance(raw_ids, list):
+            skip_ids.update(str(post_id) for post_id in raw_ids if post_id)
+        raw_keys = post.raw.get("overlap_steam_post_keys")
+        if isinstance(raw_keys, list):
+            skip_keys.update(str(post_key) for post_key in raw_keys if post_key)
+    if not skip_ids and not skip_keys:
+        return steam_posts
+    return [
+        post
+        for post in steam_posts
+        if post.post_id not in skip_ids
+        and ((_post_language_independent_id(post) or "") not in skip_keys)
+    ]
+
+
 def _twitter_posts_as_news_posts(
     posts: list[TwitterPost],
     steam_posts: list[NewsPost],
 ) -> list[NewsPost]:
-    steam_urls = {post.url for post in steam_posts if post.url}
-    steam_texts = {
-        _normalize_news_text(post.text or post.title)
-        for post in steam_posts
-        if post.text or post.title
-    }
     converted: list[NewsPost] = []
     for post in posts:
         raw = dict(post.raw)
-        link_urls = [str(url) for url in raw.get("link_urls", []) if url] if isinstance(raw.get("link_urls"), list) else []
-        if any(_is_steam_news_url(url) or url in steam_urls for url in link_urls):
+        matching_steam_posts = _matching_steam_posts_for_twitter(post, steam_posts)
+        if matching_steam_posts and not _twitter_post_is_faster_than_steam(post, matching_steam_posts):
             continue
-        if _normalize_news_text(post.text or post.title) in steam_texts:
-            continue
+        if matching_steam_posts:
+            raw["overlap_steam_post_ids"] = [
+                steam_post.post_id for steam_post in matching_steam_posts
+            ]
+            raw["overlap_steam_post_keys"] = [
+                post_key
+                for post_key in (
+                    _post_language_independent_id(steam_post)
+                    for steam_post in matching_steam_posts
+                )
+                if post_key is not None
+            ]
         raw["source_type"] = NEWS_SOURCE_TWITTER
         raw["language"] = "koreana"
         converted.append(
@@ -6213,6 +6470,60 @@ def _log_level_from_env() -> int:
     return level if isinstance(level, int) else logging.INFO
 
 
+def _keepalive_socket_factory(addr_info: tuple) -> socket.socket:
+    family, type_, proto, _, _ = addr_info
+    sock = socket.socket(family, type_, proto)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        try:
+            sock.ioctl(
+                socket.SIO_KEEPALIVE_VALS,
+                (1, WINDOWS_KEEPALIVE_TIME_MS, WINDOWS_KEEPALIVE_INTERVAL_MS),
+            )
+        except OSError:
+            pass
+    for option_name, value in (
+        ("TCP_KEEPIDLE", TCP_KEEPALIVE_IDLE_SECONDS),
+        ("TCP_KEEPALIVE", TCP_KEEPALIVE_IDLE_SECONDS),
+        ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL_SECONDS),
+        ("TCP_KEEPCNT", TCP_KEEPALIVE_PROBES),
+    ):
+        option = getattr(socket, option_name, None)
+        if option is None:
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            pass
+    return sock
+
+
+def _prevent_windows_sleep() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        result = ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        )
+    except Exception:
+        LOGGER.exception("Windows 절전 방지 설정 실패.")
+        return False
+    if not result:
+        LOGGER.warning("Windows 절전 방지 설정이 적용되지 않았습니다.")
+        return False
+    LOGGER.info("봇 실행 중 Windows 시스템 절전을 방지합니다.")
+    return True
+
+
+def _restore_windows_sleep() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    except Exception:
+        LOGGER.exception("Windows 절전 방지 해제 실패.")
+
+
 async def main() -> None:
     _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
     _log_dir = os.path.join(_base, "logs")
@@ -6279,8 +6590,15 @@ async def main() -> None:
     storage = SQLiteStorage(config.database_path)
     session: aiohttp.ClientSession | None = None
     bot: LimpiBot | None = None
+    sleep_prevented = _prevent_windows_sleep()
     try:
-        session = aiohttp.ClientSession()
+        connector = aiohttp.TCPConnector(
+            keepalive_timeout=AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS,
+            socket_factory=_keepalive_socket_factory,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        session = aiohttp.ClientSession(connector=connector)
         news_source = build_news_source(config, session)
         x_source = LimbusXClient(config, session)
         bot = LimpiBot(config)
@@ -6363,6 +6681,8 @@ async def main() -> None:
             await bot.close()
         if session is not None and not session.closed:
             await session.close()
+        if sleep_prevented:
+            _restore_windows_sleep()
         storage.close()
 
 

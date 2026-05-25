@@ -14,6 +14,7 @@ import aiohttp
 PROJECT_MOON_YOUTUBE_STREAMS_URL = "https://www.youtube.com/@ProjectMoonOfficial/streams"
 YOUTUBE_LIVE_CACHE_SECONDS = 30
 YOUTUBE_STREAM_CANDIDATE_LIMIT = 3
+YOUTUBE_REQUEST_TIMEOUT_SECONDS = 10
 YOUTUBE_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -64,7 +65,10 @@ class YoutubeClient:
         ):
             return self._live_cache
 
-        candidates = await self._fetch_stream_candidates(limit=YOUTUBE_STREAM_CANDIDATE_LIMIT)
+        try:
+            candidates = await self._fetch_stream_candidates(limit=YOUTUBE_STREAM_CANDIDATE_LIMIT)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
+            return self._live_cache
         live = await self._live_from_candidates(candidates)
         self._live_cache = live
         self._live_cache_at = now
@@ -89,9 +93,12 @@ class YoutubeClient:
         if not candidates:
             return None
         players = await asyncio.gather(
-            *[self._fetch_player_response(str(c["video_id"])) for c in candidates]
+            *[self._fetch_player_response(str(c["video_id"])) for c in candidates],
+            return_exceptions=True,
         )
         for candidate, player in zip(candidates, players):
+            if isinstance(player, BaseException):
+                continue
             if not _is_youtube_live_now(player):
                 continue
             details = player.get("videoDetails") if isinstance(player.get("videoDetails"), dict) else {}
@@ -116,14 +123,17 @@ class YoutubeClient:
         return None
 
     async def _fetch_stream_candidates(self, *, limit: int) -> list[dict[str, Any]]:
-        async with self.session.get(
-            self.streams_url,
-            headers={"User-Agent": YOUTUBE_USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as response:
-            if response.status != 200:
-                return []
-            text = await response.text()
+        try:
+            async with self.session.get(
+                self.streams_url,
+                headers={"User-Agent": YOUTUBE_USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=YOUTUBE_REQUEST_TIMEOUT_SECONDS),
+            ) as response:
+                if response.status != 200:
+                    return []
+                text = await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
+            return []
 
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -164,14 +174,17 @@ class YoutubeClient:
 
     async def _fetch_player_response(self, video_id: str) -> dict[str, Any]:
         url = f"https://www.youtube.com/watch?v={video_id}"
-        async with self.session.get(
-            url,
-            headers={"User-Agent": YOUTUBE_USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as response:
-            if response.status != 200:
-                return {}
-            text = await response.text()
+        try:
+            async with self.session.get(
+                url,
+                headers={"User-Agent": YOUTUBE_USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=YOUTUBE_REQUEST_TIMEOUT_SECONDS),
+            ) as response:
+                if response.status != 200:
+                    return {}
+                text = await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError):
+            return {}
         match = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.*?\});", text)
         if not match:
             return {}
