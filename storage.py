@@ -182,6 +182,18 @@ class SQLiteStorage:
                     ON DELETE CASCADE
             )
         """,
+        "guild_news_target_pending_updates": """
+            CREATE TABLE IF NOT EXISTS guild_news_target_pending_updates (
+                target_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                queued_at TEXT NOT NULL,
+                sent_at TEXT,
+                PRIMARY KEY (target_id, post_id),
+                FOREIGN KEY (target_id) REFERENCES guild_news_targets(target_id)
+                    ON DELETE CASCADE
+            )
+        """,
         "tracked_messages": """
             CREATE TABLE IF NOT EXISTS tracked_messages (
                 guild_id INTEGER NOT NULL,
@@ -287,6 +299,12 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_news_target_seen_posts_post_id
                 ON guild_news_target_seen_posts(post_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_news_target_pending_updates_sent_at
+                ON guild_news_target_pending_updates(sent_at, queued_at)
                 """
             )
             self._connection.execute(
@@ -1695,6 +1713,118 @@ class SQLiteStorage:
             )
             self._connection.commit()
 
+    def _queue_news_update_targets_locked(
+        self,
+        post_id: str,
+        content_hash: str,
+        queued_at: str,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO guild_news_target_pending_updates (
+                target_id, post_id, content_hash, queued_at, sent_at
+            )
+            SELECT target_id, post_id, ?, ?, NULL
+            FROM guild_news_target_seen_posts
+            WHERE post_id = ? AND announced_at IS NOT NULL
+            ON CONFLICT(target_id, post_id) DO UPDATE SET
+                content_hash = excluded.content_hash,
+                queued_at = excluded.queued_at,
+                sent_at = NULL
+            WHERE guild_news_target_pending_updates.content_hash != excluded.content_hash
+            """,
+            (content_hash, queued_at, post_id),
+        )
+
+    def get_pending_news_update_targets(
+        self,
+        post_ids: Iterable[str] | None = None,
+    ) -> list[tuple[str, GuildNewsTarget]]:
+        ids = list(dict.fromkeys(post_ids or []))
+        params: list[object] = []
+        post_filter = ""
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            post_filter = f"AND pending.post_id IN ({placeholders})"
+            params.extend(ids)
+
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT pending.post_id,
+                       gnt.target_id, gnt.guild_id, gnt.channel_id, gnt.language,
+                       gnt.created_at, gnt.updated_at
+                FROM guild_news_target_pending_updates pending
+                JOIN guild_news_targets gnt ON gnt.target_id = pending.target_id
+                JOIN guild_settings gs ON gs.guild_id = gnt.guild_id
+                WHERE pending.sent_at IS NULL
+                  AND gs.enabled = 1
+                  {post_filter}
+                ORDER BY pending.queued_at ASC, gnt.guild_id, gnt.channel_id
+                """,
+                params,
+            ).fetchall()
+
+        return [
+            (str(row["post_id"]), self._row_to_news_target(row))
+            for row in rows
+        ]
+
+    def mark_news_update_sent(self, target_id: int, post_id: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_news_target_pending_updates
+                SET sent_at = ?
+                WHERE target_id = ? AND post_id = ?
+                """,
+                (now, target_id, post_id),
+            )
+            self._connection.commit()
+
+    def queue_news_update_for_announced_targets(self, post_id: str) -> int:
+        now = _now_iso()
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                INSERT INTO guild_news_target_pending_updates (
+                    target_id, post_id, content_hash, queued_at, sent_at
+                )
+                SELECT DISTINCT gnt.target_id, posts.post_id, posts.content_hash, ?, NULL
+                FROM posts
+                JOIN guild_news_targets gnt ON gnt.language = posts.language
+                JOIN guild_settings gs ON gs.guild_id = gnt.guild_id
+                WHERE posts.post_id = ?
+                  AND gs.enabled = 1
+                  AND (
+                    EXISTS (
+                        SELECT 1
+                        FROM guild_news_target_seen_posts gntsp
+                        WHERE gntsp.target_id = gnt.target_id
+                          AND gntsp.post_id = posts.post_id
+                          AND gntsp.announced_at IS NOT NULL
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM guild_seen_posts gsp
+                        WHERE gsp.guild_id = gnt.guild_id
+                          AND gsp.post_id = posts.post_id
+                          AND gsp.announced_at IS NOT NULL
+                    )
+                  )
+                ON CONFLICT(target_id, post_id) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    queued_at = excluded.queued_at,
+                    sent_at = NULL
+                WHERE guild_news_target_pending_updates.sent_at IS NULL
+                """,
+                (now, post_id),
+            )
+            self._connection.commit()
+
+        return int(cursor.rowcount or 0)
+
     def save_posts(self, posts: Iterable[NewsPost]) -> tuple[int, list[str]]:
         posts_list = list(posts)
         if not posts_list:
@@ -1751,6 +1881,7 @@ class SQLiteStorage:
                     saved += 1
                 if old_hash is not None and old_hash != "" and old_hash != new_hash:
                     changed_post_ids.append(post.post_id)
+                    self._queue_news_update_targets_locked(post.post_id, new_hash, now)
             self._connection.commit()
 
         return saved, changed_post_ids

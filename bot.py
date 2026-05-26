@@ -48,6 +48,7 @@ POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 80
+STARTUP_NEWS_UPDATE_RECOVERY_POST_IDS = ("steam:koreana:698765376653099268",)
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
@@ -908,8 +909,7 @@ class NewsCog(commands.Cog):
                     continue
                 announced_count += result
 
-        if changed_post_ids:
-            await self._broadcast_post_updates(changed_post_ids)
+        await self._broadcast_post_updates(changed_post_ids)
         return announced_count
 
     async def _sync_global_news_cache(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
@@ -1850,11 +1850,17 @@ class NewsCog(commands.Cog):
             return False
 
     async def _broadcast_post_updates(self, post_ids: list[str]) -> None:
-        for post_id in post_ids:
+        pending_targets = self.storage.get_pending_news_update_targets()
+        targets_by_post_id: dict[str, list[GuildNewsTarget]] = {}
+        for pending_post_id, target in pending_targets:
+            targets_by_post_id.setdefault(pending_post_id, []).append(target)
+
+        pending_post_ids = list(dict.fromkeys([*post_ids, *targets_by_post_id.keys()]))
+        for post_id in pending_post_ids:
             post = self.storage.get_post(post_id)
             if post is None:
                 continue
-            targets = self.storage.get_announced_news_targets(post_id)
+            targets = targets_by_post_id.get(post_id, [])
             if not targets:
                 continue
             LOGGER.info(
@@ -1878,6 +1884,7 @@ class NewsCog(commands.Cog):
                         banner_filename=settings.notification_banner,
                         is_update=True,
                     )
+                    self.storage.mark_news_update_sent(target.target_id, post_id)
                 except Exception:
                     LOGGER.exception(
                         "뉴스 수정 재전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
@@ -2633,6 +2640,18 @@ class NewsCog(commands.Cog):
                     )
                 else:
                     LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
+                recovered_post_ids: list[str] = []
+                for post_id in STARTUP_NEWS_UPDATE_RECOVERY_POST_IDS:
+                    queued = self.storage.queue_news_update_for_announced_targets(post_id)
+                    if queued:
+                        recovered_post_ids.append(post_id)
+                        LOGGER.info(
+                            "시작 시 수정 소식 복구 큐 등록: post_id=%s targets=%s.",
+                            post_id,
+                            queued,
+                        )
+                if recovered_post_ids:
+                    await self._broadcast_post_updates(recovered_post_ids)
             except Exception:
                 LOGGER.exception("시작 시 뉴스 동기화 실패.")
         await self._sync_youtube_startup_baseline()
