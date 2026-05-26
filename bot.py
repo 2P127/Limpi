@@ -1874,7 +1874,7 @@ class NewsCog(commands.Cog):
                     await self._broadcast_post(
                         channel,
                         post,
-                        settings.role_id,
+                        None,
                         banner_filename=settings.notification_banner,
                         is_update=True,
                     )
