@@ -18,6 +18,8 @@ AGENTS.md
 BOT_USAGE.md
 RELEASE_GUIDE.md
 *.md
+!docs/project-overview.md
 /.claude
 /.claude
 .claude/settings.local.json
+/docs
