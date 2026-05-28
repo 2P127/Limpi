@@ -61,8 +61,8 @@ CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
-AUTO_NEWS_MAX_AGE = timedelta(minutes=10)
 NEWS_TARGET_SEND_CONCURRENCY = 12
+LATEST_NEWS_RECOVERY_NOTICE = "봇 네트워크 오류로 인해 소식 전달이 늦었습니다 ㅠㅠ.. 죄송합니다"
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 20
@@ -936,20 +936,31 @@ class NewsCog(commands.Cog):
             return {}, []
 
         posts_by_language: dict[str, list[NewsPost]] = {}
-        all_posts: list[NewsPost] = []
+        fetched_posts: list[NewsPost] = []
+        changed: list[str] = []
         results = await asyncio.gather(
             *(
                 self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
                 for language in SYNC_LANGUAGES
-            )
+            ),
+            return_exceptions=True,
         )
-        for language, posts in zip(SYNC_LANGUAGES, results):
+        for language, result in zip(SYNC_LANGUAGES, results):
+            if isinstance(result, Exception):
+                LOGGER.warning(
+                    "Steam 뉴스 자동 확인 실패: language=%s. 저장된 소식을 사용합니다.",
+                    language,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                posts = self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
+            else:
+                posts = result
+                fetched_posts.extend(posts[:NEWS_POST_LIMIT])
             posts_by_language[language] = posts[:NEWS_POST_LIMIT]
-            all_posts.extend(posts_by_language[language])
 
-        if all_posts:
-            _, changed = self.storage.save_posts(all_posts)
-            self._schedule_image_cache_warmup(all_posts)
+        if fetched_posts:
+            _, changed = self.storage.save_posts(fetched_posts)
+            self._schedule_image_cache_warmup(fetched_posts)
         return posts_by_language, changed
 
     async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
@@ -979,7 +990,11 @@ class NewsCog(commands.Cog):
             LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
             twitter_posts = []
         elif isinstance(twitter_result, Exception):
-            raise twitter_result
+            LOGGER.warning(
+                "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다.",
+                exc_info=(type(twitter_result), twitter_result, twitter_result.__traceback__),
+            )
+            twitter_posts = []
         else:
             _, twitter_posts = twitter_result
 
@@ -1633,7 +1648,35 @@ class NewsCog(commands.Cog):
     ) -> list[NewsPost]:
         fetched_post_ids = [post.post_id for post in posts_newest_first]
         has_seen_baseline = self.storage.has_seen_posts(settings.guild_id)
-        seen_post_ids = self.storage.get_seen_post_ids(settings.guild_id, fetched_post_ids)
+        seen_post_statuses = self.storage.get_seen_post_statuses(
+            settings.guild_id,
+            fetched_post_ids,
+        )
+        announced_seen_post_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if announced
+        }
+        if announced_seen_post_ids:
+            newest_announced_index = min(
+                fetched_post_ids.index(post_id)
+                for post_id in announced_seen_post_ids
+                if post_id in fetched_post_ids
+            )
+            candidates = [
+                post
+                for post in reversed(posts_newest_first[:newest_announced_index])
+                if not seen_post_statuses.get(post.post_id, False)
+            ]
+            recovered = [post.post_id for post in candidates if post.post_id in seen_post_statuses]
+            if recovered:
+                LOGGER.info(
+                    "발송 완료 표시가 없는 뉴스 seen 항목을 자동 전송 후보로 복구합니다 "
+                    "(guild_id=%s, post_ids=%s).",
+                    settings.guild_id,
+                    ", ".join(recovered),
+                )
+            return _recent_auto_posts(candidates)
+
+        seen_post_ids = set(seen_post_statuses)
         if seen_post_ids:
             return _recent_auto_posts([
                 post
@@ -1685,10 +1728,37 @@ class NewsCog(commands.Cog):
     ) -> list[NewsPost]:
         fetched_post_ids = [post.post_id for post in posts_newest_first]
         has_seen_baseline = self.storage.news_target_has_seen_posts(target.target_id)
-        seen_post_ids = self.storage.get_news_target_seen_post_ids(
+        seen_post_statuses = self.storage.get_news_target_seen_post_statuses(
             target.target_id,
             fetched_post_ids,
         )
+        announced_seen_post_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if announced
+        }
+        if announced_seen_post_ids:
+            newest_announced_index = min(
+                fetched_post_ids.index(post_id)
+                for post_id in announced_seen_post_ids
+                if post_id in fetched_post_ids
+            )
+            candidates = [
+                post
+                for post in reversed(posts_newest_first[:newest_announced_index])
+                if not seen_post_statuses.get(post.post_id, False)
+            ]
+            recovered = [post.post_id for post in candidates if post.post_id in seen_post_statuses]
+            if recovered:
+                LOGGER.info(
+                    "발송 완료 표시가 없는 뉴스 seen 항목을 자동 전송 후보로 복구합니다 "
+                    "(guild_id=%s, channel_id=%s, language=%s, post_ids=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    target.language,
+                    ", ".join(recovered),
+                )
+            return _recent_auto_posts(candidates)
+
+        seen_post_ids = set(seen_post_statuses)
         if seen_post_ids:
             return _recent_auto_posts([
                 post
@@ -1733,6 +1803,7 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        recovery_notice: str | None = None,
     ) -> bool:
         channel_id = getattr(channel, "id", settings.channel_id)
         try:
@@ -1742,6 +1813,7 @@ class NewsCog(commands.Cog):
                 settings.role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
+                recovery_notice=recovery_notice,
             )
             return True
         except discord.Forbidden as exc:
@@ -1803,6 +1875,7 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        recovery_notice: str | None = None,
     ) -> bool:
         try:
             await self._broadcast_post(
@@ -1811,6 +1884,7 @@ class NewsCog(commands.Cog):
                 settings.role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
+                recovery_notice=recovery_notice,
             )
             return True
         except discord.Forbidden as exc:
@@ -1921,6 +1995,7 @@ class NewsCog(commands.Cog):
         banner_filename: str | None = None,
         is_update: bool = False,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        recovery_notice: str | None = None,
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -1936,6 +2011,7 @@ class NewsCog(commands.Cog):
             include_zip_button=True,
             include_banner=banner_file is not None,
             is_update=is_update,
+            recovery_notice=recovery_notice,
         )
         image_batch_tasks = (
             batch_tasks
@@ -2677,30 +2753,108 @@ class NewsCog(commands.Cog):
         try:
             if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
                 LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
-                return
-            if not self._is_twitter_tracking_window(datetime.now(timezone.utc)):
+            elif not self._is_twitter_tracking_window(datetime.now(timezone.utc)):
                 LOGGER.info(
                     "시작 시 X 게시물 동기화 생략: 현재 X 추적 시간대가 아닙니다 (KST %s).",
                     TWITTER_TRACKING_WINDOW_LABEL,
                 )
-                return
-
-            saved, _ = await self._sync_twitter_posts()
-            latest = self.storage.get_latest_twitter_post()
-            if latest is not None:
-                LOGGER.info(
-                    "시작 시 X 게시물 동기화 완료: %d개 저장. 최신 소식: %s (%s)",
-                    saved,
-                    latest.title,
-                    latest.url,
-                )
             else:
-                LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
+                saved, _ = await self._sync_twitter_posts()
+                latest = self.storage.get_latest_twitter_post()
+                if latest is not None:
+                    LOGGER.info(
+                        "시작 시 X 게시물 동기화 완료: %d개 저장. 최신 소식: %s (%s)",
+                        saved,
+                        latest.title,
+                        latest.url,
+                    )
+                else:
+                    LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
         except XClientError as exc:
             LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
         LOGGER.info("시작 시 동기화 처리 완료.")
+        await self.recover_latest_unannounced_news()
+        await self.run_startup_news_delivery()
+
+    async def recover_latest_unannounced_news(self) -> int:
+        targets = self.storage.list_all_news_targets()
+        if not targets:
+            return 0
+
+        latest = self.storage.get_latest_post(self.config.steam_language)
+        if latest is None:
+            latest = self.storage.get_latest_post()
+        if latest is None:
+            LOGGER.info("최신 뉴스 지연 복구 생략: 저장된 소식이 없습니다.")
+            return 0
+
+        sent_count = 0
+        skipped_count = 0
+        for target in targets:
+            settings = self.storage.get_settings(target.guild_id)
+            if not settings.enabled:
+                skipped_count += 1
+                continue
+
+            post = self._post_variant_for_language(latest, target.language)
+            if post is None:
+                skipped_count += 1
+                continue
+            if not self._posts_for_source_mode([post], settings):
+                skipped_count += 1
+                continue
+
+            post_status = self.storage.get_news_target_seen_post_statuses(
+                target.target_id,
+                [post.post_id],
+            )
+            if post_status.get(post.post_id, False):
+                skipped_count += 1
+                continue
+
+            channel = await self._resolve_automatic_news_channel(target)
+            if channel is None:
+                skipped_count += 1
+                continue
+
+            sent = await self._send_news_post_to_target(
+                channel,
+                settings,
+                target,
+                post,
+                recovery_notice=LATEST_NEWS_RECOVERY_NOTICE,
+            )
+            if not sent:
+                continue
+
+            self.storage.mark_news_target_posts_seen(
+                target.target_id,
+                [post.post_id],
+                announced=True,
+            )
+            self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
+            self.storage.set_last_seen_post_id(target.guild_id, post.post_id)
+            sent_count += 1
+
+        LOGGER.info(
+            "최신 뉴스 지연 복구 확인 완료: post_id=%s, title=%r, sent=%s, skipped=%s.",
+            latest.post_id,
+            latest.title,
+            sent_count,
+            skipped_count,
+        )
+        return sent_count
+
+    async def run_startup_news_delivery(self) -> None:
+        async with self._poll_lock:
+            try:
+                announced = await self._poll_once()
+                self._last_poll_at = datetime.now(timezone.utc)
+                LOGGER.info("시작 시 새 소식 자동 전송 확인 완료: sent=%s.", announced)
+            except Exception:
+                LOGGER.exception("시작 시 새 소식 자동 전송 확인 실패.")
 
     async def _sync_youtube_startup_baseline(self) -> None:
         targets = self.storage.list_youtube_targets()
@@ -5853,6 +6007,7 @@ def _build_layout_view_for_post(
     include_banner: bool,
     leading_text: str | None = None,
     is_update: bool = False,
+    recovery_notice: str | None = None,
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=_post_embed_color(post))
@@ -5908,6 +6063,10 @@ def _build_layout_view_for_post(
     if action_row.children:
         container.add_item(discord.ui.Separator())
         container.add_item(action_row)
+
+    if recovery_notice:
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(recovery_notice))
 
     view.add_item(container)
     return view
@@ -6206,17 +6365,7 @@ def _dedupe_posts_by_id(posts: list[NewsPost]) -> list[NewsPost]:
 
 
 def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
-    cutoff = datetime.now(timezone.utc) - AUTO_NEWS_MAX_AGE
-    recent: list[NewsPost] = []
-    for post in posts:
-        created_at = post.created_at
-        if created_at is None:
-            continue
-        if created_at.tzinfo is None:
-            created_at = created_at.replace(tzinfo=timezone.utc)
-        if created_at >= cutoff:
-            recent.append(post)
-    return recent
+    return [post for post in posts if post.created_at is not None]
 
 
 def _delay_seconds(value: datetime | None) -> int | str:

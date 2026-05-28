@@ -1608,6 +1608,23 @@ class SQLiteStorage:
 
         return {str(row["post_id"]) for row in rows}
 
+    def get_seen_post_statuses(self, guild_id: int, post_ids: Iterable[str]) -> dict[str, bool]:
+        ids = list(dict.fromkeys(post_ids))
+        if not ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT post_id, announced_at FROM guild_seen_posts
+                WHERE guild_id = ? AND post_id IN ({placeholders})
+                """,
+                (guild_id, *ids),
+            ).fetchall()
+
+        return {str(row["post_id"]): row["announced_at"] is not None for row in rows}
+
     def has_seen_posts(self, guild_id: int) -> bool:
         with self._lock:
             row = self._connection.execute(
@@ -1668,6 +1685,25 @@ class SQLiteStorage:
             ).fetchall()
 
         return {str(row["post_id"]) for row in rows}
+
+    def get_news_target_seen_post_statuses(
+        self, target_id: int, post_ids: Iterable[str]
+    ) -> dict[str, bool]:
+        ids = list(dict.fromkeys(post_ids))
+        if not ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in ids)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT post_id, announced_at FROM guild_news_target_seen_posts
+                WHERE target_id = ? AND post_id IN ({placeholders})
+                """,
+                (target_id, *ids),
+            ).fetchall()
+
+        return {str(row["post_id"]): row["announced_at"] is not None for row in rows}
 
     def news_target_has_seen_posts(self, target_id: int) -> bool:
         with self._lock:

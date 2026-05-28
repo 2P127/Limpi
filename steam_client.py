@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import json
@@ -77,7 +78,11 @@ class SteamNewsSource:
     ) -> list[NewsPost]:
         language = language or self.config.steam_language
         limit = limit or self.config.max_posts_per_poll
-        event_posts = await self._fetch_event_posts(language)
+        try:
+            event_posts = await self._fetch_event_posts(language)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, RuntimeError) as exc:
+            LOGGER.warning("Steam initial event data request failed. Falling back to RSS: %s", exc)
+            event_posts = []
         if event_posts:
             return _sort_newest_first(event_posts)[:limit]
 
