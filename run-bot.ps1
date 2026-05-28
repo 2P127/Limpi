@@ -67,7 +67,7 @@ if (-not $dependenciesInstalled) {
 
 Write-Host "Starting Limpi bot..."
 if ($testMode) {
-    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("bot.py", "--test")
+    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("-m", "src.bot", "--test")
 } else {
-    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("bot.py")
+    Invoke-NativeOrThrow -FilePath $venvPython -Arguments @("-m", "src.bot")
 }

@@ -9,7 +9,7 @@ multiprocessing.freeze_support()
 _WORKER_FLAG = "--bot-worker"
 if _WORKER_FLAG in sys.argv:
     import asyncio
-    import bot
+    from src import bot
     try:
         sys.exit(asyncio.run(bot.main()))
     except KeyboardInterrupt:
@@ -39,9 +39,9 @@ if getattr(sys, "frozen", False):
     _MEIPASS = getattr(sys, "_MEIPASS", _BASE)
     ICON_PATH = os.path.join(_MEIPASS, "logo.ico")
 else:
-    _BASE = os.path.dirname(os.path.abspath(__file__))
+    _BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     PYTHON = sys.executable
-    BOT_SCRIPT = os.path.join(_BASE, "bot.py")
+    BOT_SCRIPT = None
     ICON_PATH = os.path.join(_BASE, "logo.ico")
 MAX_LOG_LINES = 2000
 
@@ -82,8 +82,8 @@ class BotProcess:
                 cmd = [PYTHON, _WORKER_FLAG]
                 cwd = _BASE
             else:
-                cmd = [PYTHON, BOT_SCRIPT]
-                cwd = os.path.dirname(BOT_SCRIPT)
+                cmd = [PYTHON, "-m", "src.bot"]
+                cwd = _BASE
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

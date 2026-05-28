@@ -13,8 +13,8 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import aiohttp
 
-from config import AppConfig
-from models import TwitterPost
+from ..core.config import AppConfig
+from ..core.models import TwitterPost
 
 LOGGER = logging.getLogger(__name__)
 X_POST_CACHE_TTL = timedelta(seconds=5)

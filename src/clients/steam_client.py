@@ -14,8 +14,8 @@ from xml.etree import ElementTree
 
 import aiohttp
 
-from config import AppConfig
-from models import NewsPost
+from ..core.config import AppConfig
+from ..core.models import NewsPost
 
 
 LOGGER = logging.getLogger(__name__)

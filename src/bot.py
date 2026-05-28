@@ -23,15 +23,15 @@ from PIL import Image, UnidentifiedImageError
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from chzzk_client import (
+from .clients.chzzk_client import (
     ChzzkBroadcast,
     ChzzkClient,
     ChzzkLive,
     PROJECT_MOON_CHZZK_LIVE_URL,
 )
-from config import AppConfig, BOT_VERSION
-from models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, GuildYoutubeTarget, NewsPost, TwitterPost
-from storage import (
+from .core.config import AppConfig, BOT_VERSION
+from .core.models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, GuildYoutubeTarget, NewsPost, TwitterPost
+from .core.storage import (
     DEFAULT_NOTIFICATION_BANNER,
     DEFAULT_NEWS_SOURCE_MODE,
     DISABLED_NOTIFICATION_BANNER,
@@ -39,9 +39,9 @@ from storage import (
     MIN_CLEANUP_DAYS,
     SQLiteStorage,
 )
-from steam_client import NewsSource, build_news_source
-from x_client import LimbusXClient, XClientError
-from youtube_client import PROJECT_MOON_YOUTUBE_STREAMS_URL, YoutubeClient, YoutubeLive, YoutubeStream
+from .clients.steam_client import NewsSource, build_news_source
+from .clients.x_client import LimbusXClient, XClientError
+from .clients.youtube_client import PROJECT_MOON_YOUTUBE_STREAMS_URL, YoutubeClient, YoutubeLive, YoutubeStream
 
 
 POST_FORMAT_RICH = "rich"
@@ -5596,7 +5596,7 @@ def _filter_image_urls(urls: list[str]) -> list[str]:
 
 
 def _resource_path(relative_path: Path) -> Path:
-    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     return base_path / relative_path
 
 
@@ -7095,7 +7095,7 @@ def _build_aiohttp_connector() -> aiohttp.TCPConnector:
 
 
 async def main() -> None:
-    _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    _base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _log_dir = os.path.join(_base, "logs")
     os.makedirs(_log_dir, exist_ok=True)
     _now = datetime.now()

@@ -11,7 +11,7 @@ from typing import Iterable
 
 LOGGER = logging.getLogger(__name__)
 
-from models import (
+from .models import (
     GuildChzzkTarget,
     GuildNewsTarget,
     GuildTwitterTarget,
