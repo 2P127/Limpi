@@ -1427,14 +1427,12 @@ class NewsCog(commands.Cog):
                 failed_post_ids.add(post.post_id)
                 LOGGER.warning(
                     "뉴스 자동 전송 실패 "
-                    "(guild_id=%s, channel_id=%s, language=%s, post_id=%s, title=%r, "
-                    "missed_recovery_enabled=%s).",
+                    "(guild_id=%s, channel_id=%s, language=%s, post_id=%s, title=%r).",
                     target.guild_id,
                     target.channel_id,
                     target.language,
                     post.post_id,
                     post.title,
-                    settings.missed_news_recovery_enabled,
                 )
                 continue
             self.storage.mark_news_target_posts_seen(
@@ -1453,7 +1451,15 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids and not settings.missed_news_recovery_enabled:
+        if failed_post_ids and settings.missed_news_recovery_enabled:
+            LOGGER.warning(
+                "뉴스 자동 전송 실패 항목은 본 것으로 처리하지 않고 다음 자동 확인 때 다시 시도합니다 "
+                "(guild_id=%s, channel_id=%s, post_ids=%s).",
+                target.guild_id,
+                target.channel_id,
+                ", ".join(sorted(failed_post_ids)),
+            )
+        elif failed_post_ids:
             LOGGER.warning(
                 "누락 뉴스 복구가 비활성화되어 있습니다. 실패한 게시물은 해당 대상에서 본 것으로 처리되어 "
                 "이후 자동 폴링에서 건너뜁니다 (guild_id=%s, channel_id=%s, post_ids=%s).",
@@ -1604,13 +1610,11 @@ class NewsCog(commands.Cog):
                 failed_post_ids.add(post.post_id)
                 LOGGER.warning(
                     "뉴스 자동 전송 실패 "
-                    "(guild_id=%s, channel_id=%s, post_id=%s, title=%r, "
-                    "missed_recovery_enabled=%s).",
+                    "(guild_id=%s, channel_id=%s, post_id=%s, title=%r).",
                     settings.guild_id,
                     settings.channel_id,
                     post.post_id,
                     post.title,
-                    settings.missed_news_recovery_enabled,
                 )
                 continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
@@ -1622,7 +1626,15 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids and not settings.missed_news_recovery_enabled:
+        if failed_post_ids and settings.missed_news_recovery_enabled:
+            LOGGER.warning(
+                "뉴스 자동 전송 실패 항목은 본 것으로 처리하지 않고 다음 자동 확인 때 다시 시도합니다 "
+                "(guild_id=%s, channel_id=%s, post_ids=%s).",
+                settings.guild_id,
+                settings.channel_id,
+                ", ".join(sorted(failed_post_ids)),
+            )
+        elif failed_post_ids:
             LOGGER.warning(
                 "누락 뉴스 복구가 비활성화되어 있습니다. 실패한 게시물은 본 것으로 처리되어 "
                 "이후 자동 폴링에서 건너뜁니다 (guild_id=%s, channel_id=%s, post_ids=%s).",
