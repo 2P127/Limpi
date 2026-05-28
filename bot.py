@@ -658,7 +658,7 @@ class NewsCog(commands.Cog):
     @tasks.loop(seconds=60)
     async def maintenance_notifications(self) -> None:
         try:
-            await self._process_maintenance_notifications()
+            await self._process_maintenance_notifications(source="loop")
         except Exception:
             LOGGER.exception("점검 알림 처리 실패.")
 
@@ -723,11 +723,15 @@ class NewsCog(commands.Cog):
 
         self.storage.delete_tracked_message(guild_id, channel_id, message_id)
 
-    async def _process_maintenance_notifications(self) -> None:
+    async def _process_maintenance_notifications(self, *, source: str) -> int:
         notice_type, notice_key = _current_maintenance_notice()
         if notice_type is None or notice_key is None:
-            return
+            LOGGER.debug("점검 알림 확인: 보낼 시간이 아닙니다 (source=%s).", source)
+            return 0
 
+        sent_count = 0
+        skipped_count = 0
+        target_count = 0
         for settings in self.storage.list_settings():
             if (
                 not settings.maintenance_notifications_enabled
@@ -736,8 +740,10 @@ class NewsCog(commands.Cog):
             ):
                 continue
 
+            target_count += 1
             if notice_type == "start":
                 if settings.last_maintenance_start_notice == notice_key:
+                    skipped_count += 1
                     continue
                 embed = _maintenance_embed(
                     MAINTENANCE_START_TITLE,
@@ -746,6 +752,7 @@ class NewsCog(commands.Cog):
                 )
             else:
                 if settings.last_maintenance_update_notice == notice_key:
+                    skipped_count += 1
                     continue
                 embed = _maintenance_embed(
                     MAINTENANCE_UPDATE_TITLE,
@@ -760,6 +767,18 @@ class NewsCog(commands.Cog):
                     notice_type=notice_type,
                     notice_key=notice_key,
                 )
+                sent_count += 1
+
+        LOGGER.info(
+            "점검 알림 확인 완료: source=%s, notice_type=%s, notice_key=%s, targets=%s, sent=%s, skipped=%s.",
+            source,
+            notice_type,
+            notice_key,
+            target_count,
+            sent_count,
+            skipped_count,
+        )
+        return sent_count
 
     async def _send_maintenance_notice(
         self,
@@ -6904,6 +6923,7 @@ async def main() -> None:
             startup_sync_task = asyncio.create_task(cog.run_startup_sync())
             await bot.sync_connected_guild_commands()
             await startup_sync_task
+            await cog._process_maintenance_notifications(source="startup")
 
         @bot.event
         async def on_guild_join(guild: discord.Guild) -> None:
