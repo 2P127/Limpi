@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-BOT_VERSION = "0.1.8-bugfix"
+BOT_VERSION = "0.1.8-bugfix-2"
 
 SUPPORTED_STEAM_LANGUAGES = {"koreana", "english", "japanese"}
 SUPPORTED_COMMAND_SYNC_MODES = {"global", "guild"}
@@ -230,8 +230,8 @@ class AppConfig:
             high_frequency_weekdays=_get_weekdays_or_default(
                 "HIGH_FREQUENCY_POLL_DAYS", (0, 1, 2, 3, 4, 5, 6)
             ),
-            high_frequency_start_hour=_get_hour("HIGH_FREQUENCY_START_HOUR", 18, maximum=23),
-            high_frequency_end_hour=_get_hour("HIGH_FREQUENCY_END_HOUR", 20, maximum=24),
+            high_frequency_start_hour=_get_hour("HIGH_FREQUENCY_START_HOUR", 0, maximum=23),
+            high_frequency_end_hour=_get_hour("HIGH_FREQUENCY_END_HOUR", 24, maximum=24),
             command_guild_id=command_guild_id,
             command_sync_mode=_get_command_sync_mode(command_guild_id),
             announce_existing_on_first_run=_get_bool("ANNOUNCE_EXISTING_ON_FIRST_RUN", False),

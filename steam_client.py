@@ -9,7 +9,7 @@ import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from xml.etree import ElementTree
 
 import aiohttp
@@ -78,16 +78,36 @@ class SteamNewsSource:
     ) -> list[NewsPost]:
         language = language or self.config.steam_language
         limit = limit or self.config.max_posts_per_poll
+        event_posts: list[NewsPost] = []
+        rss_posts: list[NewsPost] = []
         try:
             event_posts = await self._fetch_event_posts(language)
-        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError, RuntimeError) as exc:
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            RuntimeError,
+            ElementTree.ParseError,
+        ) as exc:
             LOGGER.warning("Steam initial event data request failed. Falling back to RSS: %s", exc)
-            event_posts = []
-        if event_posts:
-            return _sort_newest_first(event_posts)[:limit]
 
-        LOGGER.warning("Steam initial event data was unavailable. Falling back to RSS.")
-        return await self._fetch_rss_posts(language, limit)
+        try:
+            rss_posts = await self._fetch_rss_posts(language, limit)
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            RuntimeError,
+            ElementTree.ParseError,
+        ) as exc:
+            if not event_posts:
+                raise
+            LOGGER.warning("Steam RSS request failed. Using initial event data only: %s", exc)
+
+        posts = _dedupe_posts_by_id([*event_posts, *rss_posts])
+        if not posts:
+            LOGGER.warning("Steam initial event data was unavailable. Falling back to RSS.")
+        return _sort_newest_first(posts)[:limit]
 
     async def _fetch_rss_posts(self, language: str, limit: int) -> list[NewsPost]:
         url = self._feed_url(language)
@@ -282,6 +302,17 @@ def _sort_newest_first(posts: list[NewsPost]) -> list[NewsPost]:
         ),
         reverse=True,
     )
+
+
+def _dedupe_posts_by_id(posts: list[NewsPost]) -> list[NewsPost]:
+    deduped: list[NewsPost] = []
+    seen: set[str] = set()
+    for post in posts:
+        if post.post_id in seen:
+            continue
+        seen.add(post.post_id)
+        deduped.append(post)
+    return deduped
 
 
 def _accept_language_header(language: str) -> str:
@@ -567,7 +598,11 @@ def _post_id_from_url(value: str | None) -> str | None:
         return None
 
     match = re.search(r"/view/(\d+)", value)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+
+    emgid = parse_qs(urlparse(value).query).get("emgid")
+    return emgid[0] if emgid else None
 
 
 def _stable_hash(value: str) -> str:

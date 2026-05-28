@@ -15,7 +15,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 import discord
@@ -49,20 +49,21 @@ LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 80
 STARTUP_NEWS_UPDATE_RECOVERY_POST_IDS = ("steam:koreana:698765376653099268",)
+STARTUP_NEWS_DELAYED_DELIVERY_POST_IDS = ("steam:koreana:717906309283840567",)
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
 TWITTER_POLL_INTERVAL_SECONDS = 10
-TWITTER_TRACKING_WINDOWS = ((0, 30), (10 * 60, 13 * 60), (17 * 60, 19 * 60))
-TWITTER_TRACKING_WINDOW_LABEL = "00:00-00:30, 10:00-13:00, 17:00-19:00"
+TWITTER_TRACKING_WINDOWS = ((0, 30), (10 * 60, 16 * 60), (17 * 60, 19 * 60))
+TWITTER_TRACKING_WINDOW_LABEL = "00:00-00:30, 10:00-16:00, 17:00-19:00"
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 NEWS_TARGET_SEND_CONCURRENCY = 12
-LATEST_NEWS_RECOVERY_NOTICE = "봇 네트워크 오류로 인해 소식 전달이 늦었습니다 ㅠㅠ.. 죄송합니다"
+LATEST_NEWS_RECOVERY_NOTICE = "봇 오류로 인해 소식 전달이 늦었습니다 ㅠㅠ.. 죄송합니다"
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 20
@@ -937,6 +938,7 @@ class NewsCog(commands.Cog):
 
         posts_by_language: dict[str, list[NewsPost]] = {}
         fetched_posts: list[NewsPost] = []
+        newest_new_posts: list[tuple[str, NewsPost]] = []
         changed: list[str] = []
         results = await asyncio.gather(
             *(
@@ -955,11 +957,21 @@ class NewsCog(commands.Cog):
                 posts = self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
             else:
                 posts = result
+                if posts and self.storage.get_post(posts[0].post_id) is None:
+                    newest_new_posts.append((language, posts[0]))
                 fetched_posts.extend(posts[:NEWS_POST_LIMIT])
             posts_by_language[language] = posts[:NEWS_POST_LIMIT]
 
         if fetched_posts:
             _, changed = self.storage.save_posts(fetched_posts)
+            for language, post in newest_new_posts:
+                LOGGER.info(
+                    "Steam 새 소식 감지: language=%s, post_id=%s, title=%r, url=%s",
+                    language,
+                    post.post_id,
+                    post.title,
+                    post.url,
+                )
             self._schedule_image_cache_warmup(fetched_posts)
         return posts_by_language, changed
 
@@ -2795,65 +2807,73 @@ class NewsCog(commands.Cog):
         if not targets:
             return 0
 
+        recovery_posts: dict[str, NewsPost] = {}
+        for post_id in STARTUP_NEWS_DELAYED_DELIVERY_POST_IDS:
+            post = self.storage.get_post(post_id)
+            if post is not None:
+                recovery_posts[post.post_id] = post
+
         latest = self.storage.get_latest_post(self.config.steam_language)
         if latest is None:
             latest = self.storage.get_latest_post()
-        if latest is None:
+        if latest is not None:
+            recovery_posts[latest.post_id] = latest
+        if not recovery_posts:
             LOGGER.info("최신 뉴스 지연 복구 생략: 저장된 소식이 없습니다.")
             return 0
 
         sent_count = 0
         skipped_count = 0
-        for target in targets:
-            settings = self.storage.get_settings(target.guild_id)
-            if not settings.enabled:
-                skipped_count += 1
-                continue
+        for latest in recovery_posts.values():
+            for target in targets:
+                settings = self.storage.get_settings(target.guild_id)
+                if not settings.enabled:
+                    skipped_count += 1
+                    continue
 
-            post = self._post_variant_for_language(latest, target.language)
-            if post is None:
-                skipped_count += 1
-                continue
-            if not self._posts_for_source_mode([post], settings):
-                skipped_count += 1
-                continue
+                post = self._post_variant_for_language(latest, target.language)
+                if post is None:
+                    skipped_count += 1
+                    continue
+                if not self._posts_for_source_mode([post], settings):
+                    skipped_count += 1
+                    continue
 
-            post_status = self.storage.get_news_target_seen_post_statuses(
-                target.target_id,
-                [post.post_id],
-            )
-            if post_status.get(post.post_id, False):
-                skipped_count += 1
-                continue
+                post_status = self.storage.get_news_target_seen_post_statuses(
+                    target.target_id,
+                    [post.post_id],
+                )
+                if post_status.get(post.post_id, False):
+                    skipped_count += 1
+                    continue
 
-            channel = await self._resolve_automatic_news_channel(target)
-            if channel is None:
-                skipped_count += 1
-                continue
+                channel = await self._resolve_automatic_news_channel(target)
+                if channel is None:
+                    skipped_count += 1
+                    continue
 
-            sent = await self._send_news_post_to_target(
-                channel,
-                settings,
-                target,
-                post,
-                recovery_notice=LATEST_NEWS_RECOVERY_NOTICE,
-            )
-            if not sent:
-                continue
+                sent = await self._send_news_post_to_target(
+                    channel,
+                    settings,
+                    target,
+                    post,
+                    recovery_notice=LATEST_NEWS_RECOVERY_NOTICE,
+                )
+                if not sent:
+                    continue
 
-            self.storage.mark_news_target_posts_seen(
-                target.target_id,
-                [post.post_id],
-                announced=True,
-            )
-            self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
-            self.storage.set_last_seen_post_id(target.guild_id, post.post_id)
-            sent_count += 1
+                self.storage.mark_news_target_posts_seen(
+                    target.target_id,
+                    [post.post_id],
+                    announced=True,
+                )
+                self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
+                self.storage.set_last_seen_post_id(target.guild_id, post.post_id)
+                sent_count += 1
 
         LOGGER.info(
-            "최신 뉴스 지연 복구 확인 완료: post_id=%s, title=%r, sent=%s, skipped=%s.",
-            latest.post_id,
-            latest.title,
+            "최신 뉴스 지연 복구 확인 완료: post_ids=%s, sent=%s, skipped=%s.",
+            ", ".join(post.post_id for post in recovery_posts.values()),
             sent_count,
             skipped_count,
         )
@@ -2949,6 +2969,8 @@ class NewsCog(commands.Cog):
             return 0
 
         posts = posts[:TWITTER_POST_LIMIT]
+        await self._refresh_steam_cache_for_twitter_links(posts)
+        steam_posts_by_twitter_id = self._steam_posts_by_twitter_post_id(posts)
         send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
 
         async def process_target(target: GuildTwitterTarget) -> int:
@@ -2965,6 +2987,18 @@ class NewsCog(commands.Cog):
                 announced = 0
                 image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
                 for post in new_posts:
+                    matching_steam_posts = steam_posts_by_twitter_id.get(post.post_id, [])
+                    if matching_steam_posts:
+                        self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
+                        LOGGER.info(
+                            "X 게시물 자동 전송 생략: 같은 Steam 소식을 우선합니다 "
+                            "(guild_id=%s, channel_id=%s, twitter_post_id=%s, steam_post_ids=%s).",
+                            target.guild_id,
+                            target.channel_id,
+                            post.post_id,
+                            ", ".join(steam_post.post_id for steam_post in matching_steam_posts),
+                        )
+                        continue
                     try:
                         await self._send_twitter_post_to_channel(
                             channel,
@@ -3004,6 +3038,52 @@ class NewsCog(commands.Cog):
                 continue
             announced += result
         return announced
+
+    async def _refresh_steam_cache_for_twitter_links(
+        self,
+        twitter_posts: list[TwitterPost],
+    ) -> None:
+        if self.news_source is None:
+            return
+        post_keys = _steam_news_post_ids_for_twitter_posts(twitter_posts)
+        if not post_keys:
+            return
+        missing_keys = [
+            post_key
+            for post_key in post_keys
+            if not any(
+                self.storage.get_post(f"steam:{language}:{post_key}") is not None
+                for language in SYNC_LANGUAGES
+            )
+        ]
+        if not missing_keys:
+            return
+        try:
+            await self._sync_global_news_cache()
+        except Exception:
+            LOGGER.exception(
+                "X Steam 링크 중복 확인용 Steam 뉴스 갱신 실패: post_keys=%s",
+                ", ".join(missing_keys),
+            )
+
+    def _steam_posts_by_twitter_post_id(
+        self,
+        twitter_posts: list[TwitterPost],
+    ) -> dict[str, list[NewsPost]]:
+        steam_posts = _dedupe_posts_by_id([
+            *self._cached_steam_posts_for_twitter_links(twitter_posts),
+            *(
+                post
+                for language in SYNC_LANGUAGES
+                for post in self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
+            ),
+        ])
+        if not steam_posts:
+            return {}
+        return {
+            post.post_id: _matching_steam_posts_for_twitter(post, steam_posts)
+            for post in twitter_posts
+        }
 
     def _new_twitter_posts_for_target(
         self,
@@ -5836,6 +5916,9 @@ def _is_steam_news_url(url: str) -> bool:
 def _steam_news_url_key(url: str) -> str | None:
     if not _is_steam_news_url(url):
         return None
+    post_id = _steam_news_post_id_from_url(url)
+    if post_id is not None:
+        return f"steam-news:{post_id}"
     return urlparse(url).path.lower().rstrip("/")
 
 
@@ -6396,10 +6479,6 @@ def _twitter_post_delay_seconds(post: TwitterPost) -> int | str:
     return _delay_seconds(post.created_at)
 
 
-def _normalize_news_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip().lower()
-
-
 def _as_utc_datetime(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -6412,22 +6491,17 @@ def _matching_steam_posts_for_twitter(
     post: TwitterPost,
     steam_posts: list[NewsPost],
 ) -> list[NewsPost]:
-    raw = post.raw
-    link_urls = [str(url) for url in raw.get("link_urls", []) if url] if isinstance(raw.get("link_urls"), list) else []
+    link_urls = _raw_link_urls(post.raw)
     link_keys = _steam_news_link_keys_for_twitter(post)
-    normalized_text = _normalize_news_text(post.text or post.title)
+    twitter_candidates = _news_match_candidates(post.title, post.text)
     matched: list[NewsPost] = []
     seen: set[str] = set()
     for steam_post in steam_posts:
-        steam_key = _steam_news_url_key(steam_post.url)
-        text_matches = (
-            normalized_text
-            and normalized_text == _normalize_news_text(steam_post.text or steam_post.title)
-        )
-        if not (
-            steam_post.url in link_urls
-            or (steam_key is not None and steam_key in link_keys)
-            or text_matches
+        if not _twitter_matches_steam_news(
+            steam_post,
+            link_urls,
+            link_keys,
+            twitter_candidates,
         ):
             continue
         if steam_post.post_id in seen:
@@ -6437,14 +6511,87 @@ def _matching_steam_posts_for_twitter(
     return matched
 
 
-def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
-    raw = post.raw
+def _twitter_matches_steam_news(
+    steam_post: NewsPost,
+    link_urls: list[str],
+    link_keys: set[str],
+    twitter_candidates: set[str],
+) -> bool:
+    steam_key = _steam_news_url_key(steam_post.url)
+    if steam_post.url in link_urls or (steam_key is not None and steam_key in link_keys):
+        return True
+    return _news_match_candidates_overlap(
+        twitter_candidates,
+        _news_match_candidates(steam_post.title, steam_post.text),
+    )
+
+
+def _raw_link_urls(raw: dict) -> list[str]:
     link_urls = raw.get("link_urls")
     if not isinstance(link_urls, list):
-        return set()
+        return []
+    return [str(url) for url in link_urls if url]
+
+
+def _news_match_candidates(title: str, text: str) -> set[str]:
+    values = [title]
+    line_count = 0
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        cleaned = line.strip()
+        lowered = cleaned.lower()
+        if (
+            not cleaned
+            or cleaned.startswith("#")
+            or lowered.startswith("http://")
+            or lowered.startswith("https://")
+        ):
+            continue
+        values.append(cleaned)
+        values.extend(
+            bracketed.strip()
+            for bracketed in re.findall(r"[\[【「『](.*?)[\]】」』]", cleaned)
+            if bracketed.strip()
+        )
+        line_count += 1
+        if line_count >= 4:
+            break
+
+    candidates: set[str] = set()
+    for value in values:
+        normalized = _normalize_news_match_text(value)
+        if len(normalized.replace(" ", "")) >= 10:
+            candidates.add(normalized)
+    return candidates
+
+
+def _normalize_news_match_text(value: str) -> str:
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"#\S+", " ", value)
+    value = re.sub(r"[\[【「『](.*?)[\]】」』]", r" \1 ", value)
+    value = re.sub(r"[^\w]+", " ", value.casefold())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _news_match_candidates_overlap(left: set[str], right: set[str]) -> bool:
+    if not left or not right:
+        return False
+    if left & right:
+        return True
+
+    left_compact = {value.replace(" ", "") for value in left}
+    right_compact = {value.replace(" ", "") for value in right}
+    for left_value in left_compact:
+        for right_value in right_compact:
+            shorter, longer = sorted((left_value, right_value), key=len)
+            if len(shorter) >= 14 and shorter in longer:
+                return True
+    return False
+
+
+def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
     return {
         key
-        for key in (_steam_news_url_key(str(url)) for url in link_urls if url)
+        for key in (_steam_news_url_key(url) for url in _raw_link_urls(post.raw))
         if key is not None
     }
 
@@ -6452,10 +6599,14 @@ def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
 def _steam_news_post_id_from_url(url: str) -> str | None:
     if not _is_steam_news_url(url):
         return None
-    parts = [part for part in urlparse(url).path.split("/") if part]
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
     if len(parts) >= 5 and parts[0].lower() == "news" and parts[1].lower() == "app":
         if parts[3].lower() == "view" and parts[4]:
             return parts[4]
+    emgid = parse_qs(parsed.query).get("emgid")
+    if emgid:
+        return emgid[0]
     return None
 
 
@@ -6473,35 +6624,6 @@ def _steam_news_post_ids_for_twitter_posts(posts: list[TwitterPost]) -> list[str
             seen.add(post_id)
             post_ids.append(post_id)
     return post_ids
-
-
-def _linked_steam_posts_for_twitter(
-    post: TwitterPost,
-    steam_posts: list[NewsPost],
-) -> list[NewsPost]:
-    link_keys = _steam_news_link_keys_for_twitter(post)
-    if not link_keys:
-        return []
-    return [
-        steam_post
-        for steam_post in steam_posts
-        if (_steam_news_url_key(steam_post.url) or "") in link_keys
-    ]
-
-
-def _twitter_post_is_faster_than_steam(
-    post: TwitterPost,
-    steam_posts: list[NewsPost],
-) -> bool:
-    twitter_at = _as_utc_datetime(post.created_at)
-    if twitter_at is None:
-        return False
-    steam_times = [
-        created_at
-        for created_at in (_as_utc_datetime(steam_post.created_at) for steam_post in steam_posts)
-        if created_at is not None
-    ]
-    return not steam_times or twitter_at <= min(steam_times)
 
 
 def _steam_posts_without_fast_twitter_duplicates(
@@ -6545,13 +6667,6 @@ def _twitter_posts_as_news_posts(
     for post in posts:
         raw = dict(post.raw)
         matching_steam_posts = _matching_steam_posts_for_twitter(post, steam_posts)
-        linked_steam_posts = _linked_steam_posts_for_twitter(post, matching_steam_posts)
-        if (
-            matching_steam_posts
-            and not linked_steam_posts
-            and not _twitter_post_is_faster_than_steam(post, matching_steam_posts)
-        ):
-            continue
         if matching_steam_posts:
             raw["overlap_steam_post_ids"] = [
                 steam_post.post_id for steam_post in matching_steam_posts
@@ -6564,15 +6679,14 @@ def _twitter_posts_as_news_posts(
                 )
                 if post_key is not None
             ]
-        if linked_steam_posts:
             raw["prefer_steam_post_ids"] = [
-                steam_post.post_id for steam_post in linked_steam_posts
+                steam_post.post_id for steam_post in matching_steam_posts
             ]
             raw["prefer_steam_post_keys"] = [
                 post_key
                 for post_key in (
                     _post_language_independent_id(steam_post)
-                    for steam_post in linked_steam_posts
+                    for steam_post in matching_steam_posts
                 )
                 if post_key is not None
             ]
