@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import ctypes
@@ -48,8 +48,6 @@ POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 80
-STARTUP_NEWS_UPDATE_RECOVERY_POST_IDS = ("steam:koreana:698765376653099268",)
-STARTUP_NEWS_DELAYED_DELIVERY_POST_IDS = ("steam:koreana:717906309283840567",)
 TWITTER_POST_LIMIT = 80
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
@@ -63,7 +61,6 @@ CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 NEWS_TARGET_SEND_CONCURRENCY = 12
-LATEST_NEWS_RECOVERY_NOTICE = "봇 오류로 인해 소식 전달이 늦었습니다 ㅠㅠ.. 죄송합니다"
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 ZIP_IMAGE_CONCURRENCY = 20
@@ -441,6 +438,10 @@ class NewsCog(commands.Cog):
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
 
+    async def _wait_until_ready(self) -> None:
+        while not self.bot.is_ready():
+            await asyncio.sleep(0.5)
+
     async def cog_load(self) -> None:
         self.presence_status.start()
         self.maintenance_notifications.start()
@@ -475,7 +476,7 @@ class NewsCog(commands.Cog):
 
     @presence_status.before_loop
     async def before_presence_status(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     async def update_presence_status(self, *, show_servers: bool | None = None) -> None:
         use_server_count = self._presence_show_servers if show_servers is None else show_servers
@@ -597,7 +598,7 @@ class NewsCog(commands.Cog):
 
     @poll_news.before_loop
     async def before_poll_news(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     @tasks.loop(seconds=TWITTER_POLL_TICK_SECONDS)
     async def poll_twitter_posts(self) -> None:
@@ -626,7 +627,7 @@ class NewsCog(commands.Cog):
 
     @poll_twitter_posts.before_loop
     async def before_poll_twitter_posts(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     @tasks.loop(seconds=CHZZK_POLL_INTERVAL_SECONDS)
     async def poll_chzzk_live(self) -> None:
@@ -640,7 +641,7 @@ class NewsCog(commands.Cog):
 
     @poll_chzzk_live.before_loop
     async def before_poll_chzzk_live(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     @tasks.loop(seconds=CHZZK_POLL_INTERVAL_SECONDS)
     async def poll_youtube_live(self) -> None:
@@ -654,7 +655,7 @@ class NewsCog(commands.Cog):
 
     @poll_youtube_live.before_loop
     async def before_poll_youtube_live(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     @tasks.loop(seconds=60)
     async def maintenance_notifications(self) -> None:
@@ -665,7 +666,7 @@ class NewsCog(commands.Cog):
 
     @maintenance_notifications.before_loop
     async def before_maintenance_notifications(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     @tasks.loop(minutes=15)
     async def cleanup_messages(self) -> None:
@@ -679,7 +680,7 @@ class NewsCog(commands.Cog):
 
     @cleanup_messages.before_loop
     async def before_cleanup_messages(self) -> None:
-        await self.bot.wait_until_ready()
+        await self._wait_until_ready()
 
     async def _cleanup_expired_messages(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2759,18 +2760,6 @@ class NewsCog(commands.Cog):
                     )
                 else:
                     LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
-                recovered_post_ids: list[str] = []
-                for post_id in STARTUP_NEWS_UPDATE_RECOVERY_POST_IDS:
-                    queued = self.storage.queue_news_update_for_announced_targets(post_id)
-                    if queued:
-                        recovered_post_ids.append(post_id)
-                        LOGGER.info(
-                            "시작 시 수정 소식 복구 큐 등록: post_id=%s targets=%s.",
-                            post_id,
-                            queued,
-                        )
-                if recovered_post_ids:
-                    await self._broadcast_post_updates(recovered_post_ids)
             except Exception:
                 LOGGER.exception("시작 시 뉴스 동기화 실패.")
         await self._sync_youtube_startup_baseline()
@@ -2799,85 +2788,8 @@ class NewsCog(commands.Cog):
         except Exception:
             LOGGER.exception("시작 시 X 게시물 동기화 실패.")
         LOGGER.info("시작 시 동기화 처리 완료.")
-        await self.recover_latest_unannounced_news()
         await self.run_startup_news_delivery()
 
-    async def recover_latest_unannounced_news(self) -> int:
-        targets = self.storage.list_all_news_targets()
-        if not targets:
-            return 0
-
-        recovery_posts: dict[str, NewsPost] = {}
-        for post_id in STARTUP_NEWS_DELAYED_DELIVERY_POST_IDS:
-            post = self.storage.get_post(post_id)
-            if post is not None:
-                recovery_posts[post.post_id] = post
-
-        latest = self.storage.get_latest_post(self.config.steam_language)
-        if latest is None:
-            latest = self.storage.get_latest_post()
-        if latest is not None:
-            recovery_posts[latest.post_id] = latest
-        if not recovery_posts:
-            LOGGER.info("최신 뉴스 지연 복구 생략: 저장된 소식이 없습니다.")
-            return 0
-
-        sent_count = 0
-        skipped_count = 0
-        for latest in recovery_posts.values():
-            for target in targets:
-                settings = self.storage.get_settings(target.guild_id)
-                if not settings.enabled:
-                    skipped_count += 1
-                    continue
-
-                post = self._post_variant_for_language(latest, target.language)
-                if post is None:
-                    skipped_count += 1
-                    continue
-                if not self._posts_for_source_mode([post], settings):
-                    skipped_count += 1
-                    continue
-
-                post_status = self.storage.get_news_target_seen_post_statuses(
-                    target.target_id,
-                    [post.post_id],
-                )
-                if post_status.get(post.post_id, False):
-                    skipped_count += 1
-                    continue
-
-                channel = await self._resolve_automatic_news_channel(target)
-                if channel is None:
-                    skipped_count += 1
-                    continue
-
-                sent = await self._send_news_post_to_target(
-                    channel,
-                    settings,
-                    target,
-                    post,
-                    recovery_notice=LATEST_NEWS_RECOVERY_NOTICE,
-                )
-                if not sent:
-                    continue
-
-                self.storage.mark_news_target_posts_seen(
-                    target.target_id,
-                    [post.post_id],
-                    announced=True,
-                )
-                self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
-                self.storage.set_last_seen_post_id(target.guild_id, post.post_id)
-                sent_count += 1
-
-        LOGGER.info(
-            "최신 뉴스 지연 복구 확인 완료: post_ids=%s, sent=%s, skipped=%s.",
-            ", ".join(post.post_id for post in recovery_posts.values()),
-            sent_count,
-            skipped_count,
-        )
-        return sent_count
 
     async def run_startup_news_delivery(self) -> None:
         async with self._poll_lock:
