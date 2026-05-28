@@ -1,25 +1,36 @@
+# Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+
+# Environment / secrets
 .env
+
+# Database
 limpi.sqlite3
 limpi.sqlite3-*
-.pytest_cache/
-/old
+
+# Logs & legacy
 /logs
+/old
 
 # PyInstaller build output
 dist/
 build/
 *.spec
 limpi.ico
+
+# Docs (keep project overview)
+*.md
+!docs/project-overview.md
+/docs
+
+# Editor / tooling
+/.claude
+
+# Project-specific docs
 AGENTS.md
 BOT_USAGE.md
 RELEASE_GUIDE.md
-*.md
-!docs/project-overview.md
-/.claude
-/.claude
-.claude/settings.local.json
-/docs
