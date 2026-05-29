@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import ctypes
@@ -47,8 +47,8 @@ from .clients.youtube_client import PROJECT_MOON_YOUTUBE_STREAMS_URL, YoutubeCli
 POST_FORMAT_RICH = "rich"
 LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
-NEWS_POST_LIMIT = 80
-TWITTER_POST_LIMIT = 80
+NEWS_POST_LIMIT = 30
+TWITTER_POST_LIMIT = 30
 AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
 NEWS_POLL_TICK_SECONDS = 10
@@ -1677,30 +1677,6 @@ class NewsCog(commands.Cog):
             settings.guild_id,
             fetched_post_ids,
         )
-        announced_seen_post_ids = {
-            post_id for post_id, announced in seen_post_statuses.items() if announced
-        }
-        if announced_seen_post_ids:
-            newest_announced_index = min(
-                fetched_post_ids.index(post_id)
-                for post_id in announced_seen_post_ids
-                if post_id in fetched_post_ids
-            )
-            candidates = [
-                post
-                for post in reversed(posts_newest_first[:newest_announced_index])
-                if not seen_post_statuses.get(post.post_id, False)
-            ]
-            recovered = [post.post_id for post in candidates if post.post_id in seen_post_statuses]
-            if recovered:
-                LOGGER.info(
-                    "발송 완료 표시가 없는 뉴스 seen 항목을 자동 전송 후보로 복구합니다 "
-                    "(guild_id=%s, post_ids=%s).",
-                    settings.guild_id,
-                    ", ".join(recovered),
-                )
-            return _recent_auto_posts(candidates)
-
         seen_post_ids = set(seen_post_statuses)
         if seen_post_ids:
             return _recent_auto_posts([
@@ -1757,38 +1733,20 @@ class NewsCog(commands.Cog):
             target.target_id,
             fetched_post_ids,
         )
-        announced_seen_post_ids = {
-            post_id for post_id, announced in seen_post_statuses.items() if announced
-        }
-        if announced_seen_post_ids:
-            newest_announced_index = min(
-                fetched_post_ids.index(post_id)
-                for post_id in announced_seen_post_ids
-                if post_id in fetched_post_ids
-            )
-            candidates = [
-                post
-                for post in reversed(posts_newest_first[:newest_announced_index])
-                if not seen_post_statuses.get(post.post_id, False)
-            ]
-            recovered = [post.post_id for post in candidates if post.post_id in seen_post_statuses]
-            if recovered:
-                LOGGER.info(
-                    "발송 완료 표시가 없는 뉴스 seen 항목을 자동 전송 후보로 복구합니다 "
-                    "(guild_id=%s, channel_id=%s, language=%s, post_ids=%s).",
-                    target.guild_id,
-                    target.channel_id,
-                    target.language,
-                    ", ".join(recovered),
-                )
-            return _recent_auto_posts(candidates)
-
         seen_post_ids = set(seen_post_statuses)
         if seen_post_ids:
+            created_after = _as_utc_datetime(target.created_at)
             return _recent_auto_posts([
                 post
                 for post in reversed(posts_newest_first)
                 if post.post_id not in seen_post_ids
+                and (
+                    created_after is None
+                    or (
+                        post.created_at is not None
+                        and _as_utc_datetime(post.created_at) > created_after
+                    )
+                )
             ])
 
         if not has_seen_baseline and not self.config.announce_existing_on_first_run:
