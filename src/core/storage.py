@@ -239,6 +239,7 @@ class SQLiteStorage:
                 channel_id INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
+                last_notified_at TEXT,
                 PRIMARY KEY (target_id, post_id)
             )
         """,
@@ -1955,13 +1956,14 @@ class SQLiteStorage:
             self._connection.execute(
                 """
                 INSERT INTO news_post_messages (
-                    target_id, post_id, channel_id, message_id, created_at
+                    target_id, post_id, channel_id, message_id, created_at, last_notified_at
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, NULL)
                 ON CONFLICT(target_id, post_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     message_id = excluded.message_id,
-                    created_at = excluded.created_at
+                    created_at = excluded.created_at,
+                    last_notified_at = NULL
                 """,
                 (target_id, post_id, channel_id, message_id, now),
             )
@@ -1969,12 +1971,15 @@ class SQLiteStorage:
 
     def get_news_post_message(
         self, target_id: int, post_id: str
-    ) -> tuple[int, int] | None:
-        """저장된 (channel_id, message_id) 반환. 없으면 None."""
+    ) -> tuple[int, int, str | None] | None:
+        """저장된 (channel_id, message_id, last_notified_at) 반환. 없으면 None.
+
+        last_notified_at은 "소식이 수정되었습니다" 답장을 마지막으로 보낸 시각으로,
+        답장 도배를 막는 쿨다운 판정에 쓰인다."""
         with self._lock:
             row = self._connection.execute(
                 """
-                SELECT channel_id, message_id
+                SELECT channel_id, message_id, last_notified_at
                 FROM news_post_messages
                 WHERE target_id = ? AND post_id = ?
                 """,
@@ -1982,7 +1987,21 @@ class SQLiteStorage:
             ).fetchone()
         if row is None:
             return None
-        return int(row["channel_id"]), int(row["message_id"])
+        return int(row["channel_id"]), int(row["message_id"]), row["last_notified_at"]
+
+    def mark_news_post_message_notified(self, target_id: int, post_id: str) -> None:
+        """수정 안내 답장을 보낸 시각을 기록한다(쿨다운 기준)."""
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE news_post_messages
+                SET last_notified_at = ?
+                WHERE target_id = ? AND post_id = ?
+                """,
+                (now, target_id, post_id),
+            )
+            self._connection.commit()
 
     def queue_news_update_for_announced_targets(self, post_id: str) -> int:
         now = _now_iso()

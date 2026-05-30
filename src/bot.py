@@ -83,6 +83,10 @@ NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
 # 컴포넌트(MediaGallery) 한 개에 넣을 수 있는 이미지 최대 개수(디스코드 제한).
 MAX_INLINE_GALLERY_IMAGES = 10
+# 같은 소식에 대해 "수정되었습니다" 답장을 다시 달기까지의 최소 간격.
+# 해시가 매 폴링마다 흔들리는 비정상 상황에서도 답장 도배가 일어나지 않도록 막는다.
+# (원본 메시지 edit 자체는 새 글이 안 뜨므로 쿨다운 없이 매번 최신 내용으로 갱신한다.)
+NEWS_UPDATE_NOTICE_COOLDOWN = timedelta(minutes=30)
 COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
@@ -1972,7 +1976,7 @@ class NewsCog(commands.Cog):
             )
             return
 
-        channel_id, message_id = recorded
+        channel_id, message_id, last_notified_at = recorded
         channel = self.bot.get_channel(channel_id)
         if channel is None:
             try:
@@ -2000,13 +2004,35 @@ class NewsCog(commands.Cog):
             )
             return
 
+        # 원본 메시지는 항상 최신 내용으로 갱신(새 글이 안 뜨므로 도배 위험 없음).
         await message.edit(view=updated_view)
+
+        # "수정되었습니다" 답장은 쿨다운 안에서는 생략한다. 해시가 비정상적으로 매 폴링마다
+        # 흔들려도 답장이 도배되지 않도록 하는 안전장치다.
+        last_notified: datetime | None = None
+        if last_notified_at:
+            try:
+                last_notified = _as_utc_datetime(datetime.fromisoformat(last_notified_at))
+            except ValueError:
+                last_notified = None
+        if last_notified is not None and (
+            datetime.now(timezone.utc) - last_notified < NEWS_UPDATE_NOTICE_COOLDOWN
+        ):
+            LOGGER.info(
+                "최근에 수정 안내를 보냈으므로 내용만 갱신하고 답장은 생략합니다 "
+                "(channel_id=%s, message_id=%s, post_id=%s).",
+                channel_id,
+                message_id,
+                post.post_id,
+            )
+            return
         try:
             await message.reply(
                 embed=_news_update_notice_embed(),
                 allowed_mentions=discord.AllowedMentions.none(),
                 mention_author=False,
             )
+            self.storage.mark_news_post_message_notified(target.target_id, post.post_id)
         except discord.HTTPException:
             LOGGER.exception(
                 "수정 안내 답장 전송 실패 (channel_id=%s, message_id=%s, post_id=%s).",
