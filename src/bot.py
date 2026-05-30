@@ -81,6 +81,8 @@ ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
+# 컴포넌트(MediaGallery) 한 개에 넣을 수 있는 이미지 최대 개수(디스코드 제한).
+MAX_INLINE_GALLERY_IMAGES = 10
 COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
@@ -1428,14 +1430,12 @@ class NewsCog(commands.Cog):
 
         announced = 0
         failed_post_ids: set[str] = set()
-        image_batches_by_post_id = self._start_image_batch_tasks_for_posts(new_posts)
         for post in new_posts:
             sent = await self._send_news_post_to_target(
                 channel,
                 settings,
                 target,
                 post,
-                batch_tasks=image_batches_by_post_id.get(post.post_id),
             )
             if not sent:
                 failed_post_ids.add(post.post_id)
@@ -1599,13 +1599,11 @@ class NewsCog(commands.Cog):
 
         announced = 0
         failed_post_ids: set[str] = set()
-        image_batches_by_post_id = self._start_image_batch_tasks_for_posts(new_posts)
         for post in new_posts:
             sent = await self._send_news_post(
                 channel,
                 settings,
                 post,
-                batch_tasks=image_batches_by_post_id.get(post.post_id),
             )
             if not sent:
                 failed_post_ids.add(post.post_id)
@@ -1833,13 +1831,22 @@ class NewsCog(commands.Cog):
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> bool:
         try:
-            await self._broadcast_post(
+            sent_message = await self._broadcast_post(
                 channel,
                 post,
                 settings.role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
             )
+            if sent_message is not None:
+                # 원본 메시지 ID를 기록해 두면, 이후 소식이 수정될 때 새로 보내는 대신
+                # 이 메시지를 직접 edit 하고 답장으로 수정 안내를 달 수 있다.
+                self.storage.record_news_post_message(
+                    target.target_id,
+                    post.post_id,
+                    getattr(channel, "id", target.channel_id),
+                    sent_message.id,
+                )
             return True
         except discord.Forbidden as exc:
             LOGGER.warning(
@@ -1924,7 +1931,7 @@ class NewsCog(commands.Cog):
                 )
                 continue
             LOGGER.info(
-                "뉴스 수정 감지 — 재전송 (post_id=%s, title=%r, targets=%s).",
+                "뉴스 수정 감지 — 원본 메시지 수정 (post_id=%s, title=%r, targets=%s).",
                 post_id,
                 post.title,
                 len(targets),
@@ -1932,26 +1939,81 @@ class NewsCog(commands.Cog):
             for target in targets:
                 settings = self.storage.get_settings(target.guild_id)
                 if not settings.enabled:
-                    continue
-                channel = self.bot.get_channel(target.channel_id)
-                if channel is None or not isinstance(channel, discord.abc.Messageable):
+                    self.storage.mark_news_update_sent(target.target_id, post_id)
                     continue
                 try:
-                    await self._broadcast_post(
-                        channel,
-                        post,
-                        None,
-                        banner_filename=settings.notification_banner,
-                        is_update=True,
-                    )
+                    await self._apply_news_post_update(settings, target, post)
                     self.storage.mark_news_update_sent(target.target_id, post_id)
                 except Exception:
                     LOGGER.exception(
-                        "뉴스 수정 재전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                        "뉴스 수정 반영 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
                         target.guild_id,
                         target.channel_id,
                         post_id,
                     )
+
+    async def _apply_news_post_update(
+        self,
+        settings: GuildSettings,
+        target: GuildNewsTarget,
+        post: NewsPost,
+    ) -> None:
+        """수정된 소식을 반영한다: 원본 메시지를 직접 edit 하고, 그 메시지에 답장으로
+        간단한 수정 안내 임베드를 단다. 원본 메시지 기록이 없으면(이전 버전에서 보냈거나
+        기록 유실) 조용히 건너뛴다 — 옛 글을 새로 띄우지 않기 위함이다."""
+        recorded = self.storage.get_news_post_message(target.target_id, post.post_id)
+        if recorded is None:
+            LOGGER.info(
+                "원본 메시지 기록이 없어 수정 반영을 건너뜁니다 "
+                "(guild_id=%s, channel_id=%s, post_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                post.post_id,
+            )
+            return
+
+        channel_id, message_id = recorded
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                return
+        if not isinstance(channel, discord.abc.Messageable):
+            return
+
+        banner_file = _news_banner_file(settings.notification_banner)
+        updated_view = _build_layout_view_for_post(
+            post,
+            include_zip_button=True,
+            include_banner=banner_file is not None,
+        )
+        try:
+            message = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            LOGGER.info(
+                "원본 메시지가 삭제되어 수정 반영을 건너뜁니다 "
+                "(channel_id=%s, message_id=%s, post_id=%s).",
+                channel_id,
+                message_id,
+                post.post_id,
+            )
+            return
+
+        await message.edit(view=updated_view)
+        try:
+            await message.reply(
+                embed=_news_update_notice_embed(),
+                allowed_mentions=discord.AllowedMentions.none(),
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            LOGGER.exception(
+                "수정 안내 답장 전송 실패 (channel_id=%s, message_id=%s, post_id=%s).",
+                channel_id,
+                message_id,
+                post.post_id,
+            )
 
     async def _broadcast_post(
         self,
@@ -1962,7 +2024,7 @@ class NewsCog(commands.Cog):
         banner_filename: str | None = None,
         is_update: bool = False,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
-    ) -> None:
+    ) -> discord.Message | None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
             everyone=False,
@@ -1970,18 +2032,12 @@ class NewsCog(commands.Cog):
             roles=[discord.Object(id=role_id)] if role_id else False,
         )
 
-        standalone_urls = _standalone_image_urls(post, attach_images=True)
         banner_file = _news_banner_file(banner_filename)
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=True,
             include_banner=banner_file is not None,
             is_update=is_update,
-        )
-        image_batch_tasks = (
-            batch_tasks
-            if batch_tasks is not None
-            else (self._start_image_batch_tasks(standalone_urls) if standalone_urls else [])
         )
 
         if mention:
@@ -1995,7 +2051,9 @@ class NewsCog(commands.Cog):
         }
         if banner_file is not None:
             send_kwargs["file"] = banner_file
-        await channel.send(**send_kwargs)
+        # 본문 이미지는 컴포넌트(MediaGallery)에 인라인되므로 별도 첨부 메시지를 보내지 않는다.
+        # 이 메시지가 "원본 뉴스 메시지"이며, 이후 수정 시 직접 edit 한다.
+        sent_message = await channel.send(**send_kwargs)
 
         followup_tasks = []
         youtube_content = _youtube_links_content(post)
@@ -2028,15 +2086,6 @@ class NewsCog(commands.Cog):
                         )
                     )
                 )
-        if image_batch_tasks:
-            image_task = asyncio.create_task(
-                self._send_channel_image_messages(
-                    channel,
-                    post,
-                    batch_tasks=image_batch_tasks,
-                )
-            )
-            image_task.add_done_callback(self._log_background_task_result)
         if followup_tasks:
             results = await asyncio.gather(*followup_tasks, return_exceptions=True)
             for result in results:
@@ -2047,6 +2096,7 @@ class NewsCog(commands.Cog):
                         post.title,
                         exc_info=(type(result), result, result.__traceback__),
                     )
+        return sent_message
 
     async def _send_news_post_followups(
         self,
@@ -2061,13 +2111,15 @@ class NewsCog(commands.Cog):
         banner_file = _news_banner_file(
             self._interaction_banner_filename(interaction, private=private)
         )
+        use_image_embeds = self._bot_is_missing_from_interaction_guild(interaction)
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=attach_photos,
             include_banner=banner_file is not None,
+            # 본문 이미지는 컴포넌트에 인라인된다. 단, 봇이 길드에 없어 컴포넌트를 못 쓰는
+            # 경우(use_image_embeds)에는 인라인 대신 임베드 후속 메시지로 보낸다.
+            include_content_images=attach_photos and not use_image_embeds,
         )
-        use_image_embeds = self._bot_is_missing_from_interaction_guild(interaction)
-        batch_tasks = [] if use_image_embeds or not standalone_urls else self._start_image_batch_tasks(standalone_urls)
 
         send_kwargs = {
             "ephemeral": private,
@@ -2112,28 +2164,13 @@ class NewsCog(commands.Cog):
                     )
                 )
 
-        if self._bot_is_missing_from_interaction_guild(interaction):
+        # 본문 이미지는 컴포넌트에 인라인되므로 별도 첨부 메시지를 보내지 않는다.
+        # 컴포넌트를 못 쓰는 경우에만 임베드 후속 메시지로 대체한다.
+        if use_image_embeds:
             self._schedule_interaction_image_embed_followups(
                 interaction,
                 post,
                 private=private,
-                image_urls=standalone_urls,
-            )
-        elif private:
-            self._schedule_interaction_image_followups(
-                interaction,
-                post,
-                private=True,
-                batch_tasks=batch_tasks,
-                image_urls=standalone_urls,
-            )
-        elif isinstance(interaction.channel, discord.abc.Messageable):
-            self._schedule_channel_image_messages(
-                interaction.channel,
-                post,
-                track_guild_id=interaction.guild_id,
-                track_channel_id=interaction.channel_id,
-                batch_tasks=batch_tasks,
                 image_urls=standalone_urls,
             )
         return sent_messages
@@ -3751,6 +3788,20 @@ class NewsCog(commands.Cog):
             if len(choices) >= 25:
                 break
         return choices
+
+    # @app_commands.command(
+    #     name="소식수정임베드테스트",
+    #     description="소식 수정 시 답장으로 다는 안내 임베드를 미리 확인합니다.",
+    # )
+    # @app_commands.allowed_installs(guilds=True, users=False)
+    # @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    # @app_commands.guild_only()
+    # @app_commands.default_permissions(manage_guild=True)
+    # async def test_news_update_embed(self, interaction: discord.Interaction) -> None:
+    #     await interaction.response.send_message(
+    #         embed=_news_update_notice_embed(),
+    #         allowed_mentions=discord.AllowedMentions.none(),
+    #     )
 
     @app_commands.command(name="점검알림설정", description="매주 목요일 10시 점검 시작과 12시 업데이트 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -5870,6 +5921,7 @@ def _build_layout_view_for_post(
     include_banner: bool,
     leading_text: str | None = None,
     is_update: bool = False,
+    include_content_images: bool = True,
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=_post_embed_color(post))
@@ -5908,6 +5960,17 @@ def _build_layout_view_for_post(
         thumbnail_gallery.add_item(media=thumbnail_url)
         container.add_item(thumbnail_gallery)
 
+    # 본문 첨부 이미지를 따로 빼지 않고 컴포넌트 안 갤러리로 인라인 표시한다.
+    # (디스코드 갤러리 한도 10장, 나머지는 ZIP 버튼으로 받을 수 있다.)
+    if include_content_images:
+        content_image_urls = _content_image_urls(post)[:MAX_INLINE_GALLERY_IMAGES]
+        if content_image_urls:
+            container.add_item(discord.ui.Separator())
+            content_gallery = discord.ui.MediaGallery()
+            for image_url in content_image_urls:
+                content_gallery.add_item(media=image_url)
+            container.add_item(content_gallery)
+
     container.add_item(discord.ui.Separator())
     container.add_item(discord.ui.TextDisplay(f"**출처**\n{_post_source_label(post)}"))
 
@@ -5938,6 +6001,15 @@ def _post_embed_color(post: NewsPost) -> discord.Color:
 
 def _success_embed_color() -> discord.Color:
     return discord.Color.green()
+
+
+def _news_update_notice_embed() -> discord.Embed:
+    """수정된 소식 원본 메시지에 답장으로 다는 간단한 안내 임베드."""
+    return discord.Embed(
+        title="소식이 수정되었습니다!",
+        description="소식 내용이 수정되었으니 다시 한번 내용을 확인해보세요!",
+        color=discord.Color.orange(),
+    )
 
 
 def _truncate_component_text(text: str, limit: int) -> str:

@@ -35,10 +35,10 @@ DEFAULT_NEWS_SOURCE_MODE = "both"
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
 
-# 최초 게시 시각이 이 시간보다 오래된 글은 내용이 바뀌어도 "수정된 소식"으로 재전송하지
-# 않는다. 오래된 글의 해시가 한 번이라도 흔들리면(소스 표현 변화 등) 이미 보낸 글이
-# 무한 재전송되던 버그를 차단하기 위한 안전장치다.
-NEWS_UPDATE_MAX_AGE_SECONDS = 10 * 60
+# 최초 게시가 이 시간보다 오래된 글은 내용이 바뀌어도 수정 반영(원본 메시지 edit + 수정
+# 안내 답장)을 하지 않는다. 수정은 재전송이 아니라 원본 메시지를 직접 고치는 방식이라
+# 스팸이 아니므로 창을 넉넉히 잡되, 아주 오래된 글이 답장으로 되살아나는 것은 막는다.
+NEWS_UPDATE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def _post_content_hash(post: "NewsPost") -> str:
@@ -230,6 +230,16 @@ class SQLiteStorage:
                 PRIMARY KEY (target_id, post_id),
                 FOREIGN KEY (target_id) REFERENCES guild_news_targets(target_id)
                     ON DELETE CASCADE
+            )
+        """,
+        "news_post_messages": """
+            CREATE TABLE IF NOT EXISTS news_post_messages (
+                target_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (target_id, post_id)
             )
         """,
         "tracked_messages": """
@@ -1930,6 +1940,49 @@ class SQLiteStorage:
                 (now, target_id, post_id),
             )
             self._connection.commit()
+
+    def record_news_post_message(
+        self,
+        target_id: int,
+        post_id: str,
+        channel_id: int,
+        message_id: int,
+    ) -> None:
+        """자동 전송한 뉴스 메시지의 ID를 저장한다. 이후 소식이 수정되면 이 메시지를
+        직접 edit 하여 내용을 갱신한다."""
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO news_post_messages (
+                    target_id, post_id, channel_id, message_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(target_id, post_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    created_at = excluded.created_at
+                """,
+                (target_id, post_id, channel_id, message_id, now),
+            )
+            self._connection.commit()
+
+    def get_news_post_message(
+        self, target_id: int, post_id: str
+    ) -> tuple[int, int] | None:
+        """저장된 (channel_id, message_id) 반환. 없으면 None."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT channel_id, message_id
+                FROM news_post_messages
+                WHERE target_id = ? AND post_id = ?
+                """,
+                (target_id, post_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return int(row["channel_id"]), int(row["message_id"])
 
     def queue_news_update_for_announced_targets(self, post_id: str) -> int:
         now = _now_iso()
