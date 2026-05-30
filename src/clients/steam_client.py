@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import html
 import json
 import logging
 import re
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Protocol
-from urllib.parse import parse_qs, urlencode, urlparse
-from xml.etree import ElementTree
+from urllib.parse import urlencode
 
 import aiohttp
 
@@ -20,8 +17,10 @@ from ..core.models import NewsPost
 
 LOGGER = logging.getLogger(__name__)
 STEAM_NEWS_BASE_URL = "https://store.steampowered.com/news/app"
-STEAM_RSS_BASE_URL = "https://store.steampowered.com/feeds/news/app"
 STEAM_REQUEST_TIMEOUT_SECONDS = 20
+# 이벤트 데이터 요청이 일시적으로 실패해도 소식이 누락되지 않도록 재시도한다.
+STEAM_EVENT_MAX_ATTEMPTS = 3
+STEAM_EVENT_RETRY_BACKOFF_SECONDS = 2.0
 STEAM_CLAN_IMAGE_BASE_URL = "https://clan.fastly.steamstatic.com/images"
 STEAM_LANGUAGE_INDEXES = {
     "english": 0,
@@ -78,57 +77,47 @@ class SteamNewsSource:
     ) -> list[NewsPost]:
         language = language or self.config.steam_language
         limit = limit or self.config.max_posts_per_poll
-        event_posts: list[NewsPost] = []
-        rss_posts: list[NewsPost] = []
-        try:
-            event_posts = await self._fetch_event_posts(language)
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            TimeoutError,
-            RuntimeError,
-            ElementTree.ParseError,
-        ) as exc:
-            LOGGER.warning("Steam initial event data request failed. Falling back to RSS: %s", exc)
-
-        try:
-            rss_posts = await self._fetch_rss_posts(language, limit)
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            TimeoutError,
-            RuntimeError,
-            ElementTree.ParseError,
-        ) as exc:
-            if not event_posts:
-                raise
-            LOGGER.warning("Steam RSS request failed. Using initial event data only: %s", exc)
-
-        posts = _dedupe_posts_by_id([*event_posts, *rss_posts])
-        if not posts:
-            LOGGER.warning("Steam initial event data was unavailable. Falling back to RSS.")
+        posts = await self._fetch_event_posts_with_retry(language)
+        posts = _dedupe_posts_by_id(posts)
         return _sort_newest_first(posts)[:limit]
 
-    async def _fetch_rss_posts(self, language: str, limit: int) -> list[NewsPost]:
-        url = self._feed_url(language)
-        headers = {
-            "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
-            "Accept-Language": _accept_language_header(language),
-            "User-Agent": "Limpi Discord Bot (Steam news poller)",
-        }
-        async with self.session.get(
-            url,
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=STEAM_REQUEST_TIMEOUT_SECONDS),
-        ) as response:
-            if response.status >= 400:
-                body = await response.text()
-                raise RuntimeError(f"Steam news RSS request failed ({response.status}): {body[:500]}")
-            body = await response.text()
+    async def _fetch_event_posts_with_retry(self, language: str) -> list[NewsPost]:
+        # 일시적 요청 실패/빈 응답으로 소식이 누락되지 않도록 backoff 재시도 후,
+        # 끝까지 실패하면 예외를 올려 호출부가 저장된 소식을 유지하도록 한다.
+        last_error: Exception | None = None
+        for attempt in range(1, STEAM_EVENT_MAX_ATTEMPTS + 1):
+            try:
+                posts = await self._fetch_event_posts(language)
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                TimeoutError,
+                RuntimeError,
+            ) as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Steam 이벤트 데이터 요청 실패 (시도 %s/%s, language=%s): %s",
+                    attempt,
+                    STEAM_EVENT_MAX_ATTEMPTS,
+                    language,
+                    exc,
+                )
+            else:
+                if posts:
+                    return posts
+                last_error = RuntimeError("Steam 이벤트 데이터가 비어 있습니다.")
+                LOGGER.warning(
+                    "Steam 이벤트 데이터가 비어 있습니다 (시도 %s/%s, language=%s).",
+                    attempt,
+                    STEAM_EVENT_MAX_ATTEMPTS,
+                    language,
+                )
 
-        root = ElementTree.fromstring(body)
-        posts = self._parse_rss(root, language)
-        return _sort_newest_first(posts)[:limit]
+            if attempt < STEAM_EVENT_MAX_ATTEMPTS:
+                await asyncio.sleep(STEAM_EVENT_RETRY_BACKOFF_SECONDS * attempt)
+
+        assert last_error is not None
+        raise last_error
 
     async def _fetch_event_posts(self, language: str) -> list[NewsPost]:
         url = self._app_news_url(language)
@@ -162,13 +151,6 @@ class SteamNewsSource:
                 posts.append(post)
 
         return posts
-
-    def _feed_url(self, language: str) -> str:
-        if self.config.steam_news_url:
-            return self.config.steam_news_url
-
-        query = urlencode({"l": language, "cc": self.config.steam_country})
-        return f"{STEAM_RSS_BASE_URL}/{self.config.steam_app_id}/?{query}"
 
     def _event_to_post(self, event: dict, language: str) -> NewsPost | None:
         gid = str(event.get("gid") or "")
@@ -229,49 +211,6 @@ class SteamNewsSource:
             raw=raw,
         )
 
-    def _parse_rss(self, root: ElementTree.Element, language: str | None = None) -> list[NewsPost]:
-        language = language or self.config.steam_language
-        posts: list[NewsPost] = []
-        for item in root.findall("./channel/item"):
-            title = _find_text(item, "title") or "Steam news"
-            link = _find_text(item, "link")
-            guid = _find_text(item, "guid") or link
-            description_html = _find_text(item, "description") or ""
-            pub_date = _find_text(item, "pubDate")
-            image_urls = _extract_image_urls(item, description_html)
-            youtube_urls = _extract_youtube_urls(description_html)
-            is_video_only = bool(youtube_urls) and not image_urls
-            image_urls = _dedupe_urls(image_urls)
-            text = format_steam_news_for_discord(description_html)
-            if not text:
-                text = title
-
-            post_url = link or guid or self._app_news_url(language)
-            raw_post_id = _post_id_from_url(post_url) or _stable_hash(guid or post_url or title)
-            posts.append(
-                NewsPost(
-                    post_id=_language_post_id(language, raw_post_id),
-                    source_user="Limbus Company Steam News",
-                    url=post_url,
-                    text=text,
-                    title=_title_from_text(title, fallback=text or raw_post_id),
-                    created_at=_parse_rss_datetime(pub_date),
-                    image_urls=image_urls,
-                    raw={
-                        "title": title,
-                        "link": link,
-                        "guid": guid,
-                        "description": description_html,
-                        "source_url": self._app_news_url(language),
-                        "language": language,
-                        "youtube_urls": youtube_urls,
-                        "is_video_only": is_video_only,
-                    },
-                )
-            )
-
-        return posts
-
     def _app_news_url(self, language: str | None = None) -> str:
         language = language or self.config.steam_language
         return f"{STEAM_NEWS_BASE_URL}/{self.config.steam_app_id}/?l={language}"
@@ -331,21 +270,6 @@ def _title_from_text(text: str, fallback: str) -> str:
     return fallback[:256]
 
 
-def _parse_rss_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-
-    try:
-        parsed = parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-
-    return parsed.astimezone(timezone.utc)
-
-
 def _datetime_from_unix(value: object) -> datetime | None:
     if value in (None, ""):
         return None
@@ -370,13 +294,6 @@ def _numeric_id(value: str) -> int:
         return int(value)
     except ValueError:
         return 0
-
-
-def _find_text(element: ElementTree.Element, name: str) -> str | None:
-    child = element.find(name)
-    if child is None or child.text is None:
-        return None
-    return child.text.strip()
 
 
 def format_steam_news_for_discord(value: str | None) -> str:
@@ -504,22 +421,6 @@ def _normalize_discord_markdown(value: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _extract_image_urls(element: ElementTree.Element, html_text: str | None) -> list[str]:
-    urls: list[str] = []
-    for child in element.iter():
-        tag_name = child.tag.rsplit("}", 1)[-1].lower()
-        url = child.attrib.get("url")
-        content_type = child.attrib.get("type", "")
-        if url and (tag_name == "enclosure" or content_type.startswith("image/")):
-            urls.append(url)
-
-    if html_text:
-        html_text = html.unescape(html_text)
-        urls.extend(re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html_text, flags=re.IGNORECASE))
-
-    return _dedupe_urls(urls)
-
-
 def _extract_steam_bbcode_image_urls(value: str, clan_id: str) -> list[str]:
     urls: list[str] = []
     for raw_url in re.findall(r"\[img\](.*?)\[/img\]", value, flags=re.IGNORECASE | re.DOTALL):
@@ -591,22 +492,6 @@ def _normalize_steam_image_url(value: str, clan_id: str) -> str:
     if clan_id:
         return f"{STEAM_CLAN_IMAGE_BASE_URL}/{clan_id}/{value}"
     return value
-
-
-def _post_id_from_url(value: str | None) -> str | None:
-    if not value:
-        return None
-
-    match = re.search(r"/view/(\d+)", value)
-    if match:
-        return match.group(1)
-
-    emgid = parse_qs(urlparse(value).query).get("emgid")
-    return emgid[0] if emgid else None
-
-
-def _stable_hash(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
 def _extract_initial_events(page_html: str) -> dict | None:

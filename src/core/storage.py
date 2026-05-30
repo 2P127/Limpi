@@ -42,6 +42,27 @@ def _post_content_hash(post: "NewsPost") -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+# 동일 글을 여러 소스가 만들 수 있다(Steam 이벤트 JSON vs RSS fallback). 소스마다
+# text/image 표현이 달라 content_hash가 갈리므로, 소스가 뒤바뀔 때 정정으로 오판하지
+# 않도록 권위 순위를 둔다. 숫자가 클수록 신뢰도 높음.
+_SOURCE_PRIORITY = {
+    "steam_initial_events": 2,
+    "steam_rss": 1,
+}
+
+
+def _post_source(raw: object) -> str:
+    if isinstance(raw, dict):
+        source = raw.get("source")
+        if isinstance(source, str) and source:
+            return source
+    return ""
+
+
+def _source_priority(source: str) -> int:
+    return _SOURCE_PRIORITY.get(source, 0)
+
+
 def _column_default_definition(definition: str) -> str:
     upper = definition.upper()
     if "TEXT" in upper:
@@ -1871,16 +1892,33 @@ class SQLiteStorage:
         with self._lock:
             ids = [p.post_id for p in posts_list]
             placeholders = ",".join("?" * len(ids))
-            existing_hashes: dict[str, str] = {
-                row["post_id"]: row["content_hash"]
+            existing_rows: dict[str, sqlite3.Row] = {
+                row["post_id"]: row
                 for row in self._connection.execute(
-                    f"SELECT post_id, content_hash FROM posts WHERE post_id IN ({placeholders})",
+                    f"SELECT post_id, content_hash, raw_json FROM posts "
+                    f"WHERE post_id IN ({placeholders})",
                     ids,
                 ).fetchall()
             }
             for post in posts_list:
                 new_hash = _post_content_hash(post)
-                old_hash = existing_hashes.get(post.post_id)
+                existing = existing_rows.get(post.post_id)
+                old_hash = existing["content_hash"] if existing is not None else None
+
+                new_priority = _source_priority(_post_source(post.raw))
+                old_priority = 0
+                if existing is not None:
+                    try:
+                        old_raw = json.loads(existing["raw_json"]) if existing["raw_json"] else {}
+                    except (TypeError, ValueError):
+                        old_raw = {}
+                    old_priority = _source_priority(_post_source(old_raw))
+
+                # 낮은 권위 소스(예: RSS fallback)가 이미 높은 권위 소스로 저장된 글을
+                # 다시 들고 온 경우: 권위 있는 내용을 유지하고 정정으로 취급하지 않는다.
+                if existing is not None and new_priority < old_priority:
+                    continue
+
                 cursor = self._connection.execute(
                     """
                     INSERT INTO posts (
@@ -1915,7 +1953,14 @@ class SQLiteStorage:
                 )
                 if cursor.rowcount:
                     saved += 1
-                if old_hash is not None and old_hash != "" and old_hash != new_hash:
+                # 내용이 바뀌었더라도, 같은 권위 소스에서 온 변경만 진짜 정정으로 본다.
+                # 권위가 더 높은 소스로의 갱신(upgrade)은 내용만 덮고 재전송하지 않는다.
+                if (
+                    old_hash is not None
+                    and old_hash != ""
+                    and old_hash != new_hash
+                    and new_priority == old_priority
+                ):
                     changed_post_ids.append(post.post_id)
                     self._queue_news_update_targets_locked(post.post_id, new_hash, now)
             self._connection.commit()

@@ -80,6 +80,7 @@ ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
+COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
 YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
@@ -5220,135 +5221,89 @@ class NewsCog(commands.Cog):
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def list_commands(self, interaction: discord.Interaction) -> None:
-        embed = discord.Embed(
-            title="림피 명령어 안내",
-            color=discord.Color.from_rgb(179, 28, 28),
-            description="**림피는 림버스 컴퍼니 스팀 뉴스를 가져와 디스코드에 보내주는 봇이에요!**",
+        view = discord.ui.LayoutView(timeout=None)
+        container = discord.ui.Container(accent_color=discord.Color.from_rgb(179, 28, 28))
+
+        container.add_item(
+            discord.ui.Section(
+                discord.ui.TextDisplay(
+                    "## 림피 명령어 안내\n"
+                    "-# 림버스 컴퍼니 관련 소식을 확인할 필요없이 디스코드 채널에 전해주는 봇이에요!\n"
+                    "-# TMI: 봇 프사랑 배너가 왜 홍루냐면요.. 단순히 제작자 최애라서..ㅎ"
+                ),
+                accessory=discord.ui.Thumbnail(
+                    media=f"attachment://{COMMAND_GUIDE_IMAGE_NAME}"
+                ),
+            )
         )
-        embed.add_field(
-            name="/서버설정",
-            value=(
-                "역할, 자동 알림, 기본 언어, 뉴스 소스, 공개 소식 전송, 조회 메시지 자동 삭제(유예 1~7일)를 설정합니다.\n"
-                "알림 배너는 `img` 폴더의 배너 이미지 이름 또는 `사용 안 함`으로 고릅니다.\n"
-                "자동 알림·자동 삭제 같은 선택 옵션은 `허용`/`비허용`으로 고릅니다.\n"
-                "서버에서만 사용 가능 (서버 관리 권한 필요)."
-            ),
-            inline=False,
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                "## 📰 **소식 보기**\n"
+                "> `/최근소식보기` — 설정한 언어의 최신 소식을 즉시 조회\n"
+                "> `/이전소식보기` — 저장된 이전 소식 다시 보기\n"
+                "> `/소식보내기` — 저장된 소식을 채널에 맨션과 함께 전송"
+            )
         )
-        embed.add_field(
-            name="/소식채널설정",
-            value=(
-                "언어와 채널을 골라 자동 소식 채널을 등록합니다.\n"
-                "한국어·English·日本語 채널을 나누려면 언어와 채널을 바꿔 이 명령을 반복 실행합니다.\n"
-                "같은 채널은 한 언어로만 등록되며, 다시 설정하면 기존 언어가 새 언어로 바뀝니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                "## 📢 **소식 채널 · 자동 알림**\n"
+                "> `/소식채널설정` — 언어별 자동 소식 채널 등록\n"
+                "> `/소식채널해제` — 자동 소식 채널 등록 해제\n"
+                "> `/누락소식설정` — 발송 실패 소식 자동 재시도 설정\n"
+                "> `/점검알림설정` — 주간 점검 · 업데이트 알림 설정"
+            )
         )
-        embed.add_field(
-            name="/누락소식설정",
-            value=(
-                "권한 오류나 일시 오류로 자동 발송에 실패한 새 소식을 다음 확인 때 다시 보낼지 설정합니다.\n"
-                "`허용` 상태에서는 실패한 새 소식을 본 것으로 처리하지 않아 자동 재시도합니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                "## 📡 **방송 알림**\n"
+                "> `/방송알림설정` — 방송 시작 알림 설정\n"
+                "> `/방송알림해제` — 방송 알림 해제\n"
+                "> `/방송현황보기` — 치지직 · 유튜브 방송 현황 보기\n"
+                "> `/방송알림보내기` — 현재 방송을 지정 채널에 전송"
+            )
         )
-        embed.add_field(
-            name="/소식채널해제",
-            value="현재 설정된 소식 채널 목록에서 채널과 언어를 골라 자동 소식 채널 등록을 해제합니다. (서버 관리 권한 필요)",
-            inline=False,
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                "## ⚙️ **서버 설정 · 관리**\n"
+                "> `/서버설정` — 역할 · 자동 알림 · 언어 · 배너 등 종합 설정\n"
+                "> `/유저설정` — 앱 사용 시 개인 언어 · 배너 설정\n"
+                "> `/서버설정상태` — 현재 서버 설정 보기\n"
+                "> `/서버설정초기화` — 설정 · 읽음 기준선 초기화\n"
+                "> `/역할핑해제` — 새 소식 알림 역할 핑 제거\n"
+                "> `/서버동기화` — DB 등록 · 명령어 준비 확인"
+            )
         )
-        embed.add_field(
-            name="/점검알림설정",
-            value=(
-                "매주 목요일 10:00(KST) 점검 시작과 12:00(KST) 업데이트 알림을 임베드로 보낼지 설정합니다.\n"
-                "채널을 비우면 현재 채널 또는 기존 점검 알림 채널을 사용하고, /서버설정 역할을 함께 멘션합니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
+        container.add_item(discord.ui.Separator())
+
+        container.add_item(
+            discord.ui.TextDisplay(
+                "## ℹ️ **기타**\n"
+                "> `/명령어` — 이 안내 보기\n"
+                "> `/크레딧` — 림피 제작 크레딧 보기"
+            )
         )
-        embed.add_field(
-            name="/방송알림설정",
-            value=(
-                "ProjectMoon Official 방송 시작 알림을 설정합니다.\n"
-                "소스에서 `치지직 & 유튜브`, `치지직`, `유튜브` 중 받을 알림을 고릅니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
+        container.add_item(discord.ui.Separator())
+        container.add_item(
+            discord.ui.TextDisplay(f"-# 한 번에 가져오는 소식 수: 최대 {NEWS_POST_LIMIT}개")
         )
-        embed.add_field(
-            name="/방송알림해제",
-            value="현재 설정된 방송 알림 목록에서 치지직, 유튜브, 전체 해제 중 하나를 골라 해제합니다. (서버 관리 권한 필요)",
-            inline=False,
+
+        view.add_item(container)
+
+        guide_image = discord.File(
+            _resource_path(NEWS_BANNER_DIR / COMMAND_GUIDE_IMAGE_NAME),
+            filename=COMMAND_GUIDE_IMAGE_NAME,
         )
-        embed.add_field(
-            name="/방송현황보기",
-            value="ProjectMoon Official 치지직·유튜브 방송 현황과 바로가기 링크를 봅니다.",
-            inline=False,
+        await interaction.response.send_message(
+            view=view, files=[guide_image], ephemeral=True
         )
-        embed.add_field(
-            name="/방송알림보내기",
-            value=(
-                "현재 ProjectMoon Official 방송을 지정 채널에 보냅니다.\n"
-                "소스, 채널, 역할을 비우면 치지직·유튜브를 모두 확인하고 서버 설정 값을 사용합니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="/유저설정",
-            value="앱으로 사용할 때의 개인 언어와 /최근소식보기·/이전소식보기 배너를 설정합니다.",
-            inline=False,
-        )
-        embed.add_field(
-            name="/서버설정상태",
-            value="현재 봇 서버 설정, 뉴스 소스, 치지직·유튜브 알림 설정을 보여줍니다. (서버 전용)",
-            inline=False,
-        )
-        embed.add_field(
-            name="/서버설정초기화",
-            value="서버 공통 설정, 언어별 소식 채널, 치지직·유튜브 알림 설정, 읽음 기준선을 초기 상태로 되돌립니다. (서버 관리 권한 필요)",
-            inline=False,
-        )
-        embed.add_field(
-            name="/역할핑해제",
-            value="새 소식 알림에 붙는 역할 핑을 제거합니다. (서버 전용)",
-            inline=False,
-        )
-        embed.add_field(
-            name="/서버동기화",
-            value="현재 서버를 림피 DB에 등록하고 명령어 사용 준비 상태를 확인합니다. (서버 관리 권한 필요)",
-            inline=False,
-        )
-        embed.add_field(
-            name="/최근소식보기",
-            value="설정한 언어의 가장 최근 소식을 즉시 가져와 보여줍니다. 나만보기·사진 첨부 옵션은 `허용`/`비허용`으로 고릅니다.",
-            inline=False,
-        )
-        embed.add_field(
-            name="/소식보내기",
-            value=(
-                "저장된 소식을 골라 지정 채널에 맨션과 함께 보냅니다.\n"
-                "채널을 비우면 /소식채널설정 채널 전체에 각 채널 언어와 같은 소식을 찾아 보내고, 역할을 비우면 /서버설정 값을 사용합니다. (서버 관리 권한 필요)"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="/이전소식보기",
-            value=(
-                "저장된 이전 소식을 다시 봅니다. 자동완성은 설정한 언어로 필터링됩니다.\n"
-                "서버와 앱 설치에서 모두 사용 가능하며, 나만보기·사진 첨부 옵션은 `허용`/`비허용`으로 고릅니다."
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="/명령어",
-            value="이 안내를 봅니다.",
-            inline=False,
-        )
-        embed.add_field(
-            name="/크레딧",
-            value="림피 제작 크레딧을 봅니다.",
-            inline=False,
-        )
-        embed.set_footer(text=f"한 번에 가져오는 소식 수: 최대 {NEWS_POST_LIMIT}개")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="크레딧", description="림피 제작 크레딧을 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
