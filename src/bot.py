@@ -253,6 +253,42 @@ class LoggingCommandTree(app_commands.CommandTree):
         for user_id in stale_user_ids:
             self._user_command_cooldowns.pop(user_id, None)
 
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        if isinstance(error, app_commands.TransformerError):
+            LOGGER.warning(
+                "명령어 인자 변환 실패 (command=%s, guild_id=%s, value=%r). "
+                "봇이 해당 서버에 없거나 채널을 볼 수 없어 변환에 실패했을 수 있습니다.",
+                getattr(interaction.command, "qualified_name", "unknown"),
+                interaction.guild_id,
+                getattr(error, "value", None),
+            )
+            message = (
+                "선택한 채널을 확인하지 못했어요. 림피가 이 서버에 초대되어 있는지, "
+                "그리고 채널을 다시 선택했는지 확인한 뒤 다시 시도해주세요."
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                else:
+                    await interaction.response.send_message(
+                        message,
+                        ephemeral=True,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+            except discord.HTTPException:
+                pass
+            return
+
+        await super().on_error(interaction, error)
+
 
 class LimpiBot(commands.Bot):
     def __init__(self, config: AppConfig) -> None:
