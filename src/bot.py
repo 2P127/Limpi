@@ -37,6 +37,7 @@ from .core.storage import (
     DISABLED_NOTIFICATION_BANNER,
     MAX_CLEANUP_DAYS,
     MIN_CLEANUP_DAYS,
+    NEWS_UPDATE_MAX_AGE_SECONDS,
     SQLiteStorage,
 )
 from .clients.steam_client import NewsSource, build_news_source
@@ -530,13 +531,12 @@ class NewsCog(commands.Cog):
 
             LOGGER.info(
                 "알림 대상: guild=%s (%s), connected=%s, "
-                "news_enabled=%s, missed_recovery_enabled=%s, maintenance_enabled=%s, "
+                "news_enabled=%s, maintenance_enabled=%s, "
                 "channel=%s (%s), role=%s (%s), language=%s, image_delivery=%s, notification_banner=%s",
                 guild_name,
                 settings.guild_id,
                 settings.guild_id in connected_guild_ids,
                 settings.enabled,
-                settings.missed_news_recovery_enabled,
                 settings.maintenance_notifications_enabled,
                 channel_name,
                 settings.channel_id,
@@ -1465,31 +1465,18 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids and settings.missed_news_recovery_enabled:
+        if failed_post_ids:
             LOGGER.warning(
-                "뉴스 자동 전송 실패 항목은 본 것으로 처리하지 않고 다음 자동 확인 때 다시 시도합니다 "
+                "실패한 게시물은 해당 대상에서 본 것으로 처리되어 이후 자동 폴링에서 건너뜁니다 "
                 "(guild_id=%s, channel_id=%s, post_ids=%s).",
                 target.guild_id,
                 target.channel_id,
                 ", ".join(sorted(failed_post_ids)),
             )
-        elif failed_post_ids:
-            LOGGER.warning(
-                "누락 뉴스 복구가 비활성화되어 있습니다. 실패한 게시물은 해당 대상에서 본 것으로 처리되어 "
-                "이후 자동 폴링에서 건너뜁니다 (guild_id=%s, channel_id=%s, post_ids=%s).",
-                target.guild_id,
-                target.channel_id,
-                ", ".join(sorted(failed_post_ids)),
-            )
-        seen_posts = [
-            post.post_id
-            for post in posts
-            if not settings.missed_news_recovery_enabled or post.post_id not in failed_post_ids
-        ]
+        seen_posts = [post.post_id for post in posts]
         self.storage.mark_news_target_posts_seen(target.target_id, seen_posts)
         self.storage.mark_posts_seen(target.guild_id, seen_posts)
-        if not failed_post_ids or not settings.missed_news_recovery_enabled:
-            self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
+        self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
         return announced
 
     async def _resolve_automatic_news_channel(
@@ -1640,33 +1627,20 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids and settings.missed_news_recovery_enabled:
+        if failed_post_ids:
             LOGGER.warning(
-                "뉴스 자동 전송 실패 항목은 본 것으로 처리하지 않고 다음 자동 확인 때 다시 시도합니다 "
+                "실패한 게시물은 본 것으로 처리되어 이후 자동 폴링에서 건너뜁니다 "
                 "(guild_id=%s, channel_id=%s, post_ids=%s).",
                 settings.guild_id,
                 settings.channel_id,
                 ", ".join(sorted(failed_post_ids)),
             )
-        elif failed_post_ids:
-            LOGGER.warning(
-                "누락 뉴스 복구가 비활성화되어 있습니다. 실패한 게시물은 본 것으로 처리되어 "
-                "이후 자동 폴링에서 건너뜁니다 (guild_id=%s, channel_id=%s, post_ids=%s).",
-                settings.guild_id,
-                settings.channel_id,
-                ", ".join(sorted(failed_post_ids)),
-            )
-        seen_posts = [
-            post.post_id
-            for post in posts
-            if not settings.missed_news_recovery_enabled or post.post_id not in failed_post_ids
-        ]
+        seen_posts = [post.post_id for post in posts]
         self.storage.mark_posts_seen(
             settings.guild_id,
             seen_posts,
         )
-        if not failed_post_ids or not settings.missed_news_recovery_enabled:
-            self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
+        self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
         return announced
 
     def _new_posts_for_guild(
@@ -1787,7 +1761,6 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
-        recovery_notice: str | None = None,
     ) -> bool:
         channel_id = getattr(channel, "id", settings.channel_id)
         try:
@@ -1797,7 +1770,6 @@ class NewsCog(commands.Cog):
                 settings.role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
-                recovery_notice=recovery_notice,
             )
             return True
         except discord.Forbidden as exc:
@@ -1859,7 +1831,6 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
-        recovery_notice: str | None = None,
     ) -> bool:
         try:
             await self._broadcast_post(
@@ -1868,7 +1839,6 @@ class NewsCog(commands.Cog):
                 settings.role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
-                recovery_notice=recovery_notice,
             )
             return True
         except discord.Forbidden as exc:
@@ -1940,6 +1910,19 @@ class NewsCog(commands.Cog):
             targets = targets_by_post_id.get(post_id, [])
             if not targets:
                 continue
+            # 최초 게시가 오래된 글은 수정 알림을 보내지 않는다. 큐에 남은 stale 항목은
+            # 재전송 없이 비워, 폴링마다 옛 글이 다시 나가던 문제를 차단한다.
+            if not _is_news_update_recent(post):
+                for target in targets:
+                    self.storage.mark_news_update_sent(target.target_id, post_id)
+                LOGGER.info(
+                    "오래된 글이라 수정 재전송을 건너뛰고 큐를 정리합니다 "
+                    "(post_id=%s, title=%r, targets=%s).",
+                    post_id,
+                    post.title,
+                    len(targets),
+                )
+                continue
             LOGGER.info(
                 "뉴스 수정 감지 — 재전송 (post_id=%s, title=%r, targets=%s).",
                 post_id,
@@ -1979,7 +1962,6 @@ class NewsCog(commands.Cog):
         banner_filename: str | None = None,
         is_update: bool = False,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
-        recovery_notice: str | None = None,
     ) -> None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -1995,7 +1977,6 @@ class NewsCog(commands.Cog):
             include_zip_button=True,
             include_banner=banner_file is not None,
             is_update=is_update,
-            recovery_notice=recovery_notice,
         )
         image_batch_tasks = (
             batch_tasks
@@ -3771,43 +3752,6 @@ class NewsCog(commands.Cog):
                 break
         return choices
 
-    @app_commands.command(name="누락소식설정", description="자동 발송 실패로 누락된 소식을 다음 폴링 때 다시 보낼지 설정합니다.")
-    @app_commands.allowed_installs(guilds=True, users=False)
-    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    @app_commands.rename(enabled="허용")
-    @app_commands.describe(
-        enabled="허용하면 권한 오류나 일시 오류로 못 보낸 새 소식을 다음 자동 확인 때 다시 시도합니다.",
-    )
-    @app_commands.choices(enabled=BOOLEAN_CHOICES)
-    async def configure_missed_news_recovery(
-        self,
-        interaction: discord.Interaction,
-        enabled: app_commands.Choice[str],
-    ) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
-            return
-
-        settings = self.storage.update_settings(
-            interaction.guild_id,
-            missed_news_recovery_enabled=_choice_bool(enabled, False),
-        )
-        embed = discord.Embed(
-            title="누락 소식 설정이 완료되었어요",
-            description=(
-                f"누락 소식 자동 재시도: {_bool_label(settings.missed_news_recovery_enabled)}\n"
-                "허용 상태에서는 자동 발송에 실패한 새 소식을 본 것으로 처리하지 않고 다음 확인 때 다시 보냅니다."
-            ),
-            color=_success_embed_color(),
-        )
-        await interaction.response.send_message(
-            embed=embed,
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
     @app_commands.command(name="점검알림설정", description="매주 목요일 10시 점검 시작과 12시 업데이트 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -5240,7 +5184,7 @@ class NewsCog(commands.Cog):
 
         container.add_item(
             discord.ui.TextDisplay(
-                "## 📰 **소식 보기**\n"
+                "### 📰 **소식 보기관련 **\n"
                 "> `/최근소식보기` — 설정한 언어의 최신 소식을 즉시 조회\n"
                 "> `/이전소식보기` — 저장된 이전 소식 다시 보기\n"
                 "> `/소식보내기` — 저장된 소식을 채널에 맨션과 함께 전송"
@@ -5250,10 +5194,9 @@ class NewsCog(commands.Cog):
 
         container.add_item(
             discord.ui.TextDisplay(
-                "## 📢 **소식 채널 · 자동 알림**\n"
+                "### 📢 **소식 채널 · 자동 알림**\n"
                 "> `/소식채널설정` — 언어별 자동 소식 채널 등록\n"
                 "> `/소식채널해제` — 자동 소식 채널 등록 해제\n"
-                "> `/누락소식설정` — 발송 실패 소식 자동 재시도 설정\n"
                 "> `/점검알림설정` — 주간 점검 · 업데이트 알림 설정"
             )
         )
@@ -5261,7 +5204,7 @@ class NewsCog(commands.Cog):
 
         container.add_item(
             discord.ui.TextDisplay(
-                "## 📡 **방송 알림**\n"
+                "### 📡 **방송 알림**\n"
                 "> `/방송알림설정` — 방송 시작 알림 설정\n"
                 "> `/방송알림해제` — 방송 알림 해제\n"
                 "> `/방송현황보기` — 치지직 · 유튜브 방송 현황 보기\n"
@@ -5272,7 +5215,7 @@ class NewsCog(commands.Cog):
 
         container.add_item(
             discord.ui.TextDisplay(
-                "## ⚙️ **서버 설정 · 관리**\n"
+                "### ⚙️ **서버 설정 · 관리**\n"
                 "> `/서버설정` — 역할 · 자동 알림 · 언어 · 배너 등 종합 설정\n"
                 "> `/유저설정` — 앱 사용 시 개인 언어 · 배너 설정\n"
                 "> `/서버설정상태` — 현재 서버 설정 보기\n"
@@ -5285,9 +5228,9 @@ class NewsCog(commands.Cog):
 
         container.add_item(
             discord.ui.TextDisplay(
-                "## ℹ️ **기타**\n"
+                "### ℹ️ **기타**\n"
                 "> `/명령어` — 이 안내 보기\n"
-                "> `/크레딧` — 림피 제작 크레딧 보기"
+                "> `/크레딧` — 림피봇 제작 크레딧 보기"
             )
         )
         container.add_item(discord.ui.Separator())
@@ -5927,7 +5870,6 @@ def _build_layout_view_for_post(
     include_banner: bool,
     leading_text: str | None = None,
     is_update: bool = False,
-    recovery_notice: str | None = None,
 ) -> discord.ui.LayoutView:
     view = discord.ui.LayoutView(timeout=None)
     container = discord.ui.Container(accent_color=_post_embed_color(post))
@@ -5983,10 +5925,6 @@ def _build_layout_view_for_post(
     if action_row.children:
         container.add_item(discord.ui.Separator())
         container.add_item(action_row)
-
-    if recovery_notice:
-        container.add_item(discord.ui.Separator())
-        container.add_item(discord.ui.TextDisplay(recovery_notice))
 
     view.add_item(container)
     return view
@@ -6286,6 +6224,15 @@ def _dedupe_posts_by_id(posts: list[NewsPost]) -> list[NewsPost]:
 
 def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
     return [post for post in posts if post.created_at is not None]
+
+
+def _is_news_update_recent(post: NewsPost) -> bool:
+    """최초 게시 시각이 재전송 허용 시간(10분) 이내인지. 시각 미상이면 불허(안전)."""
+    moment = _as_utc_datetime(post.created_at)
+    if moment is None:
+        return False
+    age = (datetime.now(timezone.utc) - moment).total_seconds()
+    return age <= NEWS_UPDATE_MAX_AGE_SECONDS
 
 
 def _delay_seconds(value: datetime | None) -> int | str:

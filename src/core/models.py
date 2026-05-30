@@ -43,7 +43,6 @@ class GuildSettings:
     image_delivery: str
     notification_banner: str | None
     public_news_lookup_allowed: bool
-    missed_news_recovery_enabled: bool
     maintenance_notifications_enabled: bool
     news_source_mode: str
     last_maintenance_start_notice: str | None

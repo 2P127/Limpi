@@ -30,16 +30,34 @@ DEFAULT_IMAGE_DELIVERY = "files"
 DEFAULT_NOTIFICATION_BANNER = "림피 배너.png"
 DISABLED_NOTIFICATION_BANNER = "none"
 DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED = True
-DEFAULT_MISSED_NEWS_RECOVERY_ENABLED = False
 DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED = False
 DEFAULT_NEWS_SOURCE_MODE = "both"
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
 
+# 최초 게시 시각이 이 시간보다 오래된 글은 내용이 바뀌어도 "수정된 소식"으로 재전송하지
+# 않는다. 오래된 글의 해시가 한 번이라도 흔들리면(소스 표현 변화 등) 이미 보낸 글이
+# 무한 재전송되던 버그를 차단하기 위한 안전장치다.
+NEWS_UPDATE_MAX_AGE_SECONDS = 10 * 60
+
 
 def _post_content_hash(post: "NewsPost") -> str:
     raw = f"{post.title}\x00{post.text}\x00{json.dumps(post.image_urls, sort_keys=True)}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def _post_age_seconds(created_at: "datetime | None") -> float | None:
+    """최초 게시 시각으로부터 경과한 초. 시각을 모르면 None."""
+    if created_at is None:
+        return None
+    moment = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - moment).total_seconds()
+
+
+def _is_post_update_eligible(created_at: "datetime | None") -> bool:
+    """수정 재전송을 허용할 만큼 최근에 게시된 글인지. 시각 미상이면 불허(안전)."""
+    age = _post_age_seconds(created_at)
+    return age is not None and age <= NEWS_UPDATE_MAX_AGE_SECONDS
 
 
 # 동일 글을 여러 소스가 만들 수 있다(Steam 이벤트 JSON vs RSS fallback). 소스마다
@@ -103,7 +121,6 @@ class SQLiteStorage:
                 image_delivery TEXT NOT NULL DEFAULT 'files',
                 notification_banner TEXT DEFAULT '림피 배너.png',
                 public_news_lookup_allowed INTEGER NOT NULL DEFAULT 1,
-                missed_news_recovery_enabled INTEGER NOT NULL DEFAULT 0,
                 maintenance_notifications_enabled INTEGER NOT NULL DEFAULT 0,
                 news_source_mode TEXT NOT NULL DEFAULT 'both',
                 last_maintenance_start_notice TEXT,
@@ -343,6 +360,90 @@ class SQLiteStorage:
             self._migrate_legacy_post_ids()
             self._migrate_legacy_news_targets()
             self._connection.commit()
+        self._run_migrations()
+
+    # 적용된 스키마/데이터 마이그레이션 버전을 schema_migrations 테이블로 관리한다.
+    # 각 마이그레이션은 idempotent해야 하며, 실패 시 해당 마이그레이션만 롤백하고
+    # 버전을 기록하지 않으므로 다음 실행에서 다시 시도된다(봇 기동은 막지 않는다).
+    _MIGRATIONS: list[tuple[int, str]] = [
+        (1, "clear_stale_news_update_queue"),
+        (2, "drop_missed_news_recovery_column"),
+    ]
+
+    def _run_migrations(self) -> None:
+        with self._lock:
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            self._connection.commit()
+            applied = {
+                int(row["version"])
+                for row in self._connection.execute(
+                    "SELECT version FROM schema_migrations"
+                ).fetchall()
+            }
+            for version, name in self._MIGRATIONS:
+                if version in applied:
+                    continue
+                handler = getattr(self, f"_migration_{version:03d}")
+                try:
+                    handler()
+                    self._connection.execute(
+                        "INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) "
+                        "VALUES (?, ?, ?)",
+                        (version, name, _now_iso()),
+                    )
+                    self._connection.commit()
+                    LOGGER.info("DB 마이그레이션 적용 완료: v%s (%s).", version, name)
+                except Exception:
+                    self._connection.rollback()
+                    LOGGER.exception(
+                        "DB 마이그레이션 실패로 롤백했습니다. 봇은 계속 기동하며 다음 실행에서 "
+                        "다시 시도합니다: v%s (%s).",
+                        version,
+                        name,
+                    )
+                    break
+
+    def _migration_001(self) -> None:
+        """누적된 미전송 뉴스 수정 큐를 전부 비운다.
+
+        이 큐는 폴링 때마다 파생되는 임시 상태일 뿐이라 비워도 콘텐츠 데이터가
+        사라지지 않는다. 정말로 최근에 수정된 글은 다음 폴링에서 다시 큐잉되며,
+        이때는 새로 추가된 최초 게시 시각(10분) 게이트를 통과해야만 재전송된다.
+        과거 stale 큐가 폴링마다 무한 재전송되던 문제를 일괄 해소한다."""
+        cursor = self._connection.execute(
+            "DELETE FROM guild_news_target_pending_updates WHERE sent_at IS NULL"
+        )
+        LOGGER.info("누적된 미전송 뉴스 수정 큐 정리: %s행 삭제.", cursor.rowcount or 0)
+
+    def _migration_002(self) -> None:
+        """사용하지 않게 된 guild_settings.missed_news_recovery_enabled 컬럼 제거."""
+        cols = {
+            row["name"]
+            for row in self._connection.execute(
+                "PRAGMA table_info(guild_settings)"
+            ).fetchall()
+        }
+        if "missed_news_recovery_enabled" not in cols:
+            return
+        try:
+            self._connection.execute(
+                "ALTER TABLE guild_settings DROP COLUMN missed_news_recovery_enabled"
+            )
+            LOGGER.info("guild_settings.missed_news_recovery_enabled 컬럼을 제거했습니다.")
+        except sqlite3.OperationalError as exc:
+            # 구버전 SQLite는 DROP COLUMN 미지원. 컬럼은 미사용이므로 그대로 둬도 무해하다.
+            LOGGER.warning(
+                "missed_news_recovery_enabled 컬럼 제거를 지원하지 않아 미사용 상태로 유지합니다: %s",
+                exc,
+            )
 
     def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
         rows = self._connection.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -428,7 +529,6 @@ class SQLiteStorage:
                 image_delivery = COALESCE(NULLIF(image_delivery, ''), 'files'),
                 notification_banner = COALESCE(NULLIF(notification_banner, ''), ?),
                 public_news_lookup_allowed = COALESCE(public_news_lookup_allowed, 1),
-                missed_news_recovery_enabled = COALESCE(missed_news_recovery_enabled, 0),
                 maintenance_notifications_enabled = COALESCE(maintenance_notifications_enabled, 0),
                 news_source_mode = COALESCE(NULLIF(news_source_mode, ''), ?),
                 created_at = COALESCE(NULLIF(created_at, ''), ?),
@@ -718,7 +818,6 @@ class SQLiteStorage:
                 image_delivery=DEFAULT_IMAGE_DELIVERY,
                 notification_banner=DEFAULT_NOTIFICATION_BANNER,
                 public_news_lookup_allowed=DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED,
-                missed_news_recovery_enabled=DEFAULT_MISSED_NEWS_RECOVERY_ENABLED,
                 maintenance_notifications_enabled=DEFAULT_MAINTENANCE_NOTIFICATIONS_ENABLED,
                 news_source_mode=DEFAULT_NEWS_SOURCE_MODE,
                 last_maintenance_start_notice=None,
@@ -1410,7 +1509,6 @@ class SQLiteStorage:
         image_delivery: str | None = None,
         notification_banner: str | None = None,
         public_news_lookup_allowed: bool | None = None,
-        missed_news_recovery_enabled: bool | None = None,
         maintenance_notifications_enabled: bool | None = None,
         news_source_mode: str | None = None,
     ) -> GuildSettings:
@@ -1454,11 +1552,6 @@ class SQLiteStorage:
                 if public_news_lookup_allowed is not None
                 else current.public_news_lookup_allowed
             ),
-            missed_news_recovery_enabled=(
-                missed_news_recovery_enabled
-                if missed_news_recovery_enabled is not None
-                else current.missed_news_recovery_enabled
-            ),
             maintenance_notifications_enabled=(
                 maintenance_notifications_enabled
                 if maintenance_notifications_enabled is not None
@@ -1480,10 +1573,10 @@ class SQLiteStorage:
                     guild_id, channel_id, role_id, post_format, enabled, language,
                     max_posts_per_poll, auto_cleanup_enabled, auto_cleanup_days,
                     image_delivery, notification_banner, public_news_lookup_allowed,
-                    missed_news_recovery_enabled, maintenance_notifications_enabled, news_source_mode, last_maintenance_start_notice,
+                    maintenance_notifications_enabled, news_source_mode, last_maintenance_start_notice,
                     last_maintenance_update_notice, last_seen_post_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     role_id = excluded.role_id,
@@ -1496,7 +1589,6 @@ class SQLiteStorage:
                     image_delivery = excluded.image_delivery,
                     notification_banner = excluded.notification_banner,
                     public_news_lookup_allowed = excluded.public_news_lookup_allowed,
-                    missed_news_recovery_enabled = excluded.missed_news_recovery_enabled,
                     maintenance_notifications_enabled = excluded.maintenance_notifications_enabled,
                     news_source_mode = excluded.news_source_mode,
                     updated_at = excluded.updated_at
@@ -1514,7 +1606,6 @@ class SQLiteStorage:
                     next_settings.image_delivery,
                     next_settings.notification_banner,
                     int(next_settings.public_news_lookup_allowed),
-                    int(next_settings.missed_news_recovery_enabled),
                     int(next_settings.maintenance_notifications_enabled),
                     next_settings.news_source_mode,
                     next_settings.last_maintenance_start_notice,
@@ -1955,11 +2046,13 @@ class SQLiteStorage:
                     saved += 1
                 # 내용이 바뀌었더라도, 같은 권위 소스에서 온 변경만 진짜 정정으로 본다.
                 # 권위가 더 높은 소스로의 갱신(upgrade)은 내용만 덮고 재전송하지 않는다.
+                # 또한 최초 게시가 오래된 글은 해시가 흔들려도 재전송하지 않는다(무한 재전송 차단).
                 if (
                     old_hash is not None
                     and old_hash != ""
                     and old_hash != new_hash
                     and new_priority == old_priority
+                    and _is_post_update_eligible(post.created_at)
                 ):
                     changed_post_ids.append(post.post_id)
                     self._queue_news_update_targets_locked(post.post_id, new_hash, now)
@@ -2320,7 +2413,6 @@ class SQLiteStorage:
             image_delivery=image_delivery,
             notification_banner=row["notification_banner"] or DEFAULT_NOTIFICATION_BANNER,
             public_news_lookup_allowed=bool(row["public_news_lookup_allowed"]),
-            missed_news_recovery_enabled=bool(row["missed_news_recovery_enabled"]),
             maintenance_notifications_enabled=bool(row["maintenance_notifications_enabled"]),
             news_source_mode=news_source_mode,
             last_maintenance_start_notice=row["last_maintenance_start_notice"],
