@@ -1484,6 +1484,7 @@ class NewsCog(commands.Cog):
                 settings,
                 target,
                 post,
+                mention_role=announced == 0,
             )
             if not sent:
                 failed_post_ids.add(post.post_id)
@@ -1652,6 +1653,7 @@ class NewsCog(commands.Cog):
                 channel,
                 settings,
                 post,
+                mention_role=announced == 0,
             )
             if not sent:
                 failed_post_ids.add(post.post_id)
@@ -1807,13 +1809,14 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        mention_role: bool = True,
     ) -> bool:
         channel_id = getattr(channel, "id", settings.channel_id)
         try:
             await self._broadcast_post(
                 channel,
                 post,
-                settings.role_id,
+                settings.role_id if mention_role else None,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
             )
@@ -1877,12 +1880,13 @@ class NewsCog(commands.Cog):
         post: NewsPost,
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        mention_role: bool = True,
     ) -> bool:
         try:
             sent_message = await self._broadcast_post(
                 channel,
                 post,
-                settings.role_id,
+                settings.role_id if mention_role else None,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
             )
@@ -5324,6 +5328,7 @@ class NewsCog(commands.Cog):
         sent_channel_ids: list[int] = []
         failed_channel_ids: list[int | None] = []
         missing_languages: set[str] = set()
+        mentioned_channel_ids: set[int] = set()
 
         for target, target_language in delivery_targets:
             channel_id = getattr(target, "id", None)
@@ -5333,11 +5338,14 @@ class NewsCog(commands.Cog):
                 failed_channel_ids.append(channel_id)
                 continue
 
+            mention_role = not (
+                isinstance(channel_id, int) and channel_id in mentioned_channel_ids
+            )
             try:
                 await self._broadcast_post(
                     target,
                     target_post,
-                    role_id,
+                    role_id if mention_role else None,
                     banner_filename=settings.notification_banner,
                 )
             except discord.Forbidden:
@@ -5350,6 +5358,7 @@ class NewsCog(commands.Cog):
 
             if isinstance(channel_id, int):
                 sent_channel_ids.append(channel_id)
+                mentioned_channel_ids.add(channel_id)
 
         if not sent_channel_ids:
             await interaction.followup.send(
