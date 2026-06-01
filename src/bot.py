@@ -16,7 +16,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
 import discord
@@ -94,6 +94,7 @@ LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS = (
 )
 EMBEDS_PER_MESSAGE = 10
 IMAGE_ONLY_EMBEDS_PER_MESSAGE = 4
+MAX_TWITTER_EMBED_IMAGES = EMBEDS_PER_MESSAGE
 EMBED_DESCRIPTION_LIMIT = 8096
 FILES_PER_MESSAGE = 10
 BOOLEAN_TRUE = "true"
@@ -1178,7 +1179,7 @@ class NewsCog(commands.Cog):
             return []
         return _post_autocomplete_choices(posts)
 
-    def _get_combined_post(
+    async def _get_combined_post(
         self,
         value: str,
         *,
@@ -1194,6 +1195,8 @@ class NewsCog(commands.Cog):
             twitter_post = self.storage.get_twitter_post(value.removeprefix("twitter:"))
         if twitter_post is None:
             twitter_post = self.storage.get_twitter_post_by_id_or_title(value)
+        if twitter_post is not None:
+            twitter_post = await self._refresh_stale_twitter_post(twitter_post)
 
         steam_posts = [steam_post] if steam_post is not None else []
         candidates = [*steam_posts]
@@ -1202,7 +1205,7 @@ class NewsCog(commands.Cog):
         filtered = self._posts_for_source_mode(candidates, settings, source_mode=source_mode)
         return filtered[0] if filtered else None
 
-    def _latest_combined_post(
+    async def _latest_combined_post(
         self,
         *,
         language: str | None = None,
@@ -1210,12 +1213,26 @@ class NewsCog(commands.Cog):
     ) -> NewsPost | None:
         steam_post = self.storage.get_latest_post(language)
         twitter_post = self.storage.get_latest_twitter_post()
+        if twitter_post is not None:
+            twitter_post = await self._refresh_stale_twitter_post(twitter_post)
         steam_posts = [steam_post] if steam_post is not None else []
         candidates = [*steam_posts]
         if twitter_post is not None:
             candidates.extend(_twitter_posts_as_news_posts([twitter_post], steam_posts))
         filtered = self._posts_for_source_mode(_sort_posts_newest_first(candidates), settings)
         return filtered[0] if filtered else None
+
+    async def _refresh_stale_twitter_post(self, post: TwitterPost) -> TwitterPost:
+        if self.x_source is None or not _twitter_post_needs_refresh(post):
+            return post
+        try:
+            refreshed = await self.x_source.refresh_post(post)
+        except Exception:
+            LOGGER.exception("저장된 X 게시물 보강 실패 (post_id=%s).", post.post_id)
+            return post
+        if refreshed != post:
+            self.storage.save_twitter_posts([refreshed])
+        return refreshed
 
     def _settings_by_language(self) -> dict[str, list[GuildSettings]]:
         settings_by_language: dict[str, list[GuildSettings]] = {}
@@ -3466,14 +3483,15 @@ class NewsCog(commands.Cog):
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> discord.Message:
         image_urls = _twitter_image_urls(post) if attach_photos else []
-        embed = _embed_for_twitter_post(
-            post,
-            image_url=image_urls[0] if len(image_urls) == 1 else None,
-        )
+        embeds = _embeds_for_twitter_post(post, image_urls=image_urls)
         image_batch_tasks = (
             batch_tasks
             if batch_tasks is not None
-            else (self._start_image_batch_tasks(image_urls) if len(image_urls) > 1 else [])
+            else (
+                self._start_image_batch_tasks(image_urls[MAX_TWITTER_EMBED_IMAGES:])
+                if len(image_urls) > MAX_TWITTER_EMBED_IMAGES
+                else []
+            )
         )
         if role_id:
             await channel.send(
@@ -3485,7 +3503,7 @@ class NewsCog(commands.Cog):
                 ),
             )
         message = await channel.send(
-            embed=embed,
+            embeds=embeds,
             allowed_mentions=discord.AllowedMentions.none(),
         )
         followup_tasks = []
@@ -3549,20 +3567,17 @@ class NewsCog(commands.Cog):
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
         image_urls = _twitter_image_urls(post) if attach_photos else []
-        embed = _embed_for_twitter_post(
-            post,
-            image_url=image_urls[0] if len(image_urls) == 1 else None,
-        )
+        embeds = _embeds_for_twitter_post(post, image_urls=image_urls)
         sent_messages.append(
             await interaction.followup.send(
-                embed=embed,
+                embeds=embeds,
                 ephemeral=private,
                 allowed_mentions=discord.AllowedMentions.none(),
                 wait=True,
             )
         )
-        if len(image_urls) > 1:
-            batch_tasks = self._start_image_batch_tasks(image_urls)
+        if len(image_urls) > MAX_TWITTER_EMBED_IMAGES:
+            batch_tasks = self._start_image_batch_tasks(image_urls[MAX_TWITTER_EMBED_IMAGES:])
             task = asyncio.create_task(
                 self._send_twitter_interaction_image_followups(
                     interaction,
@@ -5163,7 +5178,7 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        post = self._get_combined_post(
+        post = await self._get_combined_post(
             title,
             language=language,
             settings=settings,
@@ -5227,10 +5242,10 @@ class NewsCog(commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=private_value, thinking=True)
 
-        post = self._latest_combined_post(language=language, settings=settings)
+        post = await self._latest_combined_post(language=language, settings=settings)
         if post is None:
             await self._refresh_recent_news_cache(language)
-            post = self._latest_combined_post(language=language, settings=settings)
+            post = await self._latest_combined_post(language=language, settings=settings)
         else:
             task = asyncio.create_task(self._refresh_recent_news_cache(language))
             task.add_done_callback(self._log_background_task_result)
@@ -5286,7 +5301,7 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id)
-        post = self._get_combined_post(
+        post = await self._get_combined_post(
             title,
             language=language,
             settings=settings,
@@ -5762,8 +5777,9 @@ def _split_message_content(text: str, limit: int) -> list[str]:
 
 
 def _description_for_post(post: NewsPost) -> str:
+    body_text, tag_block = _display_body_and_trailing_tags(post)
     chunks = _split_message_content(
-        (post.text or post.url).strip(),
+        body_text,
         EMBED_DESCRIPTION_LIMIT,
     )
     description = chunks[0] if chunks else post.url
@@ -5775,6 +5791,10 @@ def _description_for_post(post: NewsPost) -> str:
     )
     if date_block and len(date_block) + len(description) <= EMBED_DESCRIPTION_LIMIT:
         description = f"{date_block}{description}"
+    if is_twitter and tag_block:
+        tag_block = f"{tag_block}\n\n"
+        if len(tag_block) + len(description) <= EMBED_DESCRIPTION_LIMIT:
+            description = f"{tag_block}{description}"
     source_block = "" if is_twitter else f"\n\n**출처**\n{_post_source_label(post)}"
     if len(description) + len(source_block) <= EMBED_DESCRIPTION_LIMIT:
         description = f"{description}{source_block}"
@@ -5903,6 +5923,19 @@ def _twitter_link_urls(post: TwitterPost) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
+def _twitter_post_needs_refresh(post: TwitterPost) -> bool:
+    if _looks_truncated_post_text(post.text) or _looks_truncated_post_text(post.title):
+        return True
+    if re.match(r"^RT @[^:\s]+:", post.text or "") and not post.raw.get("retweeted_tweet_id"):
+        return True
+    return False
+
+
+def _looks_truncated_post_text(text: str) -> bool:
+    cleaned = (text or "").rstrip()
+    return cleaned.endswith("+...") or cleaned.endswith("…") or cleaned.endswith("...")
+
+
 def _is_steam_news_url(url: str) -> bool:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
@@ -5925,15 +5958,26 @@ def _embed_for_twitter_post(
     *,
     image_url: str | None = None,
 ) -> discord.Embed:
+    description, tag_block = _split_trailing_hashtag_block((post.text or post.url).strip())
+    description = _link_twitter_hashtags(description)
+    tag_block = _link_twitter_hashtags(tag_block)
+    meta_lines: list[str] = []
+    if post.created_at is not None:
+        meta_lines.append(f"**작성일**\n{_format_kst(post.created_at)}")
+    if tag_block:
+        meta_lines.append(tag_block)
+    if meta_lines:
+        meta_block = "\n".join(meta_lines)
+        description = f"{meta_block}\n\n{description or post.url}"
     embed = discord.Embed(
-        title=post.title[:256],
-        description=_truncate_component_text(post.text or post.url, EMBED_DESCRIPTION_LIMIT),
+        title=_display_title_for_twitter_post(post)[:256],
+        description=_truncate_component_text(description or post.url, EMBED_DESCRIPTION_LIMIT),
         url=post.url,
         color=discord.Color.from_rgb(29, 155, 240),
     )
     if post.created_at is not None:
         embed.timestamp = post.created_at
-        embed.set_footer(text=f"출처: X(트위터) · 작성일: {_format_kst(post.created_at)}")
+        embed.set_footer(text="출처: X(트위터)")
     else:
         embed.set_footer(text="출처: X(트위터)")
     embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
@@ -5941,6 +5985,35 @@ def _embed_for_twitter_post(
         embed.set_image(url=image_url)
     embed.add_field(name="원문", value=f"[X에서 보기]({post.url})", inline=False)
     return embed
+
+
+def _embeds_for_twitter_post(
+    post: TwitterPost,
+    *,
+    image_urls: list[str],
+) -> list[discord.Embed]:
+    inline_image_urls = image_urls[:MAX_TWITTER_EMBED_IMAGES]
+    embeds = [
+        _embed_for_twitter_post(
+            post,
+            image_url=inline_image_urls[0] if inline_image_urls else None,
+        )
+    ]
+    for image_url in inline_image_urls[1:]:
+        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(29, 155, 240))
+        embed.set_image(url=image_url)
+        embeds.append(embed)
+    return embeds
+
+
+def _display_title_for_twitter_post(post: TwitterPost) -> str:
+    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+    if retweeted_username:
+        return f"RT @{retweeted_username}"
+    match = re.match(r"^RT @([^:\s]+):", post.title or post.text or "")
+    if match:
+        return f"RT @{match.group(1)}"
+    return post.title.strip() or post.post_id
 
 
 def _embed_for_chzzk_live(live: ChzzkLive) -> discord.Embed:
@@ -6123,10 +6196,12 @@ def _build_layout_view_for_post(
     )
     body_limit = max(100, 4000 - overhead)
 
+    body_text, tag_block = _display_body_and_trailing_tags(post)
+    meta_block = _post_meta_block(post, tag_block=tag_block)
     container.add_item(
         discord.ui.TextDisplay(
             _truncate_component_text(
-                f"### {_display_title_for_post(post).strip() or post.url}\n{_post_date_line(post)}\n\n{(post.text or post.url).strip()}",
+                f"## {_display_title_for_post(post).strip() or post.url}\n{meta_block}\n\n{body_text}",
                 body_limit,
             )
         )
@@ -6407,13 +6482,76 @@ def _post_source_label(post: NewsPost) -> str:
 
 def _display_title_for_post(post: NewsPost) -> str:
     title = post.title.strip() or post.post_id
+    if _is_twitter_news_post(post):
+        retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+        if retweeted_username:
+            title = f"RT @{retweeted_username}"
+        else:
+            match = re.match(r"^RT @([^:\s]+):", title or post.text)
+            if match:
+                title = f"RT @{match.group(1)}"
     return f"[{_post_source_label(post)}] {title}"
+
+
+def _display_body_and_trailing_tags(post: NewsPost) -> tuple[str, str]:
+    body = (post.text or post.url).strip()
+    if not _is_twitter_news_post(post):
+        return body, ""
+    body, tag_block = _split_trailing_hashtag_block(body)
+    return _link_twitter_hashtags(body or post.url), _link_twitter_hashtags(tag_block)
 
 
 def _post_date_line(post: NewsPost) -> str:
     if post.created_at is None:
         return ""
     return f"-# 작성일: {_format_kst(post.created_at)}"
+
+
+def _post_meta_block(post: NewsPost, *, tag_block: str = "") -> str:
+    lines = []
+    date_line = _post_date_line(post)
+    if date_line:
+        lines.append(date_line)
+    if tag_block:
+        lines.append(tag_block)
+    return "\n".join(lines)
+
+
+def _split_trailing_hashtag_block(text: str) -> tuple[str, str]:
+    lines = text.rstrip().splitlines()
+    tag_lines: list[str] = []
+    while lines:
+        line = lines[-1].strip()
+        if not line:
+            if tag_lines:
+                lines.pop()
+                continue
+            break
+        if not _is_hashtag_only_line(line):
+            break
+        tag_lines.append(line)
+        lines.pop()
+    if not tag_lines:
+        return text.strip(), ""
+    tag_lines.reverse()
+    return "\n".join(lines).strip(), "\n".join(tag_lines).strip()
+
+
+def _is_hashtag_only_line(line: str) -> bool:
+    tokens = line.split()
+    return bool(tokens) and all(re.fullmatch(r"#[^\s#]+", token) for token in tokens)
+
+
+def _link_twitter_hashtags(text: str) -> str:
+    if not text:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        tag = match.group(1)
+        encoded = quote(tag, safe="")
+        return f"[#{tag}](https://x.com/hashtag/{encoded})"
+
+    return re.sub(r"(?<![\w/\]])#([^\s#]+)", replace, text)
 
 
 def _news_source_mode_label(mode: str | None) -> str:

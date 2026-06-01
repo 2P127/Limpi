@@ -267,6 +267,20 @@ class LimbusXClient:
             self._last_backoff_log_until = None
             return posts[:limit]
 
+    async def enrich_post(self, post: TwitterPost) -> TwitterPost:
+        enriched = await self._enrich_posts_with_fx_data([post])
+        return enriched[0] if enriched else post
+
+    async def refresh_post(self, post: TwitterPost, *, limit: int = 100) -> TwitterPost:
+        try:
+            posts = await self.fetch_recent_posts(limit=limit)
+        except XClientError:
+            return await self.enrich_post(post)
+        for candidate in posts:
+            if candidate.post_id == post.post_id:
+                return candidate
+        return await self.enrich_post(post)
+
     def _apply_backoff(self, seconds: float) -> None:
         self._rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         self._last_backoff_log_until = None
@@ -366,12 +380,13 @@ class LimbusXClient:
             if not cursor:
                 break
 
+        posts = await self._enrich_posts_with_fx_data(posts)
         posts.sort(key=_tweet_sort_key, reverse=True)
         if not posts:
             raise XClientError("Twitter API에서 게시물을 가져오지 못했습니다.")
         return posts[:limit]
 
-    async def _enrich_posts_with_fx_media(
+    async def _enrich_posts_with_fx_data(
         self, posts: list[TwitterPost]
     ) -> list[TwitterPost]:
         if self.session is None:
@@ -379,27 +394,43 @@ class LimbusXClient:
 
         enriched: list[TwitterPost] = []
         for post in posts:
-            if not post.raw.get("video_fallback_url"):
+            if not _should_fetch_fx_tweet(post):
                 enriched.append(post)
                 continue
 
-            groups = await self._fetch_fx_video_variant_groups(post)
-            if not groups:
+            payload = await self._fetch_fx_tweet_payload(post)
+            if not payload:
+                enriched.append(post)
+                continue
+
+            tweet = payload.get("tweet")
+            if not isinstance(tweet, dict):
                 enriched.append(post)
                 continue
 
             raw = dict(post.raw)
-            raw["video_variant_groups"] = groups
-            raw["video_urls"] = [group[0] for group in groups if group]
-            raw["video_fallback_url"] = raw["video_urls"][0]
-            enriched.append(replace(post, raw=raw))
+            fx_text = _fx_tweet_text(tweet)
+            text = post.text
+            if fx_text:
+                retweeted_username = str(raw.get("retweeted_username") or "").strip()
+                text = f"RT @{retweeted_username}: {fx_text}" if retweeted_username else fx_text
+            image_urls = _fx_photo_urls(tweet) or post.image_urls
+            groups = _fx_video_variant_groups(payload)
+            if groups:
+                raw["video_variant_groups"] = groups
+                raw["video_urls"] = [group[0] for group in groups if group]
+                raw["video_fallback_url"] = raw["video_urls"][0]
+            enriched.append(replace(post, text=text, image_urls=image_urls, raw=raw))
         return enriched
 
-    async def _fetch_fx_video_variant_groups(
-        self, post: TwitterPost
-    ) -> list[list[str]]:
-        tweet_id = str(post.raw.get("tweet_id") or post.post_id.removeprefix("x:"))
-        url = f"https://api.fxtwitter.com/{post.author_username}/status/{tweet_id}"
+    async def _fetch_fx_tweet_payload(self, post: TwitterPost) -> dict[str, Any] | None:
+        tweet_id = str(
+            post.raw.get("retweeted_tweet_id")
+            or post.raw.get("tweet_id")
+            or post.post_id.removeprefix("x:")
+        )
+        username = str(post.raw.get("retweeted_username") or post.author_username)
+        url = f"https://api.fxtwitter.com/{username}/status/{tweet_id}"
         try:
             async with self.session.get(
                 url,
@@ -407,11 +438,11 @@ class LimbusXClient:
                 timeout=30,
             ) as response:
                 if response.status >= 400:
-                    return []
+                    return None
                 payload = await response.json(content_type=None)
         except Exception:
-            return []
-        return _fx_video_variant_groups(payload)
+            return None
+        return payload if isinstance(payload, dict) else None
 
 
 def _graphql_url(query_id: str, operation_name: str) -> str:
@@ -712,21 +743,39 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     tweet_id = str(tweet.get("rest_id") or legacy.get("id_str") or "").strip()
     if not tweet_id:
         return None
-    text = _tweet_full_text(tweet, legacy)
-    link_urls = _external_link_urls(legacy, username, tweet_id)
-    text = _expand_note_tweet_urls(text, tweet)
-    text = _strip_tco_links(text, legacy)
+    content_tweet = _retweeted_tweet(tweet) or tweet
+    content_legacy = content_tweet.get("legacy")
+    if not isinstance(content_legacy, dict):
+        content_tweet = tweet
+        content_legacy = legacy
+    content_username = _tweet_author_username(content_tweet) or author_username
+    if content_tweet is not tweet:
+        retweet_username = _retweet_username_from_text(_tweet_full_text(tweet, legacy))
+        if retweet_username:
+            content_username = retweet_username
+    content_tweet_id = str(
+        content_tweet.get("rest_id") or content_legacy.get("id_str") or tweet_id
+    ).strip()
+    text = _tweet_full_text(content_tweet, content_legacy)
+    link_urls = _external_link_urls(content_legacy, content_username, content_tweet_id)
+    text = _expand_legacy_tweet_urls(text, content_legacy)
+    text = _expand_note_tweet_urls(text, content_tweet)
+    text = _strip_tco_links(text, content_legacy)
     text = _clean_tweet_text(text)
+    if content_tweet is not tweet:
+        text = f"RT @{content_username}: {text}" if text else f"RT @{content_username}"
     if text in {"고정된 게시물", "Pinned", "Pinned Tweet"}:
         return None
     title = _title_from_text(text) or f"X 게시물 {tweet_id}"
+    if content_tweet is not tweet:
+        title = f"RT @{content_username}"
     created_at = _parse_twitter_datetime(legacy.get("created_at"))
-    video_variant_groups = _video_variant_groups(tweet)
+    video_variant_groups = _video_variant_groups(content_tweet)
     video_urls = [group[0] for group in video_variant_groups if group]
-    image_urls = _photo_urls(tweet)
+    image_urls = _photo_urls(content_tweet)
     if video_urls and len(image_urls) == 1:
         image_urls = []
-    youtube_urls = _youtube_urls(legacy)
+    youtube_urls = _youtube_urls(content_legacy)
     raw: dict[str, Any] = {
         "source": "x",
         "language": "koreana",
@@ -736,6 +785,9 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
         "in_reply_to_status_id_str": legacy.get("in_reply_to_status_id_str"),
         "in_reply_to_screen_name": legacy.get("in_reply_to_screen_name"),
     }
+    if content_tweet is not tweet:
+        raw["retweeted_tweet_id"] = content_tweet_id
+        raw["retweeted_username"] = content_username
     if video_urls:
         raw["video_urls"] = video_urls
         raw["video_variant_groups"] = video_variant_groups
@@ -755,6 +807,22 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     )
 
 
+def _retweeted_tweet(tweet: dict[str, Any]) -> dict[str, Any] | None:
+    legacy = tweet.get("legacy")
+    if not isinstance(legacy, dict):
+        return None
+    retweeted_status = legacy.get("retweeted_status_result")
+    if not isinstance(retweeted_status, dict):
+        return None
+    result = retweeted_status.get("result")
+    return _unwrap_tweet_result(result)
+
+
+def _retweet_username_from_text(text: str) -> str:
+    match = re.match(r"\s*RT @([^:\s]+):", text or "")
+    return match.group(1) if match else ""
+
+
 def _strip_tco_links(text: str, legacy: dict[str, Any]) -> str:
     urls: set[str] = set()
     for media in legacy.get("extended_entities", {}).get("media", []) or []:
@@ -763,9 +831,6 @@ def _strip_tco_links(text: str, legacy: dict[str, Any]) -> str:
     for media in legacy.get("entities", {}).get("media", []) or []:
         if isinstance(media, dict) and media.get("url"):
             urls.add(str(media["url"]))
-    for url_entity in legacy.get("entities", {}).get("urls", []) or []:
-        if isinstance(url_entity, dict) and url_entity.get("url"):
-            urls.add(str(url_entity["url"]))
     for url in urls:
         text = text.replace(url, "")
     return text
@@ -782,6 +847,20 @@ def _tweet_full_text(tweet: dict[str, Any], legacy: dict[str, Any]) -> str:
         if isinstance(text, str) and text.strip():
             return text
     return str(legacy.get("full_text") or legacy.get("text") or "")
+
+
+def _expand_legacy_tweet_urls(text: str, legacy: dict[str, Any]) -> str:
+    urls = legacy.get("entities", {}).get("urls")
+    if not isinstance(urls, list):
+        return text
+    for url_entity in urls:
+        if not isinstance(url_entity, dict):
+            continue
+        short_url = str(url_entity.get("url") or "")
+        expanded_url = str(url_entity.get("expanded_url") or short_url)
+        if short_url and expanded_url:
+            text = text.replace(short_url, expanded_url)
+    return text
 
 
 def _expand_note_tweet_urls(text: str, tweet: dict[str, Any]) -> str:
@@ -929,6 +1008,46 @@ def _fx_variant_url(variant: dict[str, Any]) -> str | None:
     if not url:
         url = variant.get("href")
     return str(url) if url else None
+
+
+def _should_fetch_fx_tweet(post: TwitterPost) -> bool:
+    if post.raw.get("retweeted_tweet_id"):
+        return True
+    if post.raw.get("video_fallback_url"):
+        return True
+    return _looks_truncated_tweet_text(post.text)
+
+
+def _looks_truncated_tweet_text(text: str) -> bool:
+    cleaned = text.rstrip()
+    return cleaned.endswith("+...") or cleaned.endswith("…") or cleaned.endswith("...")
+
+
+def _fx_tweet_text(tweet: dict[str, Any]) -> str:
+    for key in ("text", "full_text", "description"):
+        value = tweet.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clean_tweet_text(value)
+    return ""
+
+
+def _fx_photo_urls(tweet: dict[str, Any]) -> list[str]:
+    media = tweet.get("media")
+    if not isinstance(media, dict):
+        return []
+    urls: list[str] = []
+    for key in ("photos", "all"):
+        items = media.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            media_type = str(item.get("type") or item.get("format") or "").lower()
+            url = str(item.get("url") or item.get("media_url_https") or "").strip()
+            if url and media_type in {"", "photo", "image"}:
+                urls.append(url)
+    return list(dict.fromkeys(urls))
 
 
 def _video_variant_groups(tweet: dict[str, Any]) -> list[list[str]]:
