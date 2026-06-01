@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 import gc
 import io
+import json
 import logging
 import logging.handlers
 import os
@@ -54,9 +55,7 @@ AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
-TWITTER_POLL_INTERVAL_SECONDS = 10
-TWITTER_TRACKING_WINDOWS = ((0, 30), (10 * 60, 16 * 60), (17 * 60, 19 * 60))
-TWITTER_TRACKING_WINDOW_LABEL = "00:00-00:30, 10:00-16:00, 17:00-19:00"
+# 추적 시간대·폴링 간격은 설정값(AppConfig)에서 가져온다. 자정을 넘는 구간(wrap)도 지원.
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -459,6 +458,8 @@ class NewsCog(commands.Cog):
         news_source: NewsSource | None,
         x_source: LimbusXClient,
         session: aiohttp.ClientSession,
+        *,
+        test_mode: bool = False,
     ) -> None:
         self.bot = bot
         self.config = config
@@ -466,6 +467,9 @@ class NewsCog(commands.Cog):
         self.news_source = news_source
         self.x_source = x_source
         self.session = session
+        self.test_mode = test_mode
+        # X 관측 전용 프로브: 테스트 모드 + X_NEWS_PROBE=1 에서만. 전송/DB 변경 없음.
+        self._x_probe_active = test_mode and config.x_news_probe
         self.chzzk_client = ChzzkClient(session)
         self.youtube_client = YoutubeClient(session)
         self._poll_lock = asyncio.Lock()
@@ -652,8 +656,8 @@ class NewsCog(commands.Cog):
                 if currently_in_window and not self._in_twitter_tracking_window:
                     LOGGER.info(
                         "X 게시물 추적 시작 (KST %s, 확인 간격: %s초).",
-                        TWITTER_TRACKING_WINDOW_LABEL,
-                        TWITTER_POLL_INTERVAL_SECONDS,
+                        _format_windows_label(self.config.twitter_tracking_windows_kst),
+                        self._current_twitter_poll_interval_seconds(now),
                     )
                 elif not currently_in_window and self._in_twitter_tracking_window:
                     LOGGER.info("X 게시물 추적 일시 중지: 추적 시간대가 아닙니다.")
@@ -1406,14 +1410,18 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
-        return TWITTER_POLL_INTERVAL_SECONDS
+        # 기본 30초. MIN(기본 20초) 아래로는 내려가지 않게 클램프.
+        return max(
+            self.config.twitter_poll_interval_seconds,
+            self.config.twitter_min_poll_interval_seconds,
+        )
 
     def _is_twitter_tracking_window(self, now: datetime) -> bool:
         local_now = now.astimezone(KST)
         current_minute = local_now.hour * 60 + local_now.minute
         return any(
-            start <= current_minute < end
-            for start, end in TWITTER_TRACKING_WINDOWS
+            _minute_in_window(current_minute, start, end)
+            for start, end in self.config.twitter_tracking_windows_kst
         )
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
@@ -2808,7 +2816,7 @@ class NewsCog(commands.Cog):
             elif not self._is_twitter_tracking_window(datetime.now(timezone.utc)):
                 LOGGER.info(
                     "시작 시 X 게시물 동기화 생략: 현재 X 추적 시간대가 아닙니다 (KST %s).",
-                    TWITTER_TRACKING_WINDOW_LABEL,
+                    _format_windows_label(self.config.twitter_tracking_windows_kst),
                 )
             else:
                 saved, _ = await self._sync_twitter_posts()
@@ -2905,6 +2913,92 @@ class NewsCog(commands.Cog):
             return
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
+    async def _x_news_probe_observe(self, targets: list[GuildTwitterTarget]) -> None:
+        """X 관측 전용: fetch + would_announce/나이/답글/RT/steam매칭을 JSONL로만 기록.
+
+        전송·save·seen·last_seen·message mapping을 일절 변경하지 않는다(테스트 전용).
+        """
+        observed_at = datetime.now(timezone.utc)
+        run_kst = observed_at.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        error: str | None = None
+        posts: list[TwitterPost] = []
+        try:
+            posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+        except XClientError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        fetch_ms = (loop.time() - t0) * 1000
+        posts = posts[:TWITTER_POST_LIMIT]
+
+        # steam 매칭은 캐시/DB 읽기만 사용(갱신 호출 없음 → DB 쓰기 없음).
+        steam_by_id: dict[str, list[NewsPost]] = (
+            self._steam_posts_by_twitter_post_id(posts) if posts else {}
+        )
+        max_age = self.config.twitter_announce_max_age_seconds
+
+        def post_info(post: TwitterPost) -> dict:
+            created = post.created_at
+            age = None
+            created_kst = None
+            if created is not None:
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                age = (observed_at - created).total_seconds()
+                created_kst = created.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
+            return {
+                "post_id": post.post_id,
+                "created_at_kst": created_kst,
+                "age_sec": round(age, 1) if age is not None else None,
+                "is_reply": bool(post.raw.get("in_reply_to_status_id_str")),
+                "is_retweet": post.text.startswith("RT @"),
+                "has_steam_link": bool(_steam_news_link_keys_for_twitter(post)),
+                "matched_steam": [s.post_id for s in steam_by_id.get(post.post_id, [])],
+                "age_gate_pass": _is_twitter_post_recent(post, max_age),
+            }
+
+        targets_info = []
+        for target in targets:
+            would = self._new_twitter_posts_for_target(target, posts) if posts else []
+            would_after_age = [p for p in would if _is_twitter_post_recent(p, max_age)]
+            targets_info.append({
+                "guild_id": target.guild_id,
+                "channel_id": target.channel_id,
+                "enabled": target.enabled,
+                "last_seen_post_id": target.last_seen_post_id,
+                "would_announce": [p.post_id for p in would],
+                "would_announce_after_age_gate": [p.post_id for p in would_after_age],
+            })
+
+        record = {
+            "probe": "x_news",
+            "observed_at_kst": run_kst,
+            "in_tracking_window": self._is_twitter_tracking_window(observed_at),
+            "poll_interval_sec": self._current_twitter_poll_interval_seconds(observed_at),
+            "tracking_windows_kst": _format_windows_label(self.config.twitter_tracking_windows_kst),
+            "age_gate_max_age_sec": max_age,
+            "fetch_duration_ms": round(fetch_ms, 1),
+            "fetched_count": len(posts),
+            "fetch_error": error,
+            "posts": [post_info(p) for p in posts],
+            "targets": targets_info,
+        }
+        try:
+            log_dir = Path("logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            path = log_dir / f"x_news_probe_{observed_at.astimezone(KST):%Y%m%d}.jsonl"
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError:
+            LOGGER.exception("X 관측 프로브 JSONL 기록 실패.")
+        LOGGER.info(
+            "[x_news_probe] window=%s fetched=%s err=%s would=%s",
+            record["in_tracking_window"],
+            len(posts),
+            error or "none",
+            sum(len(t["would_announce"]) for t in targets_info),
+        )
+
     async def _sync_twitter_posts(self) -> tuple[int, list[TwitterPost]]:
         posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
         saved = self.storage.save_twitter_posts(posts)
@@ -2913,6 +3007,10 @@ class NewsCog(commands.Cog):
     async def _poll_twitter_once(self) -> int:
         targets = self.storage.list_twitter_targets()
         if not targets:
+            return 0
+
+        if self._x_probe_active:
+            await self._x_news_probe_observe(targets)
             return 0
 
         _, posts = await self._sync_twitter_posts()
@@ -2935,6 +3033,16 @@ class NewsCog(commands.Cog):
                 if not new_posts:
                     self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
                     return 0
+                # 나이 게이트(기본 비활성). 윈도우 확대 후 오래된 백로그 덤프 차단용.
+                max_age = self.config.twitter_announce_max_age_seconds
+                if max_age > 0:
+                    new_posts = [
+                        post for post in new_posts
+                        if _is_twitter_post_recent(post, max_age)
+                    ]
+                    if not new_posts:
+                        self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
+                        return 0
                 announced = 0
                 image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
                 for post in new_posts:
@@ -6381,6 +6489,37 @@ def _post_delay_seconds(post: NewsPost) -> int | str:
     return _delay_seconds(post.created_at)
 
 
+def _minute_in_window(minute: int, start: int, end: int) -> bool:
+    """분(0~1439)이 [start, end) 구간에 드는지. end<=start면 자정을 넘는 구간으로 본다."""
+    if start == end:
+        return False
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def _format_windows_label(windows: tuple[tuple[int, int], ...]) -> str:
+    def hhmm(m: int) -> str:
+        return f"{m // 60:02d}:{m % 60:02d}"
+
+    return ", ".join(f"{hhmm(s)}-{hhmm(e)}" for s, e in windows) or "(없음)"
+
+
+def _is_twitter_post_recent(post: TwitterPost, max_age_seconds: int) -> bool:
+    """나이 게이트: max_age_seconds<=0 이면 항상 통과(게이트 비활성).
+
+    그 외에는 created_at이 max_age_seconds 이내인 글만 통과. 시각 미상은 불허(안전)."""
+    if max_age_seconds <= 0:
+        return True
+    created = post.created_at
+    if created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - created).total_seconds()
+    return age <= max_age_seconds
+
+
 def _twitter_post_delay_seconds(post: TwitterPost) -> int | str:
     return _delay_seconds(post.created_at)
 
@@ -7092,7 +7231,7 @@ async def main() -> None:
         x_source = LimbusXClient(config, session)
         bot = LimpiBot(config)
 
-        cog = NewsCog(bot, config, storage, news_source, x_source, session)
+        cog = NewsCog(bot, config, storage, news_source, x_source, session, test_mode=test_mode)
 
         @bot.event
         async def on_ready() -> None:

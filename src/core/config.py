@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-BOT_VERSION = "0.2.1"
+BOT_VERSION = "0.2.2"
 
 SUPPORTED_STEAM_LANGUAGES = {"koreana", "english", "japanese"}
 SUPPORTED_COMMAND_SYNC_MODES = {"global", "guild"}
@@ -164,6 +164,62 @@ def _get_weekdays(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(days)
 
 
+def _parse_clock_to_minutes(value: str) -> int | None:
+    value = value.strip()
+    if not value:
+        return None
+    parts = value.split(":")
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1]) if len(parts) > 1 else 0
+    except (ValueError, IndexError):
+        return None
+    if not (0 <= hour <= 24 and 0 <= minute < 60):
+        return None
+    total = hour * 60 + minute
+    return total if total <= 24 * 60 else None
+
+
+def _get_twitter_windows(
+    name: str, default: tuple[tuple[int, int], ...]
+) -> tuple[tuple[int, int], ...]:
+    """`HH:MM-HH:MM,HH:MM-HH:MM` 형식을 (시작분, 끝분) 튜플 목록으로 파싱.
+
+    끝이 시작보다 작거나 같으면 자정을 넘는 구간(wrap)으로 본다. 파싱 실패 시 기본값.
+    """
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    windows: list[tuple[int, int]] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or "-" not in chunk:
+            continue
+        start_s, end_s = chunk.split("-", 1)
+        start = _parse_clock_to_minutes(start_s)
+        end = _parse_clock_to_minutes(end_s)
+        if start is None or end is None:
+            continue
+        # 24:00 은 0(자정)으로 정규화
+        start %= 24 * 60
+        end %= 24 * 60
+        windows.append((start, end))
+    return tuple(windows) if windows else default
+
+
+def _get_float_or_default(name: str, default: float, *, minimum: float | None = None) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if minimum is not None and value < minimum:
+        return minimum
+    return value
+
+
 def _get_weekdays_or_default(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     try:
         return _get_weekdays(name, default)
@@ -193,6 +249,14 @@ class AppConfig:
     x_ct0: str | None
     x_qid_user_by_screen_name: str | None
     x_qid_user_tweets_and_replies: str | None
+    twitter_tracking_windows_kst: tuple[tuple[int, int], ...]
+    twitter_poll_interval_seconds: int
+    twitter_min_poll_interval_seconds: int
+    twitter_rate_limit_backoff_seconds: int
+    twitter_429_backoff_multiplier: float
+    twitter_max_backoff_seconds: int
+    twitter_announce_max_age_seconds: int
+    x_news_probe: bool
 
     @classmethod
     def from_env(cls, *, test: bool = False) -> "AppConfig":
@@ -240,4 +304,32 @@ class AppConfig:
             x_ct0=x_ct0,
             x_qid_user_by_screen_name=x_qid_user_by_screen_name,
             x_qid_user_tweets_and_replies=x_qid_user_tweets_and_replies,
+            # 기본 추적 시간대(KST): 00:00-01:00, 10:00-16:00, 17:00-01:00(자정 넘김).
+            # 24시간 폴링은 기본값이 아니다.
+            twitter_tracking_windows_kst=_get_twitter_windows(
+                "TWITTER_TRACKING_WINDOWS_KST",
+                ((0, 60), (10 * 60, 16 * 60), (17 * 60, 60)),
+            ),
+            # 기본 30초. 레이트리밋 문제가 없을 때만 MIN(20초)까지 줄인다.
+            twitter_poll_interval_seconds=_get_int_or_default(
+                "TWITTER_POLL_INTERVAL_SECONDS", 30, minimum=1
+            ),
+            twitter_min_poll_interval_seconds=_get_int_or_default(
+                "TWITTER_MIN_POLL_INTERVAL_SECONDS", 20, minimum=1
+            ),
+            twitter_rate_limit_backoff_seconds=_get_int_or_default(
+                "TWITTER_RATE_LIMIT_BACKOFF_SECONDS", 60, minimum=1
+            ),
+            twitter_429_backoff_multiplier=_get_float_or_default(
+                "TWITTER_429_BACKOFF_MULTIPLIER", 2.0, minimum=1.0
+            ),
+            twitter_max_backoff_seconds=_get_int_or_default(
+                "TWITTER_MAX_BACKOFF_SECONDS", 600, minimum=1
+            ),
+            # 윈도우 확대 시 오래된 글 백로그 덤프 차단용 나이 게이트.
+            # 0 = 비활성(기본). 윈도우 갭보다 너무 짧으면 정상 글까지 버리므로 관측 후 조정.
+            twitter_announce_max_age_seconds=_get_int_or_default(
+                "TWITTER_ANNOUNCE_MAX_AGE_SECONDS", 0, minimum=0
+            ),
+            x_news_probe=_get_bool("X_NEWS_PROBE", False),
         )

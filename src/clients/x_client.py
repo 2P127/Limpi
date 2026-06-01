@@ -111,9 +111,15 @@ class XClientError(RuntimeError):
 
 
 class XRateLimitError(XClientError):
-    def __init__(self, message: str, reset_at: datetime | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        reset_at: datetime | None = None,
+        remaining: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.reset_at = reset_at
+        self.remaining = remaining
 
 
 class XServerError(XClientError):
@@ -217,21 +223,7 @@ class LimbusXClient:
                     return self._cached_posts[:limit]
                 raise XClientError(f"X API 네트워크 오류: {exc}") from exc
             except XRateLimitError as exc:
-                seconds = _rate_limit_backoff_seconds(self._rate_limit_failures)
-                if exc.reset_at is not None:
-                    delta = (exc.reset_at - datetime.now(timezone.utc)).total_seconds()
-                    if delta > 0:
-                        seconds = min(
-                            max(delta + 5, seconds),
-                            X_RATE_LIMIT_RESET_CAP.total_seconds(),
-                        )
-                self._apply_backoff(seconds)
-                self._rate_limit_failures += 1
-                LOGGER.warning(
-                    "X API 호출 제한에 걸렸습니다. 제한 해제 예상 시간: %s. 캐시를 사용합니다. 다음 시도: %s",
-                    _format_kst_datetime(exc.reset_at),
-                    _format_kst_datetime(self._rate_limited_until),
-                )
+                self._handle_rate_limit(exc)
                 if self._cached_posts:
                     return self._cached_posts[:limit]
                 raise
@@ -252,12 +244,7 @@ class LimbusXClient:
                 raise
             except XClientError as exc:
                 if _is_rate_limit_error(exc):
-                    self._apply_backoff(_rate_limit_backoff_seconds(self._rate_limit_failures))
-                    self._rate_limit_failures += 1
-                    LOGGER.warning(
-                        "X API 호출 제한에 걸렸습니다. 캐시를 사용합니다. 다음 시도: %s",
-                        _format_kst_datetime(self._rate_limited_until),
-                    )
+                    self._handle_rate_limit(None)
                     if self._cached_posts:
                         return self._cached_posts[:limit]
                 elif _is_transient_server_error(exc):
@@ -283,6 +270,35 @@ class LimbusXClient:
     def _apply_backoff(self, seconds: float) -> None:
         self._rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         self._last_backoff_log_until = None
+
+    def _twitter_backoff_seconds(self, failures: int) -> float:
+        """설정 기반 429 backoff: base * multiplier^연속횟수, MAX로 캡."""
+        base = float(self.config.twitter_rate_limit_backoff_seconds)
+        multiplier = float(self.config.twitter_429_backoff_multiplier)
+        cap = float(self.config.twitter_max_backoff_seconds)
+        return min(base * (multiplier ** max(0, failures)), cap)
+
+    def _handle_rate_limit(self, exc: "XRateLimitError | None") -> None:
+        """429 즉시 backoff 적용 + 필수 필드 로깅. backoff 중에는 호출 자체가 막힌다."""
+        reset_at = exc.reset_at if exc is not None else None
+        remaining = exc.remaining if exc is not None else None
+        seconds = self._twitter_backoff_seconds(self._rate_limit_failures)
+        if reset_at is not None:
+            delta = (reset_at - datetime.now(timezone.utc)).total_seconds()
+            if delta > 0:
+                # MAX 캡보다 reset이 더 멀면 reset까지 기다린다(미리 호출하면 또 429).
+                seconds = max(seconds, delta + 1)
+        self._apply_backoff(seconds)
+        self._rate_limit_failures += 1
+        LOGGER.warning(
+            "X API 429 레이트리밋. consecutive_429=%s backoff_seconds=%.0f "
+            "next_allowed_poll_at=%s rate_limit_remaining=%s rate_limit_reset_at=%s",
+            self._rate_limit_failures,
+            seconds,
+            _format_kst_datetime(self._rate_limited_until),
+            remaining if remaining is not None else "unknown",
+            _format_kst_datetime(reset_at),
+        )
 
     def _log_backoff_active(self) -> None:
         until = self._rate_limited_until
@@ -477,7 +493,12 @@ def _build_x_http_error(operation: str, response: Any, body: str) -> XClientErro
         reset_at = _parse_reset_at(headers.get("x-rate-limit-reset"))
         if reset_at is None and retry_after is not None:
             reset_at = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
-        return XRateLimitError(message, reset_at=reset_at)
+        remaining_raw = headers.get("x-rate-limit-remaining")
+        try:
+            remaining = int(remaining_raw) if remaining_raw is not None else None
+        except (TypeError, ValueError):
+            remaining = None
+        return XRateLimitError(message, reset_at=reset_at, remaining=remaining)
     if status in (500, 502, 503, 504):
         return XServerError(message, retry_after=retry_after)
     return XClientError(message)
