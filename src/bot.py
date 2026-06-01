@@ -52,7 +52,7 @@ KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
 TWITTER_POST_LIMIT = 30
 AUTOCOMPLETE_CHOICE_LIMIT = 25
-AUTOCOMPLETE_TIMEOUT_SECONDS = 2.5
+AUTOCOMPLETE_TIMEOUT_SECONDS = 5
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
 # 추적 시간대·폴링 간격은 설정값(AppConfig)에서 가져온다. 자정을 넘는 구간(wrap)도 지원.
@@ -69,6 +69,8 @@ IMAGE_CACHE_MAX_ITEMS = 128
 IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
 IMAGE_CACHE_WARM_POST_LIMIT = 10
+IMAGE_DOWNLOAD_ATTEMPTS = 3
+IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 15
 DISCORD_HEARTBEAT_TIMEOUT_SECONDS = 120.0
 AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS = 90
 TCP_KEEPALIVE_IDLE_SECONDS = 30
@@ -93,10 +95,11 @@ YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
 LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS = (
 )
 EMBEDS_PER_MESSAGE = 10
-IMAGE_ONLY_EMBEDS_PER_MESSAGE = 4
+IMAGE_ONLY_EMBEDS_PER_MESSAGE = 10
 MAX_TWITTER_EMBED_IMAGES = EMBEDS_PER_MESSAGE
 EMBED_DESCRIPTION_LIMIT = 8096
 FILES_PER_MESSAGE = 10
+IMAGE_FILES_PER_MESSAGE = 4
 BOOLEAN_TRUE = "true"
 BOOLEAN_FALSE = "false"
 BOOLEAN_CHOICES = [
@@ -129,6 +132,11 @@ LANGUAGE_CHOICES = [
     app_commands.Choice(name="日本語", value="japanese"),
 ]
 IMAGE_DELIVERY_FILES = "files"
+IMAGE_DELIVERY_EMBEDS = "embeds"
+IMAGE_DELIVERY_CHOICES = [
+    app_commands.Choice(name="임베드에 이미지 표시", value=IMAGE_DELIVERY_EMBEDS),
+    app_commands.Choice(name="첨부파일로 따로 전송", value=IMAGE_DELIVERY_FILES),
+]
 LANGUAGE_LABELS = {
     "koreana": "한국어",
     "english": "English",
@@ -1376,7 +1384,9 @@ class NewsCog(commands.Cog):
         return self.storage.get_settings(interaction.guild_id).language
 
     def _interaction_image_delivery(self, interaction: discord.Interaction) -> str:
-        return IMAGE_DELIVERY_FILES
+        if interaction.guild_id is None or self._interaction_uses_user_install(interaction):
+            return IMAGE_DELIVERY_EMBEDS
+        return self.storage.get_settings(interaction.guild_id).image_delivery
 
     def _interaction_banner_filename(
         self,
@@ -1836,6 +1846,7 @@ class NewsCog(commands.Cog):
                 settings.role_id if mention_role else None,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
+                image_delivery=settings.image_delivery,
             )
             return True
         except discord.Forbidden as exc:
@@ -1906,6 +1917,7 @@ class NewsCog(commands.Cog):
                 settings.role_id if mention_role else None,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
+                image_delivery=settings.image_delivery,
             )
             if sent_message is not None:
                 # 원본 메시지 ID를 기록해 두면, 이후 소식이 수정될 때 새로 보내는 대신
@@ -2056,6 +2068,7 @@ class NewsCog(commands.Cog):
             post,
             include_zip_button=True,
             include_banner=banner_file is not None,
+            include_content_images=settings.image_delivery == IMAGE_DELIVERY_EMBEDS,
         )
         try:
             message = await channel.fetch_message(message_id)
@@ -2115,6 +2128,7 @@ class NewsCog(commands.Cog):
         banner_filename: str | None = None,
         is_update: bool = False,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        image_delivery: str = IMAGE_DELIVERY_EMBEDS,
     ) -> discord.Message | None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -2124,11 +2138,18 @@ class NewsCog(commands.Cog):
         )
 
         banner_file = _news_banner_file(banner_filename)
+        standalone_urls = _standalone_image_urls(
+            post,
+            attach_images=image_delivery == IMAGE_DELIVERY_FILES,
+        )
+        if image_delivery == IMAGE_DELIVERY_FILES and batch_tasks is None:
+            batch_tasks = self._start_image_batch_tasks(standalone_urls)
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=True,
             include_banner=banner_file is not None,
             is_update=is_update,
+            include_content_images=image_delivery == IMAGE_DELIVERY_EMBEDS,
         )
 
         if mention:
@@ -2142,11 +2163,16 @@ class NewsCog(commands.Cog):
         }
         if banner_file is not None:
             send_kwargs["file"] = banner_file
-        # 본문 이미지는 컴포넌트(MediaGallery)에 인라인되므로 별도 첨부 메시지를 보내지 않는다.
-        # 이 메시지가 "원본 뉴스 메시지"이며, 이후 수정 시 직접 edit 한다.
         sent_message = await channel.send(**send_kwargs)
 
         followup_tasks = []
+        if image_delivery == IMAGE_DELIVERY_FILES:
+            self._schedule_channel_image_messages(
+                channel,
+                post,
+                batch_tasks=batch_tasks,
+                image_urls=standalone_urls,
+            )
         youtube_content = _youtube_links_content(post)
         if youtube_content:
             followup_tasks.append(
@@ -2198,18 +2224,27 @@ class NewsCog(commands.Cog):
         attach_photos: bool = True,
     ) -> list[discord.Message | None]:
         sent_messages: list[discord.Message | None] = []
+        image_delivery = self._interaction_image_delivery(interaction)
         standalone_urls = _standalone_image_urls(post, attach_images=attach_photos)
         banner_file = _news_banner_file(
             self._interaction_banner_filename(interaction, private=private)
         )
         use_image_embeds = self._bot_is_missing_from_interaction_guild(interaction)
+        file_batch_tasks = (
+            self._start_image_batch_tasks(standalone_urls)
+            if attach_photos and image_delivery == IMAGE_DELIVERY_FILES and not use_image_embeds
+            else None
+        )
+        inline_content_images = (
+            attach_photos
+            and image_delivery == IMAGE_DELIVERY_EMBEDS
+            and not use_image_embeds
+        )
         news_view = _build_layout_view_for_post(
             post,
             include_zip_button=attach_photos,
             include_banner=banner_file is not None,
-            # 본문 이미지는 컴포넌트에 인라인된다. 단, 봇이 길드에 없어 컴포넌트를 못 쓰는
-            # 경우(use_image_embeds)에는 인라인 대신 임베드 후속 메시지로 보낸다.
-            include_content_images=attach_photos and not use_image_embeds,
+            include_content_images=inline_content_images,
         )
 
         send_kwargs = {
@@ -2255,13 +2290,19 @@ class NewsCog(commands.Cog):
                     )
                 )
 
-        # 본문 이미지는 컴포넌트에 인라인되므로 별도 첨부 메시지를 보내지 않는다.
-        # 컴포넌트를 못 쓰는 경우에만 임베드 후속 메시지로 대체한다.
-        if use_image_embeds:
+        if attach_photos and use_image_embeds:
             self._schedule_interaction_image_embed_followups(
                 interaction,
                 post,
                 private=private,
+                image_urls=standalone_urls,
+            )
+        elif attach_photos and image_delivery == IMAGE_DELIVERY_FILES:
+            self._schedule_interaction_image_followups(
+                interaction,
+                post,
+                private=private,
+                batch_tasks=file_batch_tasks,
                 image_urls=standalone_urls,
             )
         return sent_messages
@@ -2491,7 +2532,7 @@ class NewsCog(commands.Cog):
             return
 
         tasks = batch_tasks or []
-        for batch_task in tasks:
+        for batch_task in asyncio.as_completed(tasks):
             file_batch = await batch_task
             if not file_batch:
                 continue
@@ -2567,7 +2608,7 @@ class NewsCog(commands.Cog):
         private: bool,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
     ) -> None:
-        for batch_task in (batch_tasks or []):
+        for batch_task in asyncio.as_completed(batch_tasks or []):
             file_batch = await batch_task
             if not file_batch:
                 continue
@@ -2631,13 +2672,15 @@ class NewsCog(commands.Cog):
     def _start_image_batch_tasks(
         self,
         urls: list[str],
+        *,
+        batch_size: int = IMAGE_FILES_PER_MESSAGE,
     ) -> list[asyncio.Task[list[discord.File]]]:
         if not urls:
             return []
         semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
         tasks: list[asyncio.Task[list[discord.File]]] = []
-        for batch_start in range(0, len(urls), FILES_PER_MESSAGE):
-            batch_urls = urls[batch_start : batch_start + FILES_PER_MESSAGE]
+        for batch_start in range(0, len(urls), batch_size):
+            batch_urls = urls[batch_start : batch_start + batch_size]
             task = asyncio.create_task(
                 self._download_file_batch(semaphore, batch_start, batch_urls)
             )
@@ -2728,18 +2771,72 @@ class NewsCog(commands.Cog):
             self._image_cache[url] = self._image_cache.pop(url)
             return cached
 
-        try:
-            async with self.session.get(url) as response:
-                if response.status >= 400:
-                    LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
+        timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+        for attempt in range(1, IMAGE_DOWNLOAD_ATTEMPTS + 1):
+            try:
+                async with self.session.get(url, timeout=timeout) as response:
+                    if 400 <= response.status < 500:
+                        LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
+                        return None
+                    if response.status >= 500:
+                        if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
+                            LOGGER.warning(
+                                "이미지 다운로드 최종 실패 (%s/%s, HTTP %s): %s",
+                                attempt,
+                                IMAGE_DOWNLOAD_ATTEMPTS,
+                                response.status,
+                                url,
+                            )
+                            return None
+                        LOGGER.info(
+                            "이미지 다운로드 재시도 (%s/%s, HTTP %s): %s",
+                            attempt,
+                            IMAGE_DOWNLOAD_ATTEMPTS,
+                            response.status,
+                            url,
+                        )
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    content_type = response.headers.get("Content-Type")
+                    data = await response.read()
+                    if not data:
+                        if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
+                            LOGGER.warning(
+                                "이미지 다운로드 최종 실패: 빈 응답 (%s/%s): %s",
+                                attempt,
+                                IMAGE_DOWNLOAD_ATTEMPTS,
+                                url,
+                            )
+                            return None
+                        LOGGER.info(
+                            "이미지 다운로드 재시도: 빈 응답 (%s/%s): %s",
+                            attempt,
+                            IMAGE_DOWNLOAD_ATTEMPTS,
+                            url,
+                        )
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    self._cache_image(url, data, content_type)
+                    return data, content_type
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
+                    LOGGER.warning(
+                        "이미지 다운로드 최종 실패 (%s/%s, %s): %s",
+                        attempt,
+                        IMAGE_DOWNLOAD_ATTEMPTS,
+                        type(exc).__name__,
+                        url,
+                    )
                     return None
-                content_type = response.headers.get("Content-Type")
-                data = await response.read()
-                self._cache_image(url, data, content_type)
-                return data, content_type
-        except aiohttp.ClientError:
-            LOGGER.exception("이미지 다운로드 오류: %s", url)
-            return None
+                LOGGER.info(
+                    "이미지 다운로드 재시도 (%s/%s, %s): %s",
+                    attempt,
+                    IMAGE_DOWNLOAD_ATTEMPTS,
+                    type(exc).__name__,
+                    url,
+                )
+                await asyncio.sleep(0.5 * attempt)
+        return None
 
     async def _download_twitter_video(self, url: str) -> discord.File | None:
         max_bytes = 23 * 1024 * 1024
@@ -3752,6 +3849,7 @@ class NewsCog(commands.Cog):
         public_news_send="공개소식전송",
         notification_banner="알림배너",
         news_source="뉴스소스",
+        image_delivery="이미지전송",
     )
     @app_commands.describe(
         role="새 소식과 함께 핑할 역할입니다.",
@@ -3762,6 +3860,7 @@ class NewsCog(commands.Cog):
         public_news_send="관리자가 아닌 다른 유저가 /이전소식보기 이나 /최근소식보기 으로 서버 채널에 공개 소식을 보낼 수 있는지 설정합니다.",
         notification_banner="자동 알림과 서버에서 보내는 소식에 사용할 배너입니다. 이미지 이름 또는 사용 안 함을 고릅니다.",
         news_source="자동 알림과 소식 명령어에서 사용할 소식 출처입니다.",
+        image_delivery="소식 이미지를 임베드 안에 표시할지, 별도 첨부파일 메시지로 보낼지 정합니다.",
     )
     @app_commands.choices(
         language=LANGUAGE_CHOICES,
@@ -3769,6 +3868,7 @@ class NewsCog(commands.Cog):
         enabled=BOOLEAN_CHOICES,
         auto_cleanup=BOOLEAN_CHOICES,
         news_source=NEWS_SOURCE_CHOICES,
+        image_delivery=IMAGE_DELIVERY_CHOICES,
     )
     async def configure(
         self,
@@ -3781,6 +3881,7 @@ class NewsCog(commands.Cog):
         public_news_send: app_commands.Choice[str] | None = None,
         notification_banner: str | None = None,
         news_source: app_commands.Choice[str] | None = None,
+        image_delivery: app_commands.Choice[str] | None = None,
     ) -> None:
         if interaction.guild_id is None:
             await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
@@ -3814,6 +3915,7 @@ class NewsCog(commands.Cog):
             public_news_lookup_allowed=_choice_bool(public_news_send),
             notification_banner=banner_filename,
             news_source_mode=news_source.value if news_source else None,
+            image_delivery=image_delivery.value if image_delivery else None,
         )
         role_text = f"<@&{settings.role_id}>" if settings.role_id else "없음"
         enabled_text = "켜짐" if settings.enabled else "꺼짐"
@@ -3822,6 +3924,7 @@ class NewsCog(commands.Cog):
         public_news_send_text = _bool_label(settings.public_news_lookup_allowed)
         banner_text = _banner_display_name(settings.notification_banner)
         source_text = _news_source_mode_label(settings.news_source_mode)
+        image_delivery_text = _image_delivery_label(settings.image_delivery)
         embed = discord.Embed(
             title="설정이 완료되었어요~!",
             description=(
@@ -3832,7 +3935,8 @@ class NewsCog(commands.Cog):
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
                 f"공개 소식 전송: {public_news_send_text}\n"
                 f"알림 배너: {banner_text}\n"
-                f"뉴스 소스: {source_text}"
+                f"뉴스 소스: {source_text}\n"
+                f"이미지 전송: {image_delivery_text}"
             ),
             color=_success_embed_color(),
         )
@@ -5049,6 +5153,7 @@ class NewsCog(commands.Cog):
                 f"자동 삭제 유예: {settings.auto_cleanup_days}일\n"
                 f"공개 소식 전송: {_bool_label(settings.public_news_lookup_allowed)}\n"
                 f"알림 배너: {_banner_display_name(settings.notification_banner)}\n"
+                f"이미지 전송: {_image_delivery_label(settings.image_delivery)}\n"
                 "치지직 알림: 미설정\n"
                 "유튜브 알림: 미설정\n"
                 "점검 알림: 꺼짐"
@@ -5104,6 +5209,7 @@ class NewsCog(commands.Cog):
         maintenance_text = "켜짐" if settings.maintenance_notifications_enabled else "꺼짐"
         cleanup_text = "켜짐" if settings.auto_cleanup_enabled else "꺼짐"
         public_news_send_text = _bool_label(settings.public_news_lookup_allowed)
+        image_delivery_text = _image_delivery_label(settings.image_delivery)
 
         embed = discord.Embed(
             title="서버 설정 상태",
@@ -5120,7 +5226,8 @@ class NewsCog(commands.Cog):
                 f"기본 언어: {_language_label(settings.language)}\n"
                 f"역할 핑: {role_text}\n"
                 f"새 게시물 자동 알림: {enabled_text}\n"
-                f"알림 배너: {_banner_display_name(settings.notification_banner)}"
+                f"알림 배너: {_banner_display_name(settings.notification_banner)}\n"
+                f"이미지 전송: {image_delivery_text}"
             ),
             inline=False,
         )
@@ -5362,6 +5469,7 @@ class NewsCog(commands.Cog):
                     target_post,
                     role_id if mention_role else None,
                     banner_filename=settings.notification_banner,
+                    image_delivery=settings.image_delivery,
                 )
             except discord.Forbidden:
                 failed_channel_ids.append(channel_id)
@@ -6453,6 +6561,12 @@ def _broadcast_target_choice_name(
 
 def _bool_label(value: bool) -> str:
     return "허용" if value else "비허용"
+
+
+def _image_delivery_label(value: str | None) -> str:
+    if value == IMAGE_DELIVERY_FILES:
+        return "첨부파일로 따로 전송"
+    return "임베드에 이미지 표시"
 
 
 def _youtube_links_content(post: NewsPost) -> str | None:

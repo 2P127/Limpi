@@ -4,9 +4,15 @@ Set-Location -Path $PSScriptRoot
 
 try {
     chcp 65001 > $null
+    [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
+    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 }
 catch {
 }
+
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
@@ -28,7 +34,8 @@ function Invoke-NativeOrThrow {
 $testMode = $args -contains "--test"
 
 if ($testMode) {
-    Write-Host "테스트 모드: DISCORD_TOKEN_TEST 토큰을 사용합니다."
+    $testMessageBytes = [Convert]::FromBase64String("7YWM7Iqk7Yq4IOuqqOuTnDogRElTQ09SRF9UT0tFTl9URVNUIO2GoO2BsOydhCDsgqzsmqntlanri4jri6Qu")
+    Write-Host ([System.Text.Encoding]::UTF8.GetString($testMessageBytes))
 }
 
 if (-not (Test-Path ".env")) {

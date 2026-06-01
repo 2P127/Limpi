@@ -26,7 +26,7 @@ from .models import (
 
 DEFAULT_AUTO_CLEANUP_ENABLED = True
 DEFAULT_AUTO_CLEANUP_DAYS = 1
-DEFAULT_IMAGE_DELIVERY = "files"
+DEFAULT_IMAGE_DELIVERY = "embeds"
 DEFAULT_NOTIFICATION_BANNER = "림피 배너.png"
 DISABLED_NOTIFICATION_BANNER = "none"
 DEFAULT_PUBLIC_NEWS_LOOKUP_ALLOWED = True
@@ -118,7 +118,7 @@ class SQLiteStorage:
                 max_posts_per_poll INTEGER NOT NULL DEFAULT 30,
                 auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
                 auto_cleanup_days INTEGER NOT NULL DEFAULT 1,
-                image_delivery TEXT NOT NULL DEFAULT 'files',
+                image_delivery TEXT NOT NULL DEFAULT 'embeds',
                 notification_banner TEXT DEFAULT '림피 배너.png',
                 public_news_lookup_allowed INTEGER NOT NULL DEFAULT 1,
                 maintenance_notifications_enabled INTEGER NOT NULL DEFAULT 0,
@@ -275,12 +275,6 @@ class SQLiteStorage:
                 self._auto_migrate_table(table_name, ddl)
 
             self._backfill_schema_defaults()
-            self._connection.execute(
-                "UPDATE guild_settings SET image_delivery = 'files' WHERE image_delivery = 'embeds'"
-            )
-            self._connection.execute(
-                "UPDATE user_settings SET image_delivery = NULL WHERE image_delivery = 'embeds'"
-            )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC)"
             )
@@ -537,7 +531,7 @@ class SQLiteStorage:
                 max_posts_per_poll = COALESCE(max_posts_per_poll, 30),
                 auto_cleanup_enabled = COALESCE(auto_cleanup_enabled, 1),
                 auto_cleanup_days = COALESCE(auto_cleanup_days, 1),
-                image_delivery = COALESCE(NULLIF(image_delivery, ''), 'files'),
+                image_delivery = COALESCE(NULLIF(image_delivery, ''), ?),
                 notification_banner = COALESCE(NULLIF(notification_banner, ''), ?),
                 public_news_lookup_allowed = COALESCE(public_news_lookup_allowed, 1),
                 maintenance_notifications_enabled = COALESCE(maintenance_notifications_enabled, 0),
@@ -545,7 +539,7 @@ class SQLiteStorage:
                 created_at = COALESCE(NULLIF(created_at, ''), ?),
                 updated_at = COALESCE(NULLIF(updated_at, ''), ?)
             """,
-            (DEFAULT_NOTIFICATION_BANNER, DEFAULT_NEWS_SOURCE_MODE, now, now),
+            (DEFAULT_IMAGE_DELIVERY, DEFAULT_NOTIFICATION_BANNER, DEFAULT_NEWS_SOURCE_MODE, now, now),
         )
         self._connection.execute(
             """
@@ -2466,7 +2460,7 @@ class SQLiteStorage:
         cleanup_days = int(row["auto_cleanup_days"] or DEFAULT_AUTO_CLEANUP_DAYS)
         cleanup_days = max(MIN_CLEANUP_DAYS, min(MAX_CLEANUP_DAYS, cleanup_days))
         image_delivery = str(row["image_delivery"] or DEFAULT_IMAGE_DELIVERY)
-        if image_delivery != "files":
+        if image_delivery not in {"embeds", "files"}:
             image_delivery = DEFAULT_IMAGE_DELIVERY
         news_source_mode = str(row["news_source_mode"] or DEFAULT_NEWS_SOURCE_MODE)
         if news_source_mode not in {"both", "steam", "twitter"}:
