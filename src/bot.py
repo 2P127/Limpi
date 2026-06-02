@@ -148,6 +148,8 @@ NEWS_UI_TEXT = {
         "original": "원문 보기",
         "download_images": "이미지 다운로드",
         "updated": "-# 🔄 수정된 소식입니다.",
+        "reply_context": "> @{username} 님에게 보내는 답글:",
+        "retweet_context": "> @{username} 님의 게시물 리트윗:",
         "zip_unavailable": "지금은 다운로드를 처리할 수 없어요.",
         "zip_no_images": "이 게시물에는 이미지가 없어요.",
         "zip_fetch_failed": "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
@@ -159,6 +161,8 @@ NEWS_UI_TEXT = {
         "original": "View original",
         "download_images": "Download images",
         "updated": "-# 🔄 This news was updated.",
+        "reply_context": "> Replying to @{username}:",
+        "retweet_context": "> Retweeted @{username}'s post:",
         "zip_unavailable": "Downloads are unavailable right now.",
         "zip_no_images": "This post has no images.",
         "zip_fetch_failed": "Something went wrong while fetching the images. Please try again later.",
@@ -170,6 +174,8 @@ NEWS_UI_TEXT = {
         "original": "原文を見る",
         "download_images": "画像をダウンロード",
         "updated": "-# 🔄 このお知らせは更新されました。",
+        "reply_context": "> @{username} さんへの返信:",
+        "retweet_context": "> @{username} さんの投稿をリツイート:",
         "zip_unavailable": "現在、ダウンロードを処理できません。",
         "zip_no_images": "この投稿には画像がありません。",
         "zip_fetch_failed": "画像の取得中に問題が発生しました。しばらくしてからもう一度お試しください。",
@@ -6067,6 +6073,10 @@ def _embed_for_twitter_post(
     image_url: str | None = None,
 ) -> discord.Embed:
     description, tag_block = _split_trailing_hashtag_block((post.text or post.url).strip())
+    description = _strip_twitter_post_context_prefix(post, description)
+    context_line = _twitter_post_context_line(post)
+    if context_line:
+        description = f"{context_line}\n\n{description or post.url}"
     description = _link_twitter_hashtags(description)
     tag_block = _link_twitter_hashtags(tag_block)
     meta_lines: list[str] = []
@@ -6122,6 +6132,25 @@ def _display_title_for_twitter_post(post: TwitterPost) -> str:
     if match:
         return f"RT @{match.group(1)}"
     return post.title.strip() or post.post_id
+
+
+def _twitter_post_context_line(post: TwitterPost) -> str:
+    language = str(post.raw.get("language") or "koreana")
+    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+    if retweeted_username:
+        return _news_ui_text(language, "retweet_context").format(username=retweeted_username)
+    reply_username = str(post.raw.get("in_reply_to_screen_name") or "").strip()
+    if reply_username:
+        return _news_ui_text(language, "reply_context").format(username=reply_username)
+    return ""
+
+
+def _strip_twitter_post_context_prefix(post: TwitterPost, text: str) -> str:
+    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+    if retweeted_username:
+        pattern = rf"^\s*RT @{re.escape(retweeted_username)}:\s*"
+        return re.sub(pattern, "", text, count=1).strip()
+    return text
 
 
 def _embed_for_chzzk_live(live: ChzzkLive) -> discord.Embed:
@@ -6612,7 +6641,30 @@ def _display_body_and_trailing_tags(post: NewsPost) -> tuple[str, str]:
     if not _is_twitter_news_post(post):
         return body, ""
     body, tag_block = _split_trailing_hashtag_block(body)
+    body = _strip_twitter_context_prefix(post, body)
+    context_line = _twitter_context_line(post)
+    if context_line:
+        body = f"{context_line}\n\n{body or post.url}"
     return _link_twitter_hashtags(body or post.url), _link_twitter_hashtags(tag_block)
+
+
+def _twitter_context_line(post: NewsPost) -> str:
+    language = _post_language(post) or "koreana"
+    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+    if retweeted_username:
+        return _news_ui_text(language, "retweet_context").format(username=retweeted_username)
+    reply_username = str(post.raw.get("in_reply_to_screen_name") or "").strip()
+    if reply_username:
+        return _news_ui_text(language, "reply_context").format(username=reply_username)
+    return ""
+
+
+def _strip_twitter_context_prefix(post: NewsPost, text: str) -> str:
+    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
+    if retweeted_username:
+        pattern = rf"^\s*RT @{re.escape(retweeted_username)}:\s*"
+        return re.sub(pattern, "", text, count=1).strip()
+    return text
 
 
 def _post_date_line(post: NewsPost) -> str:
