@@ -19,7 +19,9 @@ from time import perf_counter
 from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
+import cv2
 import discord
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -55,7 +57,6 @@ AUTOCOMPLETE_CHOICE_LIMIT = 25
 AUTOCOMPLETE_TIMEOUT_SECONDS = 5
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
-# 추적 시간대·폴링 간격은 설정값(AppConfig)에서 가져온다. 자정을 넘는 구간(wrap)도 지원.
 CHZZK_POLL_INTERVAL_SECONDS = 60
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -63,6 +64,7 @@ YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 NEWS_TARGET_SEND_CONCURRENCY = 12
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
+BRIGHTEN_CUSTOM_ID_PREFIX = "limpi:brighten:"
 ZIP_IMAGE_CONCURRENCY = 20
 ZIP_CACHE_MAX_ITEMS = 8
 IMAGE_CACHE_MAX_ITEMS = 128
@@ -82,11 +84,7 @@ ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 NEWS_BANNER_DIR = Path("img")
 NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
-# 컴포넌트(MediaGallery) 한 개에 넣을 수 있는 이미지 최대 개수(디스코드 제한).
 MAX_INLINE_GALLERY_IMAGES = 10
-# 같은 소식에 대해 "수정되었습니다" 답장을 다시 달기까지의 최소 간격.
-# 해시가 매 폴링마다 흔들리는 비정상 상황에서도 답장 도배가 일어나지 않도록 막는다.
-# (원본 메시지 edit 자체는 새 글이 안 뜨므로 쿨다운 없이 매번 최신 내용으로 갱신한다.)
 NEWS_UPDATE_NOTICE_COOLDOWN = timedelta(minutes=30)
 COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -328,6 +326,7 @@ class LimpiBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(ZipDownloadButton)
+        self.add_dynamic_items(BrightenSpoilerButton)
         synced = await self.tree.sync()
         LOGGER.info(
             "글로벌 명령어 %s개 동기화 완료 (서버 및 유저 앱 설치).",
@@ -427,6 +426,43 @@ class ZipDownloadButton(
         await cog.handle_zip_request(interaction, self.post_id)
 
 
+class BrightenSpoilerButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"limpi:brighten:(?P<post_id>.+):(?P<index>\d+)",
+):
+    def __init__(
+        self, post_id: str, *, image_index: int = 0, language: str = "koreana"
+    ) -> None:
+        super().__init__(
+            discord.ui.Button(
+                label="밝기 올리기 (스포주의)",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"{BRIGHTEN_CUSTOM_ID_PREFIX}{post_id}:{image_index}",
+                emoji="🔆",
+            )
+        )
+        self.post_id = post_id
+        self.image_index = image_index
+        self.language = language
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match["post_id"], image_index=int(match["index"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cog = interaction.client.get_cog("NewsCog")
+        if not isinstance(cog, NewsCog):
+            await interaction.response.send_message(
+                "지금은 이미지를 처리할 수 없어요.", ephemeral=True
+            )
+            return
+        await cog.handle_brighten_spoiler_request(
+            interaction,
+            self.post_id,
+            image_index=self.image_index,
+        )
+
+
 class ExternalNewsSendConfirmView(discord.ui.View):
     def __init__(self, author_id: int) -> None:
         super().__init__(timeout=30)
@@ -483,7 +519,6 @@ class NewsCog(commands.Cog):
         self.x_source = x_source
         self.session = session
         self.test_mode = test_mode
-        # X 관측 전용 프로브: 테스트 모드 + X_NEWS_PROBE=1 에서만. 전송/DB 변경 없음.
         self._x_probe_active = test_mode and config.x_news_probe
         self.chzzk_client = ChzzkClient(session)
         self.youtube_client = YoutubeClient(session)
@@ -1443,7 +1478,6 @@ class NewsCog(commands.Cog):
         return elapsed >= interval
 
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
-        # 기본 30초. MIN(기본 20초) 아래로는 내려가지 않게 클램프.
         return max(
             self.config.twitter_poll_interval_seconds,
             self.config.twitter_min_poll_interval_seconds,
@@ -1926,8 +1960,6 @@ class NewsCog(commands.Cog):
                 image_delivery=settings.image_delivery,
             )
             if sent_message is not None:
-                # 원본 메시지 ID를 기록해 두면, 이후 소식이 수정될 때 새로 보내는 대신
-                # 이 메시지를 직접 edit 하고 답장으로 수정 안내를 달 수 있다.
                 self.storage.record_news_post_message(
                     target.target_id,
                     post.post_id,
@@ -2004,8 +2036,6 @@ class NewsCog(commands.Cog):
             targets = targets_by_post_id.get(post_id, [])
             if not targets:
                 continue
-            # 최초 게시가 오래된 글은 수정 알림을 보내지 않는다. 큐에 남은 stale 항목은
-            # 재전송 없이 비워, 폴링마다 옛 글이 다시 나가던 문제를 차단한다.
             if not _is_news_update_recent(post):
                 for target in targets:
                     self.storage.mark_news_update_sent(target.target_id, post_id)
@@ -2045,9 +2075,6 @@ class NewsCog(commands.Cog):
         target: GuildNewsTarget,
         post: NewsPost,
     ) -> None:
-        """수정된 소식을 반영한다: 원본 메시지를 직접 edit 하고, 그 메시지에 답장으로
-        간단한 수정 안내 임베드를 단다. 원본 메시지 기록이 없으면(이전 버전에서 보냈거나
-        기록 유실) 조용히 건너뛴다 — 옛 글을 새로 띄우지 않기 위함이다."""
         recorded = self.storage.get_news_post_message(target.target_id, post.post_id)
         if recorded is None:
             LOGGER.info(
@@ -2088,11 +2115,8 @@ class NewsCog(commands.Cog):
             )
             return
 
-        # 원본 메시지는 항상 최신 내용으로 갱신(새 글이 안 뜨므로 도배 위험 없음).
         await message.edit(view=updated_view)
 
-        # "수정되었습니다" 답장은 쿨다운 안에서는 생략한다. 해시가 비정상적으로 매 폴링마다
-        # 흔들려도 답장이 도배되지 않도록 하는 안전장치다.
         last_notified: datetime | None = None
         if last_notified_at:
             try:
@@ -2372,6 +2396,95 @@ class NewsCog(commands.Cog):
             file=file,
             ephemeral=True,
         )
+
+    async def handle_brighten_spoiler_request(
+        self,
+        interaction: discord.Interaction,
+        post_id: str,
+        *,
+        image_index: int = 0,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        post = await self._resolve_brighten_post(post_id)
+        if post is None:
+            await interaction.followup.send(
+                "이미지를 찾을 수 없어요.", ephemeral=True
+            )
+            return
+
+        image_urls = _brightenable_image_urls(post)
+        if image_index < 0 or image_index >= len(image_urls):
+            await interaction.followup.send(
+                "밝게 만들 이미지가 없어요.", ephemeral=True
+            )
+            return
+
+        downloaded = await self._download_image(image_urls[image_index])
+        if downloaded is None:
+            await interaction.followup.send(
+                "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        data, content_type = downloaded
+        brightened = await asyncio.to_thread(
+            _brighten_image_bytes, data, content_type
+        )
+        if brightened is None:
+            await interaction.followup.send(
+                "이 이미지는 밝기 보정을 할 수 없어요.",
+                ephemeral=True,
+            )
+            return
+
+        filename = (
+            f"SPOILER_limpi_brightened_{post.post_id.replace(':', '_')}_"
+            f"{image_index + 1}.png"
+        )
+        await interaction.followup.send(
+            "밝기 보정 이미지입니다. 스포일러에 주의해주세요.",
+            file=discord.File(io.BytesIO(brightened), filename=filename),
+            ephemeral=True,
+        )
+
+    async def _resolve_brighten_post(self, post_id: str) -> NewsPost | None:
+        post = self.storage.get_post(post_id)
+        if post is not None:
+            return post
+
+        twitter_id = post_id.removeprefix("twitter:")
+        twitter_post = self.storage.get_twitter_post(twitter_id)
+        if twitter_post is not None:
+            return _twitter_posts_as_news_posts([twitter_post], [])[0]
+
+        if self.x_source is None:
+            return None
+
+        try:
+            recent_posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+        except XClientError:
+            LOGGER.exception("밝기 보정용 X 게시물 재조회 실패 (post_id=%s).", post_id)
+            return None
+
+        wanted_ids = {post_id, twitter_id}
+        wanted_ids.update(
+            value.removeprefix("twitter:")
+            for value in list(wanted_ids)
+            if value.startswith("twitter:")
+        )
+        wanted_ids.update(
+            value.removeprefix("x:")
+            for value in list(wanted_ids)
+            if value.startswith("x:")
+        )
+        for candidate in recent_posts:
+            tweet_id = str(candidate.raw.get("tweet_id") or "").strip()
+            if candidate.post_id in wanted_ids or tweet_id in wanted_ids:
+                self.storage.save_twitter_posts([candidate])
+                return _twitter_posts_as_news_posts([candidate], [])[0]
+
+        return None
 
     async def _build_image_zip(self, post: NewsPost) -> tuple[io.BytesIO | None, int]:
         buffer = io.BytesIO()
@@ -3038,10 +3151,6 @@ class NewsCog(commands.Cog):
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
     async def _x_news_probe_observe(self, targets: list[GuildTwitterTarget]) -> None:
-        """X 관측 전용: fetch + would_announce/나이/답글/RT/steam매칭을 JSONL로만 기록.
-
-        전송·save·seen·last_seen·message mapping을 일절 변경하지 않는다(테스트 전용).
-        """
         observed_at = datetime.now(timezone.utc)
         run_kst = observed_at.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
         loop = asyncio.get_event_loop()
@@ -3055,7 +3164,6 @@ class NewsCog(commands.Cog):
         fetch_ms = (loop.time() - t0) * 1000
         posts = posts[:TWITTER_POST_LIMIT]
 
-        # steam 매칭은 캐시/DB 읽기만 사용(갱신 호출 없음 → DB 쓰기 없음).
         steam_by_id: dict[str, list[NewsPost]] = (
             self._steam_posts_by_twitter_post_id(posts) if posts else {}
         )
@@ -3157,7 +3265,6 @@ class NewsCog(commands.Cog):
                 if not new_posts:
                     self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
                     return 0
-                # 나이 게이트(기본 비활성). 윈도우 확대 후 오래된 백로그 덤프 차단용.
                 max_age = self.config.twitter_announce_max_age_seconds
                 if max_age > 0:
                     new_posts = [
@@ -4087,20 +4194,6 @@ class NewsCog(commands.Cog):
             if len(choices) >= 25:
                 break
         return choices
-
-    # @app_commands.command(
-    #     name="소식수정임베드테스트",
-    #     description="소식 수정 시 답장으로 다는 안내 임베드를 미리 확인합니다.",
-    # )
-    # @app_commands.allowed_installs(guilds=True, users=False)
-    # @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    # @app_commands.guild_only()
-    # @app_commands.default_permissions(manage_guild=True)
-    # async def test_news_update_embed(self, interaction: discord.Interaction) -> None:
-    #     await interaction.response.send_message(
-    #         embed=_news_update_notice_embed(),
-    #         allowed_mentions=discord.AllowedMentions.none(),
-    #     )
 
     @app_commands.command(name="점검알림설정", description="매주 목요일 10시 점검 시작과 12시 업데이트 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -5820,6 +5913,12 @@ def _content_image_urls(post: NewsPost) -> list[str]:
     ]
 
 
+def _brightenable_image_urls(post: NewsPost) -> list[str]:
+    if not _is_twitter_news_post(post):
+        return []
+    return _filter_image_urls(post.image_urls)
+
+
 def _thumbnail_url_for_post(post: NewsPost) -> str | None:
     raw_thumbnail = post.raw.get("thumbnail_url")
     if isinstance(raw_thumbnail, str) and raw_thumbnail:
@@ -6351,8 +6450,6 @@ def _build_layout_view_for_post(
         thumbnail_gallery.add_item(media=thumbnail_url)
         container.add_item(thumbnail_gallery)
 
-    # 본문 첨부 이미지를 따로 빼지 않고 컴포넌트 안 갤러리로 인라인 표시한다.
-    # (디스코드 갤러리 한도 10장, 나머지는 ZIP 버튼으로 받을 수 있다.)
     if include_content_images:
         content_image_urls = _content_image_urls(post)[:MAX_INLINE_GALLERY_IMAGES]
         if content_image_urls:
@@ -6376,6 +6473,10 @@ def _build_layout_view_for_post(
         )
     if include_zip_button and _content_image_urls(post):
         action_row.add_item(ZipDownloadButton(post.post_id, language=language))
+    if _brightenable_image_urls(post):
+        action_row.add_item(
+            BrightenSpoilerButton(post.post_id, image_index=0, language=language)
+        )
     if action_row.children:
         container.add_item(discord.ui.Separator())
         container.add_item(action_row)
@@ -6395,7 +6496,6 @@ def _success_embed_color() -> discord.Color:
 
 
 def _news_update_notice_embed() -> discord.Embed:
-    """수정된 소식 원본 메시지에 답장으로 다는 간단한 안내 임베드."""
     return discord.Embed(
         title="소식이 수정되었습니다!",
         description="소식 내용이 수정되었으니 다시 한번 내용을 확인해보세요!",
@@ -6428,6 +6528,10 @@ def _build_view_for_post(
         )
     if include_zip_button and _content_image_urls(post):
         view.add_item(ZipDownloadButton(post.post_id, language=language))
+    if _brightenable_image_urls(post):
+        view.add_item(
+            BrightenSpoilerButton(post.post_id, image_index=0, language=language)
+        )
     return view if view.children else None
 
 
@@ -6782,7 +6886,6 @@ def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
 
 
 def _is_news_update_recent(post: NewsPost) -> bool:
-    """최초 게시 시각이 재전송 허용 시간(10분) 이내인지. 시각 미상이면 불허(안전)."""
     moment = _as_utc_datetime(post.created_at)
     if moment is None:
         return False
@@ -6803,7 +6906,6 @@ def _post_delay_seconds(post: NewsPost) -> int | str:
 
 
 def _minute_in_window(minute: int, start: int, end: int) -> bool:
-    """분(0~1439)이 [start, end) 구간에 드는지. end<=start면 자정을 넘는 구간으로 본다."""
     if start == end:
         return False
     if start < end:
@@ -6819,9 +6921,6 @@ def _format_windows_label(windows: tuple[tuple[int, int], ...]) -> str:
 
 
 def _is_twitter_post_recent(post: TwitterPost, max_age_seconds: int) -> bool:
-    """나이 게이트: max_age_seconds<=0 이면 항상 통과(게이트 비활성).
-
-    그 외에는 created_at이 max_age_seconds 이내인 글만 통과. 시각 미상은 불허(안전)."""
     if max_age_seconds <= 0:
         return True
     created = post.created_at
@@ -7359,6 +7458,116 @@ def _image_bytes_as_png(
     except (UnidentifiedImageError, OSError):
         LOGGER.warning("이미지를 PNG로 변환하지 못해 원본으로 보냅니다.")
         return data, content_type
+
+
+_SHADOW_GAMMA = 0.36
+_CLAHE_CLIP_LIMIT = 3.5
+_CLAHE_TILE_GRID = (8, 8)
+_STRETCH_LOW_PCT = 1.0
+_STRETCH_HIGH_PCT = 99.0
+_SATURATION_GAIN = 1.4
+_NLM_LUMINANCE = 4
+_NLM_COLOR = 4
+_NLM_TEMPLATE_WINDOW = 7
+_NLM_SEARCH_WINDOW = 21
+_TEXT_MASK_HUE_LOW = np.array([80, 50, 100], dtype=np.uint8)
+_TEXT_MASK_HUE_HIGH = np.array([100, 255, 255], dtype=np.uint8)
+_UNSHARP_SIGMA = 2.0
+_UNSHARP_AMOUNT = 1.5
+_UNSHARP_THRESHOLD = 0.5
+
+
+def _build_gamma_lut(gamma: float) -> "np.ndarray":
+    scale = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    return np.clip(np.power(scale, gamma) * 255.0, 0, 255).astype(np.uint8)
+
+
+_SHADOW_GAMMA_LUT = _build_gamma_lut(_SHADOW_GAMMA)
+
+
+def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
+    hsv_src = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    text_mask = cv2.inRange(hsv_src, _TEXT_MASK_HUE_LOW, _TEXT_MASK_HUE_HIGH)
+    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+
+    gamma_img = cv2.LUT(rgb, _SHADOW_GAMMA_LUT)
+
+    ycrcb = cv2.cvtColor(gamma_img, cv2.COLOR_RGB2YCrCb)
+    y, cr, cb = cv2.split(ycrcb)
+    clahe = cv2.createCLAHE(
+        clipLimit=_CLAHE_CLIP_LIMIT, tileGridSize=_CLAHE_TILE_GRID
+    )
+    y_enhanced = clahe.apply(y)
+
+    lo, hi = np.percentile(y_enhanced, (_STRETCH_LOW_PCT, _STRETCH_HIGH_PCT))
+    if hi > lo:
+        y_stretched = np.clip(
+            (y_enhanced.astype(np.float32) - lo) * 255.0 / (hi - lo),
+            0,
+            255,
+        ).astype(np.uint8)
+    else:
+        y_stretched = y_enhanced
+
+    restored = cv2.cvtColor(cv2.merge((y_stretched, cr, cb)), cv2.COLOR_YCrCb2RGB)
+
+    denoised = cv2.fastNlMeansDenoisingColored(
+        restored,
+        None,
+        _NLM_LUMINANCE,
+        _NLM_COLOR,
+        _NLM_TEMPLATE_WINDOW,
+        _NLM_SEARCH_WINDOW,
+    )
+
+    blur = cv2.GaussianBlur(denoised, (0, 0), _UNSHARP_SIGMA)
+    sharpened = cv2.addWeighted(
+        denoised,
+        _UNSHARP_AMOUNT,
+        blur,
+        -(_UNSHARP_AMOUNT - 1.0),
+        _UNSHARP_THRESHOLD,
+    )
+
+    hsv = cv2.cvtColor(sharpened, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * _SATURATION_GAIN, 0, 255)
+    final_img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+    cv2.copyTo(rgb, text_mask, final_img)
+
+    return final_img
+
+
+def _brighten_image_bytes(data: bytes, content_type: str | None) -> bytes | None:
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            has_alpha = "A" in image.getbands()
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if has_alpha else "RGB")
+
+            alpha = (
+                np.asarray(image.getchannel("A"), dtype=np.uint8)
+                if image.mode == "RGBA"
+                else None
+            )
+            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+
+        recovered = _recover_shadow_detail(rgb)
+
+        out = Image.fromarray(recovered, mode="RGB")
+        if alpha is not None:
+            out.putalpha(Image.fromarray(alpha, mode="L"))
+
+        buffer = io.BytesIO()
+        out.save(buffer, format="PNG", optimize=True)
+        return buffer.getvalue()
+    except (UnidentifiedImageError, OSError, cv2.error):
+        LOGGER.warning(
+            "스포일러 이미지 밝기 보정 실패 (content_type=%s).",
+            content_type,
+        )
+        return None
 
 
 def _safe_zip_filename(post: NewsPost) -> str:

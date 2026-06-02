@@ -35,9 +35,6 @@ DEFAULT_NEWS_SOURCE_MODE = "both"
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
 
-# 최초 게시가 이 시간보다 오래된 글은 내용이 바뀌어도 수정 반영(원본 메시지 edit + 수정
-# 안내 답장)을 하지 않는다. 수정은 재전송이 아니라 원본 메시지를 직접 고치는 방식이라
-# 스팸이 아니므로 창을 넉넉히 잡되, 아주 오래된 글이 답장으로 되살아나는 것은 막는다.
 NEWS_UPDATE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
@@ -47,7 +44,6 @@ def _post_content_hash(post: "NewsPost") -> str:
 
 
 def _post_age_seconds(created_at: "datetime | None") -> float | None:
-    """최초 게시 시각으로부터 경과한 초. 시각을 모르면 None."""
     if created_at is None:
         return None
     moment = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
@@ -55,14 +51,10 @@ def _post_age_seconds(created_at: "datetime | None") -> float | None:
 
 
 def _is_post_update_eligible(created_at: "datetime | None") -> bool:
-    """수정 재전송을 허용할 만큼 최근에 게시된 글인지. 시각 미상이면 불허(안전)."""
     age = _post_age_seconds(created_at)
     return age is not None and age <= NEWS_UPDATE_MAX_AGE_SECONDS
 
 
-# 동일 글을 여러 소스가 만들 수 있다(Steam 이벤트 JSON vs RSS fallback). 소스마다
-# text/image 표현이 달라 content_hash가 갈리므로, 소스가 뒤바뀔 때 정정으로 오판하지
-# 않도록 권위 순위를 둔다. 숫자가 클수록 신뢰도 높음.
 _SOURCE_PRIORITY = {
     "steam_initial_events": 2,
     "steam_rss": 1,
@@ -367,9 +359,6 @@ class SQLiteStorage:
             self._connection.commit()
         self._run_migrations()
 
-    # 적용된 스키마/데이터 마이그레이션 버전을 schema_migrations 테이블로 관리한다.
-    # 각 마이그레이션은 idempotent해야 하며, 실패 시 해당 마이그레이션만 롤백하고
-    # 버전을 기록하지 않으므로 다음 실행에서 다시 시도된다(봇 기동은 막지 않는다).
     _MIGRATIONS: list[tuple[int, str]] = [
         (1, "clear_stale_news_update_queue"),
         (2, "drop_missed_news_recovery_column"),
@@ -417,19 +406,12 @@ class SQLiteStorage:
                     break
 
     def _migration_001(self) -> None:
-        """누적된 미전송 뉴스 수정 큐를 전부 비운다.
-
-        이 큐는 폴링 때마다 파생되는 임시 상태일 뿐이라 비워도 콘텐츠 데이터가
-        사라지지 않는다. 정말로 최근에 수정된 글은 다음 폴링에서 다시 큐잉되며,
-        이때는 새로 추가된 최초 게시 시각(10분) 게이트를 통과해야만 재전송된다.
-        과거 stale 큐가 폴링마다 무한 재전송되던 문제를 일괄 해소한다."""
         cursor = self._connection.execute(
             "DELETE FROM guild_news_target_pending_updates WHERE sent_at IS NULL"
         )
         LOGGER.info("누적된 미전송 뉴스 수정 큐 정리: %s행 삭제.", cursor.rowcount or 0)
 
     def _migration_002(self) -> None:
-        """사용하지 않게 된 guild_settings.missed_news_recovery_enabled 컬럼 제거."""
         cols = {
             row["name"]
             for row in self._connection.execute(
@@ -444,7 +426,6 @@ class SQLiteStorage:
             )
             LOGGER.info("guild_settings.missed_news_recovery_enabled 컬럼을 제거했습니다.")
         except sqlite3.OperationalError as exc:
-            # 구버전 SQLite는 DROP COLUMN 미지원. 컬럼은 미사용이므로 그대로 둬도 무해하다.
             LOGGER.warning(
                 "missed_news_recovery_enabled 컬럼 제거를 지원하지 않아 미사용 상태로 유지합니다: %s",
                 exc,
@@ -1943,8 +1924,6 @@ class SQLiteStorage:
         channel_id: int,
         message_id: int,
     ) -> None:
-        """자동 전송한 뉴스 메시지의 ID를 저장한다. 이후 소식이 수정되면 이 메시지를
-        직접 edit 하여 내용을 갱신한다."""
         now = _now_iso()
         with self._lock:
             self._connection.execute(
@@ -1966,10 +1945,6 @@ class SQLiteStorage:
     def get_news_post_message(
         self, target_id: int, post_id: str
     ) -> tuple[int, int, str | None] | None:
-        """저장된 (channel_id, message_id, last_notified_at) 반환. 없으면 None.
-
-        last_notified_at은 "소식이 수정되었습니다" 답장을 마지막으로 보낸 시각으로,
-        답장 도배를 막는 쿨다운 판정에 쓰인다."""
         with self._lock:
             row = self._connection.execute(
                 """
@@ -1984,7 +1959,6 @@ class SQLiteStorage:
         return int(row["channel_id"]), int(row["message_id"]), row["last_notified_at"]
 
     def mark_news_post_message_notified(self, target_id: int, post_id: str) -> None:
-        """수정 안내 답장을 보낸 시각을 기록한다(쿨다운 기준)."""
         now = _now_iso()
         with self._lock:
             self._connection.execute(
@@ -2071,8 +2045,6 @@ class SQLiteStorage:
                         old_raw = {}
                     old_priority = _source_priority(_post_source(old_raw))
 
-                # 낮은 권위 소스(예: RSS fallback)가 이미 높은 권위 소스로 저장된 글을
-                # 다시 들고 온 경우: 권위 있는 내용을 유지하고 정정으로 취급하지 않는다.
                 if existing is not None and new_priority < old_priority:
                     continue
 
@@ -2110,9 +2082,6 @@ class SQLiteStorage:
                 )
                 if cursor.rowcount:
                     saved += 1
-                # 내용이 바뀌었더라도, 같은 권위 소스에서 온 변경만 진짜 정정으로 본다.
-                # 권위가 더 높은 소스로의 갱신(upgrade)은 내용만 덮고 재전송하지 않는다.
-                # 또한 최초 게시가 오래된 글은 해시가 흔들려도 재전송하지 않는다(무한 재전송 차단).
                 if (
                     old_hash is not None
                     and old_hash != ""

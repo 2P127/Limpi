@@ -18,7 +18,6 @@ from ..core.models import NewsPost
 LOGGER = logging.getLogger(__name__)
 STEAM_NEWS_BASE_URL = "https://store.steampowered.com/news/app"
 STEAM_REQUEST_TIMEOUT_SECONDS = 20
-# 이벤트 데이터 요청이 일시적으로 실패해도 소식이 누락되지 않도록 재시도한다.
 STEAM_EVENT_MAX_ATTEMPTS = 3
 STEAM_EVENT_RETRY_BACKOFF_SECONDS = 2.0
 STEAM_CLAN_IMAGE_BASE_URL = "https://clan.fastly.steamstatic.com/images"
@@ -82,8 +81,6 @@ class SteamNewsSource:
         return _sort_newest_first(posts)[:limit]
 
     async def _fetch_event_posts_with_retry(self, language: str) -> list[NewsPost]:
-        # 일시적 요청 실패/빈 응답으로 소식이 누락되지 않도록 backoff 재시도 후,
-        # 끝까지 실패하면 예외를 올려 호출부가 저장된 소식을 유지하도록 한다.
         last_error: Exception | None = None
         for attempt in range(1, STEAM_EVENT_MAX_ATTEMPTS + 1):
             try:

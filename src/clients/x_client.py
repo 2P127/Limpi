@@ -286,21 +286,18 @@ class LimbusXClient:
         self._last_backoff_log_until = None
 
     def _twitter_backoff_seconds(self, failures: int) -> float:
-        """설정 기반 429 backoff: base * multiplier^연속횟수, MAX로 캡."""
         base = float(self.config.twitter_rate_limit_backoff_seconds)
         multiplier = float(self.config.twitter_429_backoff_multiplier)
         cap = float(self.config.twitter_max_backoff_seconds)
         return min(base * (multiplier ** max(0, failures)), cap)
 
     def _handle_rate_limit(self, exc: "XRateLimitError | None") -> None:
-        """429 즉시 backoff 적용 + 필수 필드 로깅. backoff 중에는 호출 자체가 막힌다."""
         reset_at = exc.reset_at if exc is not None else None
         remaining = exc.remaining if exc is not None else None
         seconds = self._twitter_backoff_seconds(self._rate_limit_failures)
         if reset_at is not None:
             delta = (reset_at - datetime.now(timezone.utc)).total_seconds()
             if delta > 0:
-                # MAX 캡보다 reset이 더 멀면 reset까지 기다린다(미리 호출하면 또 429).
                 seconds = max(seconds, delta + 1)
         self._apply_backoff(seconds)
         self._rate_limit_failures += 1

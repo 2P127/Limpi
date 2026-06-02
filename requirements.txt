@@ -2,5 +2,7 @@ aiohttp>=3.9,<4
 discord.py>=2.4,<3
 python-dotenv>=1.0,<2
 Pillow>=10
+opencv-python-headless>=4.9
+numpy>=1.26
 pystray>=0.19
 psutil>=5.9
