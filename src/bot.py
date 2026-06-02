@@ -53,8 +53,8 @@ LOGGER = logging.getLogger(__name__)
 KST = timezone(timedelta(hours=9))
 NEWS_POST_LIMIT = 30
 TWITTER_POST_LIMIT = 30
-AUTOCOMPLETE_CHOICE_LIMIT = 25
-AUTOCOMPLETE_TIMEOUT_SECONDS = 5
+NEWS_SELECT_PAGE_SIZE = 25
+NEWS_SELECT_POST_LIMIT = 250
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
 CHZZK_POLL_INTERVAL_SECONDS = 60
@@ -521,6 +521,171 @@ class BrightenSpoilerVisibilityView(discord.ui.View):
         button: discord.ui.Button,
     ) -> None:
         await self._send_result(interaction, ephemeral=False)
+
+
+class NewsPostSelect(discord.ui.Select):
+    def __init__(self, parent: "NewsPostSelectView") -> None:
+        options = parent.current_options()
+        super().__init__(
+            placeholder="게시물을 선택해주세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=not options,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_select(interaction, self.values[0])
+
+
+class NewsPostSelectView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "NewsCog",
+        author_id: int,
+        posts: list[NewsPost],
+        *,
+        mode: str,
+        source_mode: str,
+        language: str,
+        private: bool = True,
+        attach_photos: bool = True,
+        channel_id: int | None = None,
+        role_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.author_id = author_id
+        self.posts = posts
+        self.mode = mode
+        self.source_mode = source_mode
+        self.language = language
+        self.private = private
+        self.attach_photos = attach_photos
+        self.channel_id = channel_id
+        self.role_id = role_id
+        self.page = 0
+        self.refresh_items()
+
+    @property
+    def max_page(self) -> int:
+        if not self.posts:
+            return 0
+        return (len(self.posts) - 1) // NEWS_SELECT_PAGE_SIZE
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+
+        await interaction.response.send_message(
+            "이 선택 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    def current_options(self) -> list[discord.SelectOption]:
+        start = self.page * NEWS_SELECT_PAGE_SIZE
+        page_posts = self.posts[start:start + NEWS_SELECT_PAGE_SIZE]
+        options: list[discord.SelectOption] = []
+        for post in page_posts:
+            label = _choice_name(post, include_language=False, include_source=False)
+            description = _choice_name(post, include_language=True, include_source=True)
+            index = start + len(options)
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=str(index),
+                    description=description[:100],
+                )
+            )
+        return options
+
+    def refresh_items(self) -> None:
+        self.clear_items()
+        self.add_item(NewsPostSelect(self))
+        prev_button = discord.ui.Button(
+            label="이전",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+        )
+        next_button = discord.ui.Button(
+            label="다음",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= self.max_page,
+        )
+        prev_button.callback = self.previous_page
+        next_button.callback = self.next_page
+        self.add_item(prev_button)
+        self.add_item(next_button)
+
+    async def previous_page(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        if self.page < self.max_page:
+            self.page += 1
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def update_message(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    def build_embed(self) -> discord.Embed:
+        title = "게시물을 선택해주세요"
+        if self.mode == "send":
+            title = "보낼 게시물을 선택해주세요"
+        description = f"{self.page + 1} / {self.max_page + 1} 페이지"
+        if not self.posts:
+            description = "선택할 수 있는 게시물이 없어요."
+        return discord.Embed(
+            title=title,
+            description=description,
+            color=discord.Color.from_rgb(179, 28, 28),
+        )
+
+    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
+        try:
+            post = self.posts[int(value)]
+        except (IndexError, ValueError):
+            await interaction.response.send_message(
+                "선택한 게시물을 찾지 못했어요.",
+                ephemeral=True,
+            )
+            return
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="선택한 게시물을 처리하고 있어요.",
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        if self.mode == "send":
+            await self.cog._send_news_by_selected_post(
+                interaction,
+                post.post_id,
+                source_mode=self.source_mode,
+                channel_id=self.channel_id,
+                role_id=self.role_id,
+            )
+            return
+
+        await self.cog._show_previous_news_by_selected_post(
+            interaction,
+            post.post_id,
+            source_mode=self.source_mode,
+            language=self.language,
+            private=self.private,
+            attach_photos=self.attach_photos,
+        )
 
 
 class ExternalNewsSendConfirmView(discord.ui.View):
@@ -1264,36 +1429,6 @@ class NewsCog(commands.Cog):
             source_mode=source_mode,
         )[:limit]
 
-    def _autocomplete_cached_posts(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[NewsPost]:
-        language = self._interaction_language(interaction)
-        settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        source_mode = _selected_source_mode(interaction)
-        return self._combined_cached_posts(
-            current,
-            limit=AUTOCOMPLETE_CHOICE_LIMIT,
-            language=language,
-            settings=settings,
-            source_mode=source_mode,
-        )
-
-    async def _news_post_autocomplete_choices(
-        self, interaction: discord.Interaction, current: str, command_name: str
-    ) -> list[app_commands.Choice[str]]:
-        try:
-            posts = await asyncio.wait_for(
-                asyncio.to_thread(self._autocomplete_cached_posts, interaction, current),
-                timeout=AUTOCOMPLETE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            LOGGER.warning("%s 게시물 자동완성 지연: %.1f초 초과", command_name, AUTOCOMPLETE_TIMEOUT_SECONDS)
-            return []
-        except Exception:
-            LOGGER.exception("%s 게시물 자동완성 실패.", command_name)
-            return []
-        return _post_autocomplete_choices(posts)
-
     async def _get_combined_post(
         self,
         value: str,
@@ -1319,6 +1454,243 @@ class NewsCog(commands.Cog):
             candidates.extend(_twitter_posts_as_news_posts([twitter_post], steam_posts))
         filtered = self._posts_for_source_mode(candidates, settings, source_mode=source_mode)
         return filtered[0] if filtered else None
+
+    async def _selectable_news_posts(
+        self,
+        *,
+        language: str | None = None,
+        settings: GuildSettings | None = None,
+        source_mode: str | None = None,
+    ) -> list[NewsPost]:
+        return await asyncio.to_thread(
+            self._combined_cached_posts,
+            "",
+            limit=NEWS_SELECT_POST_LIMIT,
+            language=language,
+            settings=settings,
+            source_mode=source_mode,
+        )
+
+    async def _send_news_post_select_menu(
+        self,
+        interaction: discord.Interaction,
+        posts: list[NewsPost],
+        *,
+        mode: str,
+        source_mode: str,
+        language: str,
+        private: bool = True,
+        attach_photos: bool = True,
+        channel_id: int | None = None,
+        role_id: int | None = None,
+    ) -> None:
+        if not posts:
+            message = "선택할 수 있는 게시물이 없어요. 림피가 자동 동기화한 뒤 다시 시도해 주세요."
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        view = NewsPostSelectView(
+            self,
+            interaction.user.id,
+            posts,
+            mode=mode,
+            source_mode=source_mode,
+            language=language,
+            private=private,
+            attach_photos=attach_photos,
+            channel_id=channel_id,
+            role_id=role_id,
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                embed=view.build_embed(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=view.build_embed(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _show_previous_news_by_selected_post(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        *,
+        source_mode: str,
+        language: str,
+        private: bool,
+        attach_photos: bool,
+        settings: GuildSettings | None = None,
+    ) -> None:
+        resolved_settings = (
+            settings
+            if settings is not None
+            else self.storage.get_settings(interaction.guild_id)
+            if interaction.guild_id
+            else None
+        )
+        post = await self._get_combined_post(
+            title,
+            language=language,
+            settings=resolved_settings,
+            source_mode=source_mode,
+        )
+        if post is None:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "아직 저장된 게시물을 찾지 못했어요. 림피가 자동 동기화한 뒤 다시 선택해 주세요.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "아직 저장된 게시물을 찾지 못했어요. 림피가 자동 동기화한 뒤 다시 선택해 주세요.",
+                    ephemeral=True,
+                )
+            return
+
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private, thinking=True)
+        sent_messages = await self._send_news_post_followups(
+            interaction,
+            post,
+            private=private,
+            attach_photos=attach_photos,
+        )
+        if not private:
+            for message in sent_messages:
+                await self._track_manual_message(
+                    interaction.guild_id, interaction.channel_id, message
+                )
+
+    async def _send_news_by_selected_post(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        *,
+        source_mode: str,
+        channel_id: int | None = None,
+        role_id: int | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.followup.send("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        language = self._interaction_language(interaction)
+        settings = self.storage.get_settings(interaction.guild_id)
+        post = await self._get_combined_post(
+            title,
+            language=language,
+            settings=settings,
+            source_mode=source_mode,
+        )
+        if post is None:
+            await interaction.followup.send("해당 게시물을 찾지 못했어요.", ephemeral=True)
+            return
+
+        configured_targets = self.storage.list_news_targets(interaction.guild_id)
+        delivery_targets: list[tuple[discord.abc.Messageable, str]] = []
+        if channel_id is not None:
+            resolved_channel = await self._resolve_target_channel(None, channel_id)
+            if resolved_channel is None:
+                await interaction.followup.send(
+                    "보낼 채널을 찾지 못했어요. 채널 권한을 확인해주세요.",
+                    ephemeral=True,
+                )
+                return
+            channel_languages = [
+                target.language
+                for target in configured_targets
+                if target.channel_id == channel_id
+            ]
+            if not channel_languages:
+                channel_languages = [_post_language(post) or language]
+            delivery_targets = [
+                (resolved_channel, target_language)
+                for target_language in channel_languages
+            ]
+        else:
+            for news_target in configured_targets:
+                resolved = await self._resolve_target_channel(None, news_target.channel_id)
+                if resolved is not None:
+                    delivery_targets.append((resolved, news_target.language))
+
+        if not delivery_targets:
+            await interaction.followup.send(
+                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /소식채널설정으로 언어별 채널을 설정해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        role_to_send = role_id if role_id is not None else settings.role_id
+        sent_channel_ids: list[int] = []
+        failed_channel_ids: list[int | None] = []
+        missing_languages: set[str] = set()
+        mentioned_channel_ids: set[int] = set()
+
+        for target, target_language in delivery_targets:
+            resolved_channel_id = getattr(target, "id", None)
+            target_post = self._post_variant_for_language(post, target_language)
+            if target_post is None:
+                missing_languages.add(target_language)
+                failed_channel_ids.append(resolved_channel_id)
+                continue
+
+            mention_role = not (
+                isinstance(resolved_channel_id, int)
+                and resolved_channel_id in mentioned_channel_ids
+            )
+            try:
+                await self._broadcast_post(
+                    target,
+                    target_post,
+                    role_to_send if mention_role else None,
+                    banner_filename=settings.notification_banner,
+                    image_delivery=settings.image_delivery,
+                )
+            except discord.Forbidden:
+                failed_channel_ids.append(resolved_channel_id)
+                continue
+            except discord.HTTPException:
+                LOGGER.exception("수동 뉴스 전송 실패.")
+                failed_channel_ids.append(resolved_channel_id)
+                continue
+
+            if isinstance(resolved_channel_id, int):
+                sent_channel_ids.append(resolved_channel_id)
+                mentioned_channel_ids.add(resolved_channel_id)
+
+        if not sent_channel_ids:
+            await interaction.followup.send(
+                "소식을 보낼 수 있는 채널이 없어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        sent_text = ", ".join(f"<#{sent_channel_id}>" for sent_channel_id in sent_channel_ids)
+        if failed_channel_ids:
+            failed_text = ", ".join(
+                f"<#{failed_channel_id}>" if failed_channel_id else "지정한 채널"
+                for failed_channel_id in failed_channel_ids
+            )
+            message = f"{sent_text}에 소식을 보냈어요.\n전송 실패: {failed_text}"
+        else:
+            message = f"{sent_text}에 소식을 보냈어요."
+        if missing_languages:
+            missing_text = ", ".join(
+                _language_label(missing_language)
+                for missing_language in sorted(missing_languages)
+            )
+            message += f"\n같은 소식의 {missing_text} 게시물을 아직 찾지 못했어요."
+
+        await interaction.followup.send(message, ephemeral=True)
 
     async def _latest_combined_post(
         self,
@@ -5517,7 +5889,7 @@ class NewsCog(commands.Cog):
     @app_commands.rename(source="소스", title="게시물", private="나만보기", attach_photos="사진첨부")
     @app_commands.describe(
         source="게시물을 가져온 소스입니다.",
-        title="게시물의 첫 번째 줄을 선택합니다.",
+        title="게시물 ID나 제목입니다. 비워두면 선택 메뉴를 엽니다.",
         private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
         attach_photos="켜면 소식에 포함된 이미지를 임베드로 함께 표시합니다.",
     )
@@ -5526,7 +5898,7 @@ class NewsCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         source: app_commands.Choice[str],
-        title: str,
+        title: str | None = None,
         private: app_commands.Choice[str] | None = None,
         attach_photos: app_commands.Choice[str] | None = None,
     ) -> None:
@@ -5537,41 +5909,37 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id) if interaction.guild_id else None
-        post = await self._get_combined_post(
-            title,
-            language=language,
-            settings=settings,
-            source_mode=source.value,
-        )
-        if post is None:
-            await interaction.response.send_message(
-                "아직 저장된 게시물을 찾지 못했어요. 림피가 자동 동기화한 뒤 다시 선택해 주세요.",
-                ephemeral=True,
+        if not title:
+            if not await self._confirm_external_news_send(interaction):
+                return
+            posts = await self._selectable_news_posts(
+                language=language,
+                settings=settings,
+                source_mode=source.value,
+            )
+            await self._send_news_post_select_menu(
+                interaction,
+                posts,
+                mode="previous",
+                source_mode=source.value,
+                language=language,
+                private=private_value,
+                attach_photos=attach_photos_value,
             )
             return
 
         if not await self._confirm_external_news_send(interaction):
             return
 
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=private_value, thinking=True)
-        sent_messages = await self._send_news_post_followups(
+        await self._show_previous_news_by_selected_post(
             interaction,
-            post,
+            title,
+            source_mode=source.value,
+            language=language,
             private=private_value,
             attach_photos=attach_photos_value,
+            settings=settings,
         )
-        if not private_value:
-            for message in sent_messages:
-                await self._track_manual_message(
-                    interaction.guild_id, interaction.channel_id, message
-                )
-
-    @previous_news.autocomplete("title")
-    async def previous_news_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        return await self._news_post_autocomplete_choices(interaction, current, "이전소식보기")
 
     @app_commands.command(name="최근소식보기", description="가장 최근 림버스 컴퍼니 소식을 즉시 확인합니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -5639,7 +6007,7 @@ class NewsCog(commands.Cog):
     @app_commands.rename(source="소스", title="게시물", channel="채널", role="역할")
     @app_commands.describe(
         source="게시물을 가져온 소스입니다.",
-        title="보낼 게시물을 선택합니다.",
+        title="게시물 ID나 제목입니다. 비워두면 선택 메뉴를 엽니다.",
         channel="보낼 채널입니다. 비워두면 /소식채널설정 채널 전체에 각 채널 언어 버전으로 보냅니다.",
         role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
     )
@@ -5648,7 +6016,7 @@ class NewsCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         source: app_commands.Choice[str],
-        title: str,
+        title: str | None = None,
         channel: discord.TextChannel | None = None,
         role: discord.Role | None = None,
     ) -> None:
@@ -5660,111 +6028,31 @@ class NewsCog(commands.Cog):
 
         language = self._interaction_language(interaction)
         settings = self.storage.get_settings(interaction.guild_id)
-        post = await self._get_combined_post(
-            title,
-            language=language,
-            settings=settings,
-            source_mode=source.value,
-        )
-        if post is None:
-            await interaction.response.send_message(
-                "해당 게시물을 찾지 못했어요.", ephemeral=True
+        if not title:
+            posts = await self._selectable_news_posts(
+                language=language,
+                settings=settings,
+                source_mode=source.value,
             )
-            return
-
-        configured_targets = self.storage.list_news_targets(interaction.guild_id)
-        delivery_targets: list[tuple[discord.abc.Messageable, str]] = []
-        if channel is not None:
-            channel_languages = [
-                target.language
-                for target in configured_targets
-                if target.channel_id == channel.id
-            ]
-            if not channel_languages:
-                channel_languages = [_post_language(post) or language]
-            delivery_targets = [(channel, target_language) for target_language in channel_languages]
-        else:
-            for news_target in configured_targets:
-                resolved = await self._resolve_target_channel(None, news_target.channel_id)
-                if resolved is not None:
-                    delivery_targets.append((resolved, news_target.language))
-
-        if not delivery_targets:
-            await interaction.response.send_message(
-                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /소식채널설정으로 언어별 채널을 설정해주세요.",
-                ephemeral=True,
+            await self._send_news_post_select_menu(
+                interaction,
+                posts,
+                mode="send",
+                source_mode=source.value,
+                language=language,
+                channel_id=channel.id if channel else None,
+                role_id=role.id if role else None,
             )
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-
-        role_id = role.id if role else settings.role_id
-        sent_channel_ids: list[int] = []
-        failed_channel_ids: list[int | None] = []
-        missing_languages: set[str] = set()
-        mentioned_channel_ids: set[int] = set()
-
-        for target, target_language in delivery_targets:
-            channel_id = getattr(target, "id", None)
-            target_post = self._post_variant_for_language(post, target_language)
-            if target_post is None:
-                missing_languages.add(target_language)
-                failed_channel_ids.append(channel_id)
-                continue
-
-            mention_role = not (
-                isinstance(channel_id, int) and channel_id in mentioned_channel_ids
-            )
-            try:
-                await self._broadcast_post(
-                    target,
-                    target_post,
-                    role_id if mention_role else None,
-                    banner_filename=settings.notification_banner,
-                    image_delivery=settings.image_delivery,
-                )
-            except discord.Forbidden:
-                failed_channel_ids.append(channel_id)
-                continue
-            except discord.HTTPException:
-                LOGGER.exception("수동 뉴스 전송 실패.")
-                failed_channel_ids.append(channel_id)
-                continue
-
-            if isinstance(channel_id, int):
-                sent_channel_ids.append(channel_id)
-                mentioned_channel_ids.add(channel_id)
-
-        if not sent_channel_ids:
-            await interaction.followup.send(
-                "소식을 보낼 수 있는 채널이 없어요. 채널 권한을 확인해주세요.",
-                ephemeral=True,
-            )
-            return
-
-        sent_text = ", ".join(f"<#{channel_id}>" for channel_id in sent_channel_ids)
-        if failed_channel_ids:
-            failed_text = ", ".join(
-                f"<#{channel_id}>" if channel_id else "지정한 채널"
-                for channel_id in failed_channel_ids
-            )
-            message = f"{sent_text}에 소식을 보냈어요.\n전송 실패: {failed_text}"
-        else:
-            message = f"{sent_text}에 소식을 보냈어요."
-        if missing_languages:
-            missing_text = ", ".join(
-                _language_label(language)
-                for language in sorted(missing_languages)
-            )
-            message += f"\n같은 소식의 {missing_text} 게시물을 아직 찾지 못했어요."
-
-        await interaction.followup.send(message, ephemeral=True)
-
-    @send_news.autocomplete("title")
-    async def send_news_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        return await self._news_post_autocomplete_choices(interaction, current, "소식보내기")
+        await self._send_news_by_selected_post(
+            interaction,
+            title,
+            source_mode=source.value,
+            channel_id=channel.id if channel else None,
+            role_id=role.id if role else None,
+        )
 
     @app_commands.command(name="명령어", description="림피의 모든 명령어 사용법을 봅니다.")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -7490,25 +7778,6 @@ def _choice_name(
     if max_title_length <= 3:
         return f"{prefix}{title[:max_title_length]}"
     return f"{prefix}{title[: max_title_length - 3]}..."
-
-
-def _post_autocomplete_choices(posts: list[NewsPost]) -> list[app_commands.Choice[str]]:
-    choices: list[app_commands.Choice[str]] = []
-    seen_values: set[str] = set()
-    for post in posts:
-        value = str(post.post_id)
-        if value in seen_values:
-            continue
-        choices.append(
-            app_commands.Choice(
-                name=_choice_name(post, include_language=False, include_source=False),
-                value=value,
-            )
-        )
-        seen_values.add(value)
-        if len(choices) >= AUTOCOMPLETE_CHOICE_LIMIT:
-            break
-    return choices
 
 
 def _twitter_choice_name(post: TwitterPost) -> str:
