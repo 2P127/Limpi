@@ -67,6 +67,10 @@ ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 BRIGHTEN_CUSTOM_ID_PREFIX = "limpi:brighten:"
 ZIP_IMAGE_CONCURRENCY = 20
 ZIP_CACHE_MAX_ITEMS = 8
+BRIGHTEN_PROCESS_CONCURRENCY = 2
+BRIGHTEN_CACHE_MAX_ITEMS = 24
+BRIGHTEN_CACHE_MAX_BYTES = 64 * 1024 * 1024
+BRIGHTEN_CACHE_MAX_ITEM_BYTES = 16 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEMS = 128
 IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
@@ -435,7 +439,7 @@ class BrightenSpoilerButton(
     ) -> None:
         super().__init__(
             discord.ui.Button(
-                label="밝기 올리기 (스포주의)",
+                label="밝기 올리기",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"{BRIGHTEN_CUSTOM_ID_PREFIX}{post_id}:{image_index}",
                 emoji="🔆",
@@ -456,11 +460,67 @@ class BrightenSpoilerButton(
                 "지금은 이미지를 처리할 수 없어요.", ephemeral=True
             )
             return
-        await cog.handle_brighten_spoiler_request(
+        await cog.prompt_brighten_spoiler_visibility(
             interaction,
             self.post_id,
             image_index=self.image_index,
         )
+
+
+class BrightenSpoilerVisibilityView(discord.ui.View):
+    def __init__(self, author_id: int, post_id: str, image_index: int) -> None:
+        super().__init__(timeout=30)
+        self.author_id = author_id
+        self.post_id = post_id
+        self.image_index = image_index
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+
+        await interaction.response.send_message(
+            "이 선택 버튼은 처음 누른 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    async def _send_result(self, interaction: discord.Interaction, *, ephemeral: bool) -> None:
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(
+            content="이미지를 처리하고 있어요.",
+            embed=None,
+            view=self,
+        )
+        cog = interaction.client.get_cog("NewsCog")
+        if not isinstance(cog, NewsCog):
+            await interaction.followup.send(
+                "지금은 이미지를 처리할 수 없어요.",
+                ephemeral=True,
+            )
+            return
+        await cog.handle_brighten_spoiler_request(
+            interaction,
+            self.post_id,
+            image_index=self.image_index,
+            ephemeral=ephemeral,
+        )
+
+    @discord.ui.button(label="나만 보기", style=discord.ButtonStyle.primary)
+    async def private_result(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._send_result(interaction, ephemeral=True)
+
+    @discord.ui.button(label="채널에 보내기", style=discord.ButtonStyle.danger)
+    async def public_result(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self._send_result(interaction, ephemeral=False)
 
 
 class ExternalNewsSendConfirmView(discord.ui.View):
@@ -529,6 +589,10 @@ class NewsCog(commands.Cog):
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
+        self._brighten_cache: dict[str, bytes] = {}
+        self._brighten_cache_bytes: int = 0
+        self._brighten_tasks: dict[str, asyncio.Task[bytes | None]] = {}
+        self._brighten_semaphore = asyncio.Semaphore(BRIGHTEN_PROCESS_CONCURRENCY)
         self._last_poll_at: datetime | None = None
         self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
@@ -567,6 +631,8 @@ class NewsCog(commands.Cog):
             self.poll_youtube_live.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
+        for task in self._brighten_tasks.values():
+            task.cancel()
 
     @tasks.loop(minutes=1)
     async def presence_status(self) -> None:
@@ -2403,8 +2469,8 @@ class NewsCog(commands.Cog):
         post_id: str,
         *,
         image_index: int = 0,
+        ephemeral: bool = True,
     ) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         post = await self._resolve_brighten_post(post_id)
         if post is None:
             await interaction.followup.send(
@@ -2419,21 +2485,11 @@ class NewsCog(commands.Cog):
             )
             return
 
-        downloaded = await self._download_image(image_urls[image_index])
-        if downloaded is None:
-            await interaction.followup.send(
-                "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
-                ephemeral=True,
-            )
-            return
-
-        data, content_type = downloaded
-        brightened = await asyncio.to_thread(
-            _brighten_image_bytes, data, content_type
-        )
+        image_url = image_urls[image_index]
+        brightened = await self._get_brightened_image(image_url)
         if brightened is None:
             await interaction.followup.send(
-                "이 이미지는 밝기 보정을 할 수 없어요.",
+                "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
                 ephemeral=True,
             )
             return
@@ -2442,11 +2498,91 @@ class NewsCog(commands.Cog):
             f"SPOILER_limpi_brightened_{post.post_id.replace(':', '_')}_"
             f"{image_index + 1}.png"
         )
-        await interaction.followup.send(
-            "밝기 보정 이미지입니다. 스포일러에 주의해주세요.",
-            file=discord.File(io.BytesIO(brightened), filename=filename),
-            ephemeral=True,
+        try:
+            await interaction.followup.send(
+                "밝기 보정 이미지입니다. 스포일러에 주의해주세요.",
+                file=discord.File(io.BytesIO(brightened), filename=filename),
+                ephemeral=ephemeral,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "이 채널에 이미지를 보낼 권한이 없어요.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            await interaction.followup.send(
+                "밝기 보정 이미지를 보내는 중 문제가 생겼어요.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await interaction.edit_original_response(
+                content="밝기 보정 이미지를 보냈어요.",
+                embed=None,
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
+
+    async def prompt_brighten_spoiler_visibility(
+        self,
+        interaction: discord.Interaction,
+        post_id: str,
+        *,
+        image_index: int = 0,
+    ) -> None:
+        embed = discord.Embed(
+            title="밝기 보정 이미지를 어디로 보낼까요?",
+            description="스포일러 이미지일 수 있으니 공개 전송 전에 한 번 확인해주세요.",
+            color=discord.Color.from_rgb(179, 28, 28),
         )
+        view = BrightenSpoilerVisibilityView(
+            interaction.user.id,
+            post_id,
+            image_index,
+        )
+        await interaction.response.send_message(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _get_brightened_image(self, image_url: str) -> bytes | None:
+        cached = self._brighten_cache.get(image_url)
+        if cached is not None:
+            self._brighten_cache[image_url] = self._brighten_cache.pop(image_url)
+            return cached
+
+        task = self._brighten_tasks.get(image_url)
+        if task is None:
+            task = asyncio.create_task(self._build_brightened_image(image_url))
+            self._brighten_tasks[image_url] = task
+
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._brighten_tasks.pop(image_url, None)
+
+    async def _build_brightened_image(self, image_url: str) -> bytes | None:
+        downloaded = await self._download_image(image_url)
+        if downloaded is None:
+            return None
+
+        data, content_type = downloaded
+        async with self._brighten_semaphore:
+            brightened = await asyncio.to_thread(
+                _brighten_image_bytes,
+                data,
+                content_type,
+            )
+        if brightened is not None:
+            self._cache_brightened_image(image_url, brightened)
+        return brightened
 
     async def _resolve_brighten_post(self, post_id: str) -> NewsPost | None:
         post = self.storage.get_post(post_id)
@@ -3010,6 +3146,23 @@ class NewsCog(commands.Cog):
             oldest_url, (oldest_data, _) = next(iter(self._image_cache.items()))
             self._image_cache.pop(oldest_url, None)
             self._image_cache_bytes -= len(oldest_data)
+
+    def _cache_brightened_image(self, url: str, data: bytes) -> None:
+        size = len(data)
+        if size > BRIGHTEN_CACHE_MAX_ITEM_BYTES:
+            return
+        prev = self._brighten_cache.pop(url, None)
+        if prev is not None:
+            self._brighten_cache_bytes -= len(prev)
+        self._brighten_cache[url] = data
+        self._brighten_cache_bytes += size
+        while self._brighten_cache and (
+            len(self._brighten_cache) > BRIGHTEN_CACHE_MAX_ITEMS
+            or self._brighten_cache_bytes > BRIGHTEN_CACHE_MAX_BYTES
+        ):
+            oldest_url, oldest_data = next(iter(self._brighten_cache.items()))
+            self._brighten_cache.pop(oldest_url, None)
+            self._brighten_cache_bytes -= len(oldest_data)
 
     def _cache_zip(self, post_id: str, zip_bytes: bytes, count: int) -> None:
         self._zip_cache[post_id] = (zip_bytes, count)
@@ -7460,20 +7613,28 @@ def _image_bytes_as_png(
         return data, content_type
 
 
-_SHADOW_GAMMA = 0.36
-_CLAHE_CLIP_LIMIT = 3.5
+_SHADOW_GAMMA_RED = 0.42
+_SHADOW_GAMMA_GREEN = 0.40
+_SHADOW_GAMMA_BLUE = 0.35
+_CLAHE_CLIP_LIMIT = 3.0
 _CLAHE_TILE_GRID = (8, 8)
 _STRETCH_LOW_PCT = 1.0
 _STRETCH_HIGH_PCT = 99.0
-_SATURATION_GAIN = 1.4
-_NLM_LUMINANCE = 4
-_NLM_COLOR = 4
+_SATURATION_GAIN = 1.3
+_NLM_LUMINANCE = 2.5
+_NLM_COLOR = 2.5
 _NLM_TEMPLATE_WINDOW = 7
 _NLM_SEARCH_WINDOW = 21
 _TEXT_MASK_HUE_LOW = np.array([80, 50, 100], dtype=np.uint8)
 _TEXT_MASK_HUE_HIGH = np.array([100, 255, 255], dtype=np.uint8)
+_TEXT_MASK_DILATE_KERNEL = (5, 5)
+_TEXT_MASK_DILATE_ITERATIONS = 1
+_TEXT_MASK_BLUR_KERNEL = (5, 5)
+_BILATERAL_DIAMETER = 7
+_BILATERAL_SIGMA_COLOR = 64
+_BILATERAL_SIGMA_SPACE = 56
 _UNSHARP_SIGMA = 2.0
-_UNSHARP_AMOUNT = 1.5
+_UNSHARP_AMOUNT = 1.35
 _UNSHARP_THRESHOLD = 0.5
 
 
@@ -7482,15 +7643,29 @@ def _build_gamma_lut(gamma: float) -> "np.ndarray":
     return np.clip(np.power(scale, gamma) * 255.0, 0, 255).astype(np.uint8)
 
 
-_SHADOW_GAMMA_LUT = _build_gamma_lut(_SHADOW_GAMMA)
+_SHADOW_GAMMA_RED_LUT = _build_gamma_lut(_SHADOW_GAMMA_RED)
+_SHADOW_GAMMA_GREEN_LUT = _build_gamma_lut(_SHADOW_GAMMA_GREEN)
+_SHADOW_GAMMA_BLUE_LUT = _build_gamma_lut(_SHADOW_GAMMA_BLUE)
 
 
 def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
     hsv_src = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     text_mask = cv2.inRange(hsv_src, _TEXT_MASK_HUE_LOW, _TEXT_MASK_HUE_HIGH)
-    text_mask = cv2.morphologyEx(text_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    mask_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, _TEXT_MASK_DILATE_KERNEL)
+    dilated_mask = cv2.dilate(
+        text_mask,
+        mask_kernel,
+        iterations=_TEXT_MASK_DILATE_ITERATIONS,
+    )
+    smooth_mask = cv2.GaussianBlur(dilated_mask, _TEXT_MASK_BLUR_KERNEL, 0)
+    text_alpha = smooth_mask.astype(np.float32) / 255.0
 
-    gamma_img = cv2.LUT(rgb, _SHADOW_GAMMA_LUT)
+    red, green, blue = cv2.split(rgb)
+    gamma_img = cv2.merge((
+        cv2.LUT(red, _SHADOW_GAMMA_RED_LUT),
+        cv2.LUT(green, _SHADOW_GAMMA_GREEN_LUT),
+        cv2.LUT(blue, _SHADOW_GAMMA_BLUE_LUT),
+    ))
 
     ycrcb = cv2.cvtColor(gamma_img, cv2.COLOR_RGB2YCrCb)
     y, cr, cb = cv2.split(ycrcb)
@@ -7498,6 +7673,12 @@ def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
         clipLimit=_CLAHE_CLIP_LIMIT, tileGridSize=_CLAHE_TILE_GRID
     )
     y_enhanced = clahe.apply(y)
+    y_enhanced = cv2.bilateralFilter(
+        y_enhanced,
+        d=_BILATERAL_DIAMETER,
+        sigmaColor=_BILATERAL_SIGMA_COLOR,
+        sigmaSpace=_BILATERAL_SIGMA_SPACE,
+    )
 
     lo, hi = np.percentile(y_enhanced, (_STRETCH_LOW_PCT, _STRETCH_HIGH_PCT))
     if hi > lo:
@@ -7531,11 +7712,15 @@ def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
 
     hsv = cv2.cvtColor(sharpened, cv2.COLOR_RGB2HSV).astype(np.float32)
     hsv[..., 1] = np.clip(hsv[..., 1] * _SATURATION_GAIN, 0, 255)
-    final_img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    final_background = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-    cv2.copyTo(rgb, text_mask, final_img)
+    text_alpha_3d = text_alpha[..., np.newaxis]
+    final_img = (
+        rgb.astype(np.float32) * text_alpha_3d
+        + final_background.astype(np.float32) * (1.0 - text_alpha_3d)
+    )
 
-    return final_img
+    return np.clip(final_img, 0, 255).astype(np.uint8)
 
 
 def _brighten_image_bytes(data: bytes, content_type: str | None) -> bytes | None:
