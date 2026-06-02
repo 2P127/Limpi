@@ -454,6 +454,11 @@ class BrightenSpoilerButton(
         return cls(match["post_id"], image_index=int(match["index"]))
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        if not interaction.permissions.send_messages:
+            await interaction.response.send_message(
+                "이 채널에서는 밝기 올리기를 사용할 수 없어요. 당신의 권한을 확인해주세요.", ephemeral=True
+            )
+            return
         cog = interaction.client.get_cog("NewsCog")
         if not isinstance(cog, NewsCog):
             await interaction.response.send_message(
@@ -7882,14 +7887,14 @@ def _image_bytes_as_png(
         return data, content_type
 
 
-_SHADOW_GAMMA_RED = 0.42
+_SHADOW_GAMMA_RED = 0.45
 _SHADOW_GAMMA_GREEN = 0.40
 _SHADOW_GAMMA_BLUE = 0.35
 _CLAHE_CLIP_LIMIT = 3.0
 _CLAHE_TILE_GRID = (8, 8)
 _STRETCH_LOW_PCT = 1.0
 _STRETCH_HIGH_PCT = 99.0
-_SATURATION_GAIN = 1.3
+_SATURATION_GAIN = 1.0
 _NLM_LUMINANCE = 2.5
 _NLM_COLOR = 2.5
 _NLM_TEMPLATE_WINDOW = 7
