@@ -17,7 +17,8 @@ if (Test-Path "$root\.env") {
 }
 $addDataArgs += @(
     "--add-data", "$root\logo.ico;.",
-    "--add-data", "$root\img;img"
+    "--add-data", "$root\img;img",
+    "--add-data", "$root\ego_gifts.csv;."
 )
 
 $pyInstallerArgs = @(

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import csv
 import ctypes
 import gc
 import io
@@ -13,7 +14,9 @@ import socket
 import sys
 import re
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
 from urllib.parse import parse_qs, quote, urlparse
@@ -74,9 +77,14 @@ BRIGHTEN_CACHE_MAX_ITEM_BYTES = 16 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEMS = 128
 IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
+# 처리 완료된 에고 기프트 첨부 이미지(150px PNG)는 작아서 넉넉히 캐싱한다.
+EGO_GIFT_IMAGE_CACHE_MAX_ITEMS = 512
+EGO_GIFT_IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
 IMAGE_CACHE_WARM_POST_LIMIT = 10
 IMAGE_DOWNLOAD_ATTEMPTS = 3
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 15
+EGO_GIFT_FALLBACK_IMAGE_INDEX_URL = "https://www.archivum.dev/ko/limbus/egoGifts"
+EGO_GIFT_FALLBACK_IMAGE_BASE_URL = "https://cdn.archivum.dev/file/butterflytheory/limbus/ego_gift"
 DISCORD_HEARTBEAT_TIMEOUT_SECONDS = 120.0
 AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS = 90
 TCP_KEEPALIVE_IDLE_SECONDS = 30
@@ -91,6 +99,8 @@ NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
 MAX_INLINE_GALLERY_IMAGES = 10
 NEWS_UPDATE_NOTICE_COOLDOWN = timedelta(minutes=30)
 COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
+EGO_GIFT_CSV_PATH = Path("ego_gifts.csv")
+EGO_GIFT_SELECT_PAGE_SIZE = 25
 NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
 YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
@@ -693,6 +703,340 @@ class NewsPostSelectView(discord.ui.View):
         )
 
 
+class EgoGiftSearchModal(discord.ui.Modal, title="에고 기프트 검색"):
+    query = discord.ui.TextInput(
+        label="검색어",
+        placeholder="예: 재에서 재로, 화상, 배터리",
+        required=False,
+        max_length=100,
+    )
+
+    def __init__(self, parent: "EgoGiftSelectView") -> None:
+        super().__init__()
+        self.parent_view = parent
+        self.query.default = parent.query
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        self.parent_view.query = str(self.query.value).strip()
+        self.parent_view.keyword = None
+        self.parent_view.page = 0
+        self.parent_view.selected_gift = None
+        self.parent_view.refresh_items()
+        await self.parent_view.update_message(interaction)
+
+
+class EgoGiftKeywordSelect(discord.ui.Select):
+    def __init__(self, parent: "EgoGiftSelectView") -> None:
+        options = parent.keyword_options()
+        super().__init__(
+            placeholder="키워드별로 보기",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        self.parent_view.keyword = None if value == "__all__" else value
+        self.parent_view.page = 0
+        self.parent_view.selected_gift = None
+        self.parent_view.refresh_items()
+        await self.parent_view.update_message(interaction)
+
+
+class EgoGiftSelect(discord.ui.Select):
+    def __init__(self, parent: "EgoGiftSelectView") -> None:
+        options = parent.current_options()
+        super().__init__(
+            placeholder="에고 기프트를 선택해주세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=not parent.has_active_filter or not parent.filtered_gifts,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_select(interaction, self.values[0])
+
+
+class EgoGiftSelectView(discord.ui.LayoutView):
+    def __init__(
+        self,
+        cog: "NewsCog",
+        author_id: int,
+        *,
+        query: str = "",
+        private: bool = True,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.author_id = author_id
+        self.query = query.strip()
+        self.private = private
+        self.keyword: str | None = None
+        self.page = 0
+        self.selected_gift: EgoGift | None = None
+        self.refresh_items()
+
+    @property
+    def filtered_gifts(self) -> list["EgoGift"]:
+        return _filter_ego_gifts(self.query, keyword=self.keyword)
+
+    @property
+    def has_active_filter(self) -> bool:
+        return bool(self.query) or self.keyword is not None
+
+    @property
+    def max_page(self) -> int:
+        gifts = self.filtered_gifts
+        if not gifts:
+            return 0
+        return (len(gifts) - 1) // EGO_GIFT_SELECT_PAGE_SIZE
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+
+        await interaction.response.send_message(
+            "이 검색 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    def keyword_options(self) -> list[discord.SelectOption]:
+        options = [
+            discord.SelectOption(
+                label="전체 키워드",
+                value="__all__",
+                default=self.keyword is None,
+            )
+        ]
+        for keyword, count in _ego_gift_keyword_counts():
+            options.append(
+                discord.SelectOption(
+                    label=keyword[:100],
+                    value=keyword[:100],
+                    description=f"{count}개",
+                    default=self.keyword == keyword,
+                )
+            )
+        return options[:25]
+
+    def current_options(self) -> list[discord.SelectOption]:
+        if not self.has_active_filter:
+            return [
+                discord.SelectOption(
+                    label="검색 또는 키워드를 선택해주세요",
+                    value="__idle__",
+                    description="아래 검색 버튼이나 키워드 메뉴를 이용해주세요.",
+                )
+            ]
+
+        gifts = self.filtered_gifts
+        if not gifts:
+            return [
+                discord.SelectOption(
+                    label="검색 결과 없음",
+                    value="__none__",
+                    description="검색어 또는 키워드를 바꿔주세요.",
+                )
+            ]
+
+        start = self.page * EGO_GIFT_SELECT_PAGE_SIZE
+        page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
+        options: list[discord.SelectOption] = []
+        for index, gift in enumerate(page_gifts, start=start):
+            description = f"{gift.keyword or '키워드 없음'} · {_ego_gift_grade_label(gift.grade)}"
+            if gift.category:
+                description += f" · {gift.category}"
+            options.append(
+                discord.SelectOption(
+                    label=gift.name[:100],
+                    value=str(index),
+                    description=description[:100],
+                    default=self.selected_gift == gift,
+                )
+            )
+        return options
+
+    def refresh_items(self, *, image_filename: str | None = None) -> None:
+        self.clear_items()
+        if self.page > self.max_page:
+            self.page = self.max_page
+
+        container = discord.ui.Container(accent_color=discord.Color.from_rgb(179, 28, 28))
+        if self.selected_gift is not None:
+            if image_filename:
+                gallery = discord.ui.MediaGallery()
+                gallery.add_item(media=f"attachment://{image_filename}")
+                container.add_item(gallery)
+                container.add_item(discord.ui.Separator())
+            container.add_item(
+                discord.ui.TextDisplay(
+                    _truncate_component_text(
+                        _ego_gift_component_markdown(
+                            self.selected_gift,
+                            status_text=self.status_text(),
+                        ),
+                        4000,
+                    )
+                )
+            )
+        elif not self.has_active_filter:
+            container.add_item(
+                discord.ui.TextDisplay(
+                    "## **에고 기프트 검색**\n"
+                    "에고 기프트 검색을 위해 밑에서 선택해주세요!\n\n"
+                    f"-# {self.status_text()}"
+                )
+            )
+        else:
+            container.add_item(
+                discord.ui.TextDisplay(
+                    _truncate_component_text(
+                        self._gift_list_markdown(),
+                        4000,
+                    )
+                )
+            )
+
+        container.add_item(discord.ui.Separator())
+
+        keyword_row = discord.ui.ActionRow()
+        keyword_row.add_item(EgoGiftKeywordSelect(self))
+        container.add_item(keyword_row)
+
+        gift_row = discord.ui.ActionRow()
+        gift_row.add_item(EgoGiftSelect(self))
+        container.add_item(gift_row)
+
+        search_button = discord.ui.Button(
+            label="검색",
+            style=discord.ButtonStyle.primary,
+        )
+        reset_button = discord.ui.Button(
+            label="초기화",
+            style=discord.ButtonStyle.secondary,
+            disabled=not self.query and self.keyword is None,
+        )
+        prev_button = discord.ui.Button(
+            label="이전",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+        )
+        next_button = discord.ui.Button(
+            label="다음",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= self.max_page,
+        )
+        search_button.callback = self.open_search
+        reset_button.callback = self.reset_filters
+        prev_button.callback = self.previous_page
+        next_button.callback = self.next_page
+        action_row = discord.ui.ActionRow()
+        action_row.add_item(search_button)
+        action_row.add_item(reset_button)
+        action_row.add_item(prev_button)
+        action_row.add_item(next_button)
+        container.add_item(action_row)
+
+        self.add_item(container)
+
+    async def open_search(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(EgoGiftSearchModal(self))
+
+    async def reset_filters(self, interaction: discord.Interaction) -> None:
+        self.query = ""
+        self.keyword = None
+        self.page = 0
+        self.selected_gift = None
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def previous_page(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+        self.selected_gift = None
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        if self.page < self.max_page:
+            self.page += 1
+        self.selected_gift = None
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def update_message(self, interaction: discord.Interaction) -> None:
+        # build_response가 namu.wiki 이미지를 다운로드할 수 있어 3초를 넘길 수 있다.
+        # 먼저 defer로 인터랙션을 ack해 토큰 만료(10062 Unknown interaction)를 막고,
+        # 이후 15분 창을 가진 webhook(edit_original_response)으로 편집한다.
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        attachments = await self.build_response()
+        await interaction.edit_original_response(
+            attachments=attachments,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def build_response(self) -> list[discord.File]:
+        file = None
+        if self.selected_gift is not None:
+            file = await self.cog._ego_gift_image_file(self.selected_gift)
+        self.refresh_items(image_filename=file.filename if file is not None else None)
+        return [file] if file is not None else []
+
+    def _gift_list_markdown(self) -> str:
+        gifts = self.filtered_gifts
+        start = self.page * EGO_GIFT_SELECT_PAGE_SIZE
+        page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
+        if page_gifts:
+            lines = [
+                f"`{index + 1}.` **{gift.name}** · {gift.keyword or '-'} · {_ego_gift_grade_label(gift.grade)}"
+                for index, gift in enumerate(page_gifts, start=start)
+            ]
+            body = "\n".join(lines)
+        else:
+            body = "검색 결과가 없어요. 검색어를 바꾸거나 키워드를 전체로 돌려보세요."
+
+        return (
+            "## **에고 기프트 검색**\n"
+            f"{body}\n\n"
+            f"-# {self.status_text()}"
+        )
+
+    def status_text(self) -> str:
+        gifts = self.filtered_gifts
+        keyword = self.keyword or "전체"
+        query = self.query or "없음"
+        return (
+            f"검색어: {query} · 키워드: {keyword} · "
+            f"{self.page + 1}/{self.max_page + 1} 페이지 · 결과 {len(gifts)}개 · "
+            "출처: 나무위키 참고"
+        )
+
+    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
+        if value in {"__idle__", "__none__"}:
+            await interaction.response.send_message(
+                "선택할 에고 기프트가 없어요.",
+                ephemeral=True,
+            )
+            return
+        try:
+            self.selected_gift = self.filtered_gifts[int(value)]
+        except (IndexError, ValueError):
+            await interaction.response.send_message(
+                "선택한 에고 기프트를 찾지 못했어요.",
+                ephemeral=True,
+            )
+            return
+        self.refresh_items()
+        await self.update_message(interaction)
+
+
 class ExternalNewsSendConfirmView(discord.ui.View):
     def __init__(self, author_id: int) -> None:
         super().__init__(timeout=30)
@@ -763,6 +1107,13 @@ class NewsCog(commands.Cog):
         self._brighten_cache_bytes: int = 0
         self._brighten_tasks: dict[str, asyncio.Task[bytes | None]] = {}
         self._brighten_semaphore = asyncio.Semaphore(BRIGHTEN_PROCESS_CONCURRENCY)
+        self._ego_gift_image_fallbacks: dict[str, str] | None = None
+        # 처리 완료(PNG 변환 + 150px 리사이즈)된 첨부 바이트를 기프트 이름으로 캐싱.
+        # 연속 전환/다중 사용자 조회 시 재다운로드·재인코딩을 막는다.
+        self._ego_gift_image_cache: dict[str, bytes] = {}
+        self._ego_gift_image_cache_bytes: int = 0
+        # 동일 기프트를 동시에 조회할 때 빌드를 한 번만 수행하도록 in-flight 태스크 공유.
+        self._ego_gift_image_tasks: dict[str, asyncio.Task[bytes | None]] = {}
         self._last_poll_at: datetime | None = None
         self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
@@ -1886,6 +2237,121 @@ class NewsCog(commands.Cog):
             self._remember_interaction_user(interaction)
             return self.storage.get_user_settings(interaction.user.id).news_banner
         return self.storage.get_settings(interaction.guild_id).notification_banner
+
+    async def _ego_gift_image_file(self, gift: EgoGift) -> discord.File | None:
+        data = await self._get_ego_gift_image_bytes(gift)
+        if data is None:
+            return None
+        # discord.File은 1회용(스트림 소비)이라 캐시 바이트로 매번 새 인스턴스를 만든다.
+        return discord.File(io.BytesIO(data), filename="ego_gift_image.png")
+
+    async def _get_ego_gift_image_bytes(self, gift: EgoGift) -> bytes | None:
+        cache_key = gift.name
+        cached = self._ego_gift_image_cache.get(cache_key)
+        if cached is not None:
+            # LRU: 최근 사용 항목을 뒤로 보낸다.
+            self._ego_gift_image_cache[cache_key] = self._ego_gift_image_cache.pop(cache_key)
+            return cached
+
+        # 동일 기프트를 동시에 조회하면 진행 중인 빌드 태스크를 공유해 중복 다운로드를 막는다.
+        task = self._ego_gift_image_tasks.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(self._build_ego_gift_image_bytes(gift))
+            self._ego_gift_image_tasks[cache_key] = task
+            task.add_done_callback(
+                lambda _t, key=cache_key: self._ego_gift_image_tasks.pop(key, None)
+            )
+
+        data = await task
+        if data is not None:
+            self._cache_ego_gift_image(cache_key, data)
+        return data
+
+    async def _build_ego_gift_image_bytes(self, gift: EgoGift) -> bytes | None:
+        image_url = _normalize_image_url(gift.image_url)
+        if not image_url:
+            return None
+
+        downloaded = await self._download_image(image_url)
+        if downloaded is None:
+            fallback_url = await self._ego_gift_fallback_image_url(gift.name)
+            if fallback_url:
+                downloaded = await self._download_image(fallback_url)
+                if downloaded is not None:
+                    image_url = fallback_url
+        if downloaded is None:
+            LOGGER.warning("에고 기프트 이미지 첨부 변환 실패: %s (%s)", gift.name, image_url)
+            return None
+
+        data, content_type = downloaded
+        # PIL 디코드/리사이즈는 CPU 작업이라 스레드로 빼서 이벤트 루프를 막지 않는다.
+        return await asyncio.to_thread(
+            _process_ego_gift_image_bytes, data, content_type
+        )
+
+    def _cache_ego_gift_image(self, cache_key: str, data: bytes) -> None:
+        prev = self._ego_gift_image_cache.pop(cache_key, None)
+        if prev is not None:
+            self._ego_gift_image_cache_bytes -= len(prev)
+        self._ego_gift_image_cache[cache_key] = data
+        self._ego_gift_image_cache_bytes += len(data)
+        while self._ego_gift_image_cache and (
+            len(self._ego_gift_image_cache) > EGO_GIFT_IMAGE_CACHE_MAX_ITEMS
+            or self._ego_gift_image_cache_bytes > EGO_GIFT_IMAGE_CACHE_MAX_BYTES
+        ):
+            oldest_key, oldest_data = next(iter(self._ego_gift_image_cache.items()))
+            self._ego_gift_image_cache.pop(oldest_key, None)
+            self._ego_gift_image_cache_bytes -= len(oldest_data)
+
+    async def _ego_gift_fallback_image_url(self, name: str) -> str | None:
+        if self._ego_gift_image_fallbacks is None:
+            self._ego_gift_image_fallbacks = await self._load_ego_gift_image_fallbacks()
+        return self._ego_gift_image_fallbacks.get(name)
+
+    async def _load_ego_gift_image_fallbacks(self) -> dict[str, str]:
+        timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+        try:
+            async with self.session.get(
+                EGO_GIFT_FALLBACK_IMAGE_INDEX_URL,
+                timeout=timeout,
+                headers=_image_request_headers(EGO_GIFT_FALLBACK_IMAGE_INDEX_URL),
+            ) as response:
+                if response.status >= 400:
+                    LOGGER.warning(
+                        "에고 기프트 대체 이미지 목록 요청 실패 (HTTP %s).",
+                        response.status,
+                    )
+                    return {}
+                html = await response.text()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            LOGGER.warning("에고 기프트 대체 이미지 목록 요청 실패.", exc_info=True)
+            return {}
+
+        match = re.search(
+            r"<script[^>]*>\s*(\{\"egoGifts\":.*?\})\s*</script>",
+            html,
+            flags=re.DOTALL,
+        )
+        if match is None:
+            LOGGER.warning("에고 기프트 대체 이미지 목록을 찾지 못했습니다.")
+            return {}
+
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            LOGGER.warning("에고 기프트 대체 이미지 목록 파싱 실패.", exc_info=True)
+            return {}
+
+        fallbacks: dict[str, str] = {}
+        for item in payload.get("egoGifts", []):
+            if not isinstance(item, dict):
+                continue
+            gift_name = item.get("name")
+            gift_id = item.get("ID")
+            if not gift_name or gift_id is None:
+                continue
+            fallbacks[str(gift_name)] = f"{EGO_GIFT_FALLBACK_IMAGE_BASE_URL}/{gift_id}.png"
+        return fallbacks
 
     def _post_variant_for_language(
         self,
@@ -3406,7 +3872,11 @@ class NewsCog(commands.Cog):
         timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
         for attempt in range(1, IMAGE_DOWNLOAD_ATTEMPTS + 1):
             try:
-                async with self.session.get(url, timeout=timeout) as response:
+                async with self.session.get(
+                    url,
+                    timeout=timeout,
+                    headers=_image_request_headers(url),
+                ) as response:
                     if 400 <= response.status < 500:
                         LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
                         return None
@@ -6001,6 +6471,36 @@ class NewsCog(commands.Cog):
                     interaction.guild_id, interaction.channel_id, message
                 )
 
+    @app_commands.command(name="에고기프트", description="거울 던전 에고 기프트 정보를 검색합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(query="검색어", private="나만보기")
+    @app_commands.describe(
+        query="검색어입니다. 비워두면 전체 목록을 엽니다.",
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+    )
+    @app_commands.choices(private=BOOLEAN_CHOICES)
+    async def ego_gift(
+        self,
+        interaction: discord.Interaction,
+        query: str | None = None,
+        private: app_commands.Choice[str] | None = None,
+    ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        view = EgoGiftSelectView(
+            self,
+            interaction.user.id,
+            query=query or "",
+            private=private_value,
+        )
+        files = await view.build_response()
+        await interaction.response.send_message(
+            view=view,
+            files=files,
+            ephemeral=private_value,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @app_commands.command(
         name="소식보내기",
         description="저장된 소식을 지정한 채널에 맨션과 함께 보냅니다.",
@@ -6127,8 +6627,10 @@ class NewsCog(commands.Cog):
         container.add_item(
             discord.ui.TextDisplay(
                 "### ℹ️ **기타**\n"
+                "> `/에고기프트` — 거울 던전 에고 기프트 정보 검색\n"
                 "> `/명령어` — 이 안내 보기\n"
-                "> `/크레딧` — 림피봇 제작 크레딧 보기"
+                "> `/크레딧` — 림피봇 제작 크레딧 보기\n"
+                "-# 에고 기프트 데이터는 나무위키를 참고하여 만들었습니다."
             )
         )
         container.add_item(discord.ui.Separator())
@@ -6155,6 +6657,7 @@ class NewsCog(commands.Cog):
             description=(
                 "림피(Limpi) 봇 By. 2P\n"
                 "알림 배너 그림 By. @gamstergd7\n"
+                "에고 기프트 데이터 참고: 나무위키\n"
                 "치지직 알림 구현 참고: [junah201/chzzk-discord-bot](https://github.com/junah201/chzzk-discord-bot)"
             ),
             color=discord.Color.from_rgb(179, 28, 28),
@@ -6253,12 +6756,229 @@ class NewsCog(commands.Cog):
         )
 
 
+@dataclass(frozen=True)
+class EgoGift:
+    name: str
+    grade: str
+    keyword: str
+    category: str
+    related: str
+    first_seen: str
+    upgradeable: str
+    sale_price: str
+    purchasable: str
+    synthesis: str
+    hard_only: str
+    extreme_only: str
+    theme_pack_only: str
+    recipe: str
+    effect: str
+    image_url: str
+
+
+def _normalize_search_text(value: str) -> str:
+    return re.sub(r"\s+", "", value).casefold()
+
+
+@lru_cache(maxsize=1)
+def _load_ego_gifts() -> tuple[EgoGift, ...]:
+    path = _resource_path(EGO_GIFT_CSV_PATH)
+    if not path.exists():
+        LOGGER.warning("에고 기프트 CSV 파일을 찾지 못했습니다: %s", path)
+        return ()
+
+    gifts: list[EgoGift] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            name = (row.get("이름") or "").strip()
+            if not name:
+                continue
+            gifts.append(
+                EgoGift(
+                    name=name,
+                    grade=(row.get("등급") or "").strip(),
+                    keyword=(row.get("키워드") or "").strip(),
+                    category=(row.get("카테고리") or "").strip(),
+                    related=(row.get("연관") or "").strip(),
+                    first_seen=(row.get("첫_등장") or "").strip(),
+                    upgradeable=(row.get("강화_가능") or "").strip(),
+                    sale_price=(row.get("판매_가격") or "").strip(),
+                    purchasable=(row.get("구매_가능") or "").strip(),
+                    synthesis=(row.get("합성_기프트") or "").strip(),
+                    hard_only=(row.get("하드_한정") or "").strip(),
+                    extreme_only=(row.get("익스트림_한정") or "").strip(),
+                    theme_pack_only=(row.get("테마팩_한정") or "").strip(),
+                    recipe=(row.get("조합식") or "").strip(),
+                    effect=(row.get("효과") or "").strip(),
+                    image_url=(row.get("이미지_URL") or "").strip(),
+                )
+            )
+    return tuple(sorted(gifts, key=_ego_gift_sort_key))
+
+
+def _find_ego_gifts(query: str) -> list[EgoGift]:
+    return _filter_ego_gifts(query)
+
+
+def _ego_gift_sort_key(gift: EgoGift) -> tuple[int, str, str]:
+    return _ego_gift_grade_value(gift.grade), gift.keyword, gift.name
+
+
+def _ego_gift_grade_value(grade: str) -> int:
+    normalized = grade.strip().upper()
+    roman_grades = {
+        "Ⅰ": 1,
+        "I": 1,
+        "Ⅱ": 2,
+        "II": 2,
+        "Ⅲ": 3,
+        "III": 3,
+        "Ⅳ": 4,
+        "IV": 4,
+        "Ⅴ": 5,
+        "V": 5,
+    }
+    if normalized in roman_grades:
+        return roman_grades[normalized]
+    try:
+        return int(normalized)
+    except ValueError:
+        return 999
+
+
+def _filter_ego_gifts(query: str, *, keyword: str | None = None) -> list[EgoGift]:
+    normalized_query = _normalize_search_text(query)
+    gifts = [
+        gift
+        for gift in _load_ego_gifts()
+        if keyword is None or gift.keyword == keyword
+    ]
+    if not normalized_query:
+        return gifts
+
+    exact = [
+        gift
+        for gift in gifts
+        if _normalize_search_text(gift.name) == normalized_query
+    ]
+    if exact:
+        return exact
+
+    startswith = [
+        gift
+        for gift in gifts
+        if _normalize_search_text(gift.name).startswith(normalized_query)
+    ]
+    contains = [
+        gift
+        for gift in gifts
+        if normalized_query in _normalize_search_text(gift.name)
+        and gift not in startswith
+    ]
+    return [*startswith, *contains]
+
+
+@lru_cache(maxsize=1)
+def _ego_gift_keyword_counts() -> tuple[tuple[str, int], ...]:
+    counts: dict[str, int] = {}
+    for gift in _load_ego_gifts():
+        if not gift.keyword:
+            continue
+        counts[gift.keyword] = counts.get(gift.keyword, 0) + 1
+    return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _ego_gift_component_markdown(gift: EgoGift, *, status_text: str) -> str:
+    detail_lines = [
+        ("등급", _ego_gift_grade_label(gift.grade), False),
+        ("강화 여부", gift.upgradeable, False),
+        ("판매 가격", gift.sale_price, False),
+        ("구매 가능", _format_ego_gift_flag(gift.purchasable), False),
+        ("합성 기프트", _format_ego_gift_flag(gift.synthesis), False),
+        ("하드 한정", _format_ego_gift_flag(gift.hard_only), False),
+        ("익스트림 한정", _format_ego_gift_flag(gift.extreme_only), True),
+        ("테마팩 한정", gift.theme_pack_only, True),
+    ]
+    if gift.recipe:
+        detail_lines.append(("조합식", gift.recipe, True))
+
+    quoted_details = "\n".join(
+        f"> {'-# ' if muted else ''}{label}: **{value or '-'}**"
+        for label, value, muted in detail_lines
+    )
+    return (
+        f"## **{gift.name}**\n"
+        f"-# 분류: **{gift.keyword or '-'}**\n\n"
+        "## **기프트 상세 정보**\n"
+        f"{quoted_details}\n\n"
+        "## **효과**\n"
+        f"{_format_ego_gift_effect_markdown(gift.effect)}\n\n"
+        f"-# {status_text}"
+    )
+
+
+def _format_ego_gift_flag(value: str) -> str:
+    return value.strip() or "-"
+
+
+def _ego_gift_grade_label(grade: str) -> str:
+    value = grade.strip()
+    return f"{value}등급" if value else "-"
+
+
+def _format_ego_gift_effect_markdown(effect: str) -> str:
+    normalized_effect = effect.replace("\r\n", "\n").replace("\r", "\n")
+    if "|" in normalized_effect:
+        raw_parts = normalized_effect.split("|")
+    else:
+        raw_parts = normalized_effect.split("\n")
+    parts = [part.strip() for part in raw_parts if part.strip()]
+    if not parts:
+        return "-"
+
+    heading_labels = {
+        "기본 효과": "기본 효과",
+        "+": "+ (1강)",
+        "++": "++ (2강)",
+    }
+    lines: list[str] = []
+    for part in parts:
+        heading = heading_labels.get(part)
+        if heading is not None:
+            lines.append(f"### **• {heading}**")
+        else:
+            lines.append(part)
+    return "\n".join(lines)
+
+
 def _filter_image_urls(urls: list[str]) -> list[str]:
     return [
         url
         for url in urls
         if url and YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT not in url
     ]
+
+
+def _normalize_image_url(url: str) -> str:
+    value = url.strip()
+    if value.startswith("//"):
+        return f"https:{value}"
+    return value
+
+
+def _image_request_headers(url: str) -> dict[str, str]:
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0 Safari/537.36 LimpiBot/1.0"
+        )
+    }
+    hostname = urlparse(url).hostname or ""
+    if hostname.endswith("namu.wiki"):
+        headers["Referer"] = "https://namu.wiki/"
+    return headers
 
 
 def _resource_path(relative_path: Path) -> Path:
@@ -7887,16 +8607,52 @@ def _image_bytes_as_png(
         return data, content_type
 
 
-_SHADOW_GAMMA_RED = 0.45
-_SHADOW_GAMMA_GREEN = 0.40
-_SHADOW_GAMMA_BLUE = 0.35
-_CLAHE_CLIP_LIMIT = 3.0
+EGO_GIFT_IMAGE_MAX_SIZE = 150
+
+
+def _resize_image_to_fit(data: bytes, max_size: int) -> bytes:
+    """비율을 유지한 채 긴 변이 max_size가 되도록 리사이즈한다.
+
+    가로/세로 비율이 달라도 왜곡되지 않으며, max_size x max_size 박스 안에 들어간다.
+    """
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            if image.mode not in {"RGB", "RGBA"}:
+                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
+            width, height = image.size
+            longest = max(width, height)
+            if longest == 0:
+                return data
+            scale = max_size / longest
+            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+            resized = image.resize(new_size, Image.LANCZOS)
+            output = io.BytesIO()
+            resized.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+    except (UnidentifiedImageError, OSError):
+        LOGGER.warning("에고 기프트 이미지 크기 조정에 실패해 원본 크기로 보냅니다.")
+        return data
+
+
+def _process_ego_gift_image_bytes(data: bytes, content_type: str | None) -> bytes:
+    """에고 기프트 첨부 이미지를 PNG로 변환하고 150px 박스에 맞춰 리사이즈한다.
+
+    CPU 바운드 작업이므로 asyncio.to_thread로 호출한다.
+    """
+    data, content_type = _image_bytes_as_png(data, content_type)
+    return _resize_image_to_fit(data, EGO_GIFT_IMAGE_MAX_SIZE)
+
+
+_SHADOW_GAMMA_RED = 0.43
+_SHADOW_GAMMA_GREEN = 0.39
+_SHADOW_GAMMA_BLUE = 0.34
+_CLAHE_CLIP_LIMIT = 2.8
 _CLAHE_TILE_GRID = (8, 8)
-_STRETCH_LOW_PCT = 1.0
-_STRETCH_HIGH_PCT = 99.0
-_SATURATION_GAIN = 1.0
-_NLM_LUMINANCE = 2.5
-_NLM_COLOR = 2.5
+_STRETCH_LOW_PCT = 0.8
+_STRETCH_HIGH_PCT = 99.2
+_SATURATION_GAIN = 1.12
+_NLM_LUMINANCE = 2.2
+_NLM_COLOR = 2.2
 _NLM_TEMPLATE_WINDOW = 7
 _NLM_SEARCH_WINDOW = 21
 _TEXT_MASK_HUE_LOW = np.array([80, 50, 100], dtype=np.uint8)
@@ -7905,11 +8661,17 @@ _TEXT_MASK_DILATE_KERNEL = (5, 5)
 _TEXT_MASK_DILATE_ITERATIONS = 1
 _TEXT_MASK_BLUR_KERNEL = (5, 5)
 _BILATERAL_DIAMETER = 7
-_BILATERAL_SIGMA_COLOR = 64
-_BILATERAL_SIGMA_SPACE = 56
-_UNSHARP_SIGMA = 2.0
-_UNSHARP_AMOUNT = 1.35
-_UNSHARP_THRESHOLD = 0.5
+_BILATERAL_SIGMA_COLOR = 72
+_BILATERAL_SIGMA_SPACE = 64
+_SHADOW_COLOR_THRESHOLD = 150.0
+_SHADOW_COOL_RED_GAIN = 0.92
+_SHADOW_COOL_GREEN_GAIN = 1.02
+_SHADOW_COOL_BLUE_GAIN = 1.12
+_SHADOW_LIFT_GAIN = 0.10
+_MIDTONE_DETAIL_AMOUNT = 0.16
+_UNSHARP_SIGMA = 1.35
+_UNSHARP_AMOUNT = 1.48
+_UNSHARP_THRESHOLD = 0.0
 
 
 def _build_gamma_lut(gamma: float) -> "np.ndarray":
@@ -7965,6 +8727,18 @@ def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
         y_stretched = y_enhanced
 
     restored = cv2.cvtColor(cv2.merge((y_stretched, cr, cb)), cv2.COLOR_YCrCb2RGB)
+    shadow_weight = np.clip(
+        (_SHADOW_COLOR_THRESHOLD - y_stretched.astype(np.float32))
+        / _SHADOW_COLOR_THRESHOLD,
+        0.0,
+        1.0,
+    )[..., np.newaxis]
+    restored_float = restored.astype(np.float32)
+    restored_float[..., 0] *= 1.0 + ((_SHADOW_COOL_RED_GAIN - 1.0) * shadow_weight[..., 0])
+    restored_float[..., 1] *= 1.0 + ((_SHADOW_COOL_GREEN_GAIN - 1.0) * shadow_weight[..., 0])
+    restored_float[..., 2] *= 1.0 + ((_SHADOW_COOL_BLUE_GAIN - 1.0) * shadow_weight[..., 0])
+    restored_float += (255.0 - restored_float) * shadow_weight * _SHADOW_LIFT_GAIN
+    restored = np.clip(restored_float, 0, 255).astype(np.uint8)
 
     denoised = cv2.fastNlMeansDenoisingColored(
         restored,
@@ -7973,6 +8747,20 @@ def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
         _NLM_COLOR,
         _NLM_TEMPLATE_WINDOW,
         _NLM_SEARCH_WINDOW,
+    )
+
+    detail_base = cv2.bilateralFilter(
+        denoised,
+        d=5,
+        sigmaColor=36,
+        sigmaSpace=36,
+    )
+    denoised = cv2.addWeighted(
+        denoised,
+        1.0 + _MIDTONE_DETAIL_AMOUNT,
+        detail_base,
+        -_MIDTONE_DETAIL_AMOUNT,
+        0,
     )
 
     blur = cv2.GaussianBlur(denoised, (0, 0), _UNSHARP_SIGMA)
