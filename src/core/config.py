@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-BOT_VERSION = "0.2.6"
+BOT_VERSION = "0.2.7"
 
 SUPPORTED_STEAM_LANGUAGES = {"koreana", "english", "japanese"}
 SUPPORTED_COMMAND_SYNC_MODES = {"global", "guild"}
@@ -319,7 +319,7 @@ class AppConfig:
                 "TWITTER_MAX_BACKOFF_SECONDS", 600, minimum=1
             ),
             twitter_announce_max_age_seconds=_get_int_or_default(
-                "TWITTER_ANNOUNCE_MAX_AGE_SECONDS", 0, minimum=0
+                "TWITTER_ANNOUNCE_MAX_AGE_SECONDS", 24 * 60 * 60, minimum=0
             ),
             x_news_probe=_get_bool("X_NEWS_PROBE", False),
         )

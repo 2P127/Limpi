@@ -129,6 +129,7 @@ BROADCAST_SOURCE_CHOICES = [
 NEWS_SOURCE_BOTH = "both"
 NEWS_SOURCE_STEAM = "steam"
 NEWS_SOURCE_TWITTER = "twitter"
+TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS = 24 * 60 * 60
 NEWS_SOURCE_CHOICES = [
     app_commands.Choice(name="Steam & X(트위터)", value=NEWS_SOURCE_BOTH),
     app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
@@ -209,6 +210,74 @@ MAINTENANCE_UPDATE_DESCRIPTION = (
     "지금 림버스 컴퍼니가 점검이 끝나고 업데이트가 되었어요! "
     "스팀 또는 앱 스토어에 들어가서 림버스를 업데이트 해주세요! <3"
 )
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _internet_error_detail(exc: BaseException) -> tuple[str, str] | None:
+    dns_error_type = getattr(aiohttp, "ClientConnectorDNSError", None)
+    for item in _exception_chain(exc):
+        if dns_error_type is not None and isinstance(item, dns_error_type):
+            return "DNS 확인 실패", type(item).__name__
+        if isinstance(item, socket.gaierror):
+            return "DNS 확인 실패", type(item).__name__
+        if isinstance(item, (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)):
+            return "요청 시간 초과", type(item).__name__
+        if isinstance(item, aiohttp.ClientResponseError):
+            return "HTTP 응답 오류", type(item).__name__
+        if isinstance(item, aiohttp.ClientConnectorError):
+            return "서버 연결 실패", type(item).__name__
+        if isinstance(item, aiohttp.ClientConnectionError):
+            return "네트워크 연결 오류", type(item).__name__
+        if isinstance(item, aiohttp.ClientError):
+            return "네트워크 요청 오류", type(item).__name__
+        if isinstance(item, ConnectionError):
+            return "네트워크 연결 오류", type(item).__name__
+
+    message = str(exc)
+    if isinstance(exc, XClientError) and any(
+        marker in message
+        for marker in (
+            "네트워크",
+            "Cannot connect",
+            "getaddrinfo",
+            "Name or service not known",
+            "Temporary failure in name resolution",
+            "timed out",
+            "Timeout",
+        )
+    ):
+        return "X API 네트워크 오류", type(exc).__name__
+    return None
+
+
+def _is_internet_exception(exc: BaseException) -> bool:
+    return _internet_error_detail(exc) is not None
+
+
+def _log_internet_exception(
+    message: str,
+    exc: BaseException,
+    *,
+    level: int = logging.WARNING,
+) -> None:
+    reason, error_type = _internet_error_detail(exc) or ("인터넷 관련 오류", type(exc).__name__)
+    LOGGER.log(level, "%s: %s (%s)", message, reason, error_type)
+    LOGGER.debug(
+        "%s 전체 오류: %s",
+        message,
+        exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
 
 
 class LoggingCommandTree(app_commands.CommandTree):
@@ -1117,6 +1186,10 @@ class NewsCog(commands.Cog):
         self._last_poll_at: datetime | None = None
         self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
+        self._news_recovery_baseline_pending = False
+        self._twitter_recovery_baseline_pending = False
+        self._chzzk_recovery_baseline_pending = False
+        self._youtube_recovery_baseline_pending = False
         self._in_high_frequency_window: bool = False
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
@@ -1272,13 +1345,20 @@ class NewsCog(commands.Cog):
                     LOGGER.info("뉴스 고빈도 추적 종료.")
                 self._in_high_frequency_window = currently_in_window
 
+                if not self.bot.is_ready():
+                    self._news_recovery_baseline_pending = True
+                    return
                 if not self._should_poll_now(now):
                     return
                 self._last_poll_at = now
                 await self._poll_once()
                 self._startup_synced = True
-            except Exception:
-                LOGGER.exception("뉴스 폴링 실패.")
+            except Exception as exc:
+                if _is_internet_exception(exc):
+                    self._news_recovery_baseline_pending = True
+                    _log_internet_exception("뉴스 폴링 실패", exc)
+                else:
+                    LOGGER.exception("뉴스 폴링 실패.")
 
     @poll_news.before_loop
     async def before_poll_news(self) -> None:
@@ -1300,14 +1380,25 @@ class NewsCog(commands.Cog):
                     LOGGER.info("X 게시물 추적 일시 중지: 추적 시간대가 아닙니다.")
                 self._in_twitter_tracking_window = currently_in_window
 
+                if not self.bot.is_ready():
+                    self._twitter_recovery_baseline_pending = True
+                    return
                 if not self._should_poll_twitter_now(now):
                     return
                 self._last_twitter_poll_at = now
                 await self._poll_twitter_once()
             except XClientError as exc:
-                LOGGER.warning("X 게시물 자동 확인 실패: %s", exc)
-            except Exception:
-                LOGGER.exception("X 게시물 자동 확인 실패.")
+                self._twitter_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("X 게시물 자동 확인 실패", exc)
+                else:
+                    LOGGER.warning("X 게시물 자동 확인 실패: %s", exc)
+            except Exception as exc:
+                self._twitter_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("X 게시물 자동 확인 실패", exc)
+                else:
+                    LOGGER.exception("X 게시물 자동 확인 실패.")
 
     @poll_twitter_posts.before_loop
     async def before_poll_twitter_posts(self) -> None:
@@ -1317,11 +1408,20 @@ class NewsCog(commands.Cog):
     async def poll_chzzk_live(self) -> None:
         async with self._chzzk_poll_lock:
             try:
+                if not self.bot.is_ready():
+                    self._chzzk_recovery_baseline_pending = True
+                    return
                 await self._poll_chzzk_once()
-            except aiohttp.ClientError as exc:
-                LOGGER.warning("치지직 라이브 자동 확인 실패: %s", exc)
-            except Exception:
-                LOGGER.exception("치지직 라이브 자동 확인 실패.")
+                self._chzzk_recovery_baseline_pending = False
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                self._chzzk_recovery_baseline_pending = True
+                _log_internet_exception("치지직 라이브 자동 확인 실패", exc)
+            except Exception as exc:
+                self._chzzk_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("치지직 라이브 자동 확인 실패", exc)
+                else:
+                    LOGGER.exception("치지직 라이브 자동 확인 실패.")
 
     @poll_chzzk_live.before_loop
     async def before_poll_chzzk_live(self) -> None:
@@ -1331,11 +1431,20 @@ class NewsCog(commands.Cog):
     async def poll_youtube_live(self) -> None:
         async with self._youtube_poll_lock:
             try:
+                if not self.bot.is_ready():
+                    self._youtube_recovery_baseline_pending = True
+                    return
                 await self._poll_youtube_once()
+                self._youtube_recovery_baseline_pending = False
             except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
-                LOGGER.warning("유튜브 라이브 자동 확인 실패: %s", exc)
-            except Exception:
-                LOGGER.exception("유튜브 라이브 자동 확인 실패.")
+                self._youtube_recovery_baseline_pending = True
+                _log_internet_exception("유튜브 라이브 자동 확인 실패", exc)
+            except Exception as exc:
+                self._youtube_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("유튜브 라이브 자동 확인 실패", exc)
+                else:
+                    LOGGER.exception("유튜브 라이브 자동 확인 실패.")
 
     @poll_youtube_live.before_loop
     async def before_poll_youtube_live(self) -> None:
@@ -1568,7 +1677,27 @@ class NewsCog(commands.Cog):
         if not targets_by_language:
             return 0
 
-        posts_by_language, changed_post_ids = await self._combined_posts_by_language()
+        posts_by_language, changed_post_ids, had_upstream_failure = await self._combined_posts_by_language()
+        if had_upstream_failure:
+            self._news_recovery_baseline_pending = True
+            LOGGER.info(
+                "뉴스 업스트림 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
+                "다음 정상 확인에서 기준선을 갱신합니다."
+            )
+            return 0
+
+        if self._news_recovery_baseline_pending:
+            updated = self._mark_news_targets_recovery_baseline(
+                targets_by_language,
+                posts_by_language,
+            )
+            self._news_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 뉴스 기준선을 갱신했습니다. 누적 소식 자동 전송은 건너뜁니다 "
+                "(targets=%s).",
+                updated,
+            )
+            return 0
 
         announced_count = 0
         target_tasks: list[asyncio.Task[int]] = []
@@ -1607,24 +1736,32 @@ class NewsCog(commands.Cog):
             results = await asyncio.gather(*target_tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
-                    LOGGER.error(
-                        "뉴스 자동 전송 대상 처리 실패.",
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
+                    if _is_internet_exception(result):
+                        _log_internet_exception(
+                            "뉴스 자동 전송 대상 처리 실패",
+                            result,
+                            level=logging.ERROR,
+                        )
+                    else:
+                        LOGGER.error(
+                            "뉴스 자동 전송 대상 처리 실패.",
+                            exc_info=(type(result), result, result.__traceback__),
+                        )
                     continue
                 announced_count += result
 
         await self._broadcast_post_updates(changed_post_ids)
         return announced_count
 
-    async def _sync_global_news_cache(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
+    async def _sync_global_news_cache(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
         if self.news_source is None:
-            return {}, []
+            return {}, [], False
 
         posts_by_language: dict[str, list[NewsPost]] = {}
         fetched_posts: list[NewsPost] = []
         newest_new_posts: list[tuple[str, NewsPost]] = []
         changed: list[str] = []
+        had_fetch_failure = False
         results = await asyncio.gather(
             *(
                 self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
@@ -1634,11 +1771,16 @@ class NewsCog(commands.Cog):
         )
         for language, result in zip(SYNC_LANGUAGES, results):
             if isinstance(result, Exception):
-                LOGGER.warning(
-                    "Steam 뉴스 자동 확인 실패: language=%s. 저장된 소식을 사용합니다.",
-                    language,
-                    exc_info=(type(result), result, result.__traceback__),
-                )
+                had_fetch_failure = True
+                message = f"Steam 뉴스 자동 확인 실패: language={language}. 저장된 소식을 사용합니다"
+                if _is_internet_exception(result):
+                    _log_internet_exception(message, result)
+                else:
+                    LOGGER.warning(
+                        "%s.",
+                        message,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
                 posts = self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
             else:
                 posts = result
@@ -1658,9 +1800,9 @@ class NewsCog(commands.Cog):
                     post.url,
                 )
             self._schedule_image_cache_warmup(fetched_posts)
-        return posts_by_language, changed
+        return posts_by_language, changed, had_fetch_failure
 
-    async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str]]:
+    async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
         now = datetime.now(timezone.utc)
         news_task = asyncio.create_task(self._sync_global_news_cache())
         if self._is_twitter_tracking_window(now):
@@ -1673,24 +1815,44 @@ class NewsCog(commands.Cog):
         else:
             news_result = await news_task
             twitter_result = (0, [])
+        had_upstream_failure = False
         if isinstance(news_result, Exception):
-            LOGGER.warning(
-                "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
-                exc_info=(type(news_result), news_result, news_result.__traceback__),
-            )
+            had_upstream_failure = True
+            if _is_internet_exception(news_result):
+                _log_internet_exception(
+                    "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다",
+                    news_result,
+                )
+            else:
+                LOGGER.warning(
+                    "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
+                    exc_info=(type(news_result), news_result, news_result.__traceback__),
+                )
             posts_by_language = self._cached_posts_by_language()
             changed = []
         else:
-            posts_by_language, changed = news_result
+            posts_by_language, changed, steam_had_failure = news_result
+            had_upstream_failure = had_upstream_failure or steam_had_failure
 
         if isinstance(twitter_result, XClientError):
-            LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
+            had_upstream_failure = True
+            if _is_internet_exception(twitter_result):
+                _log_internet_exception("X 게시물 자동 확인 실패", twitter_result)
+            else:
+                LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
             twitter_posts = []
         elif isinstance(twitter_result, Exception):
-            LOGGER.warning(
-                "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다.",
-                exc_info=(type(twitter_result), twitter_result, twitter_result.__traceback__),
-            )
+            had_upstream_failure = True
+            if _is_internet_exception(twitter_result):
+                _log_internet_exception(
+                    "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다",
+                    twitter_result,
+                )
+            else:
+                LOGGER.warning(
+                    "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다.",
+                    exc_info=(type(twitter_result), twitter_result, twitter_result.__traceback__),
+                )
             twitter_posts = []
         else:
             _, twitter_posts = twitter_result
@@ -1722,7 +1884,29 @@ class NewsCog(commands.Cog):
                 )
                 combined = [*steam_language_posts, *twitter_news]
                 posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
-        return posts_by_language, changed
+        return posts_by_language, changed, had_upstream_failure
+
+    def _mark_news_targets_recovery_baseline(
+        self,
+        targets_by_language: dict[str, list[GuildNewsTarget]],
+        posts_by_language: dict[str, list[NewsPost]],
+    ) -> int:
+        updated = 0
+        for language, target_list in targets_by_language.items():
+            posts = posts_by_language.get(language, [])
+            if not posts:
+                continue
+            for target in target_list:
+                settings = self.storage.get_settings(target.guild_id)
+                target_posts = self._posts_for_source_mode(posts, settings)[:NEWS_POST_LIMIT]
+                if not target_posts:
+                    continue
+                post_ids = [post.post_id for post in target_posts]
+                self.storage.mark_news_target_posts_seen(target.target_id, post_ids)
+                self.storage.mark_posts_seen(target.guild_id, post_ids)
+                self.storage.set_last_seen_post_id(target.guild_id, target_posts[0].post_id)
+                updated += 1
+        return updated
 
     def _cached_posts_by_language(self) -> dict[str, list[NewsPost]]:
         return {
@@ -2323,8 +2507,8 @@ class NewsCog(commands.Cog):
                     )
                     return {}
                 html = await response.text()
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            LOGGER.warning("에고 기프트 대체 이미지 목록 요청 실패.", exc_info=True)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            _log_internet_exception("에고 기프트 대체 이미지 목록 요청 실패", exc)
             return {}
 
         match = re.search(
@@ -2439,7 +2623,10 @@ class NewsCog(commands.Cog):
         if channel is None:
             return 0
 
-        new_posts = self._new_posts_for_news_target(settings, target, posts)
+        new_posts = self._auto_sendable_news_posts(
+            self._new_posts_for_news_target(settings, target, posts),
+            target=target,
+        )
         if not new_posts:
             self.storage.mark_news_target_posts_seen(
                 target.target_id,
@@ -2503,6 +2690,36 @@ class NewsCog(commands.Cog):
         self.storage.mark_posts_seen(target.guild_id, seen_posts)
         self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
         return announced
+
+    def _auto_sendable_news_posts(
+        self,
+        posts: list[NewsPost],
+        *,
+        target: GuildNewsTarget | None = None,
+    ) -> list[NewsPost]:
+        if not posts:
+            return []
+
+        created_after = _as_utc_datetime(target.created_at) if target is not None else None
+        max_twitter_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
+        filtered: list[NewsPost] = []
+        for post in posts:
+            created = _as_utc_datetime(post.created_at)
+            if created is None:
+                continue
+            if created_after is not None and created <= created_after:
+                continue
+            if (
+                _is_twitter_news_post(post)
+                and max_twitter_age > 0
+                and not _is_twitter_news_post_recent(post, max_twitter_age)
+            ):
+                continue
+            filtered.append(post)
+        return filtered
 
     async def _resolve_automatic_news_channel(
         self, target: GuildNewsTarget
@@ -2613,7 +2830,9 @@ class NewsCog(commands.Cog):
             )
             return 0
 
-        new_posts = self._new_posts_for_guild(settings, posts)
+        new_posts = self._auto_sendable_news_posts(
+            self._new_posts_for_guild(settings, posts),
+        )
         if not new_posts:
             self.storage.mark_posts_seen(
                 settings.guild_id,
@@ -3973,8 +4192,8 @@ class NewsCog(commands.Cog):
                 if not filename.endswith(".mp4"):
                     filename = "video.mp4"
                 return discord.File(io.BytesIO(data), filename=filename)
-        except aiohttp.ClientError:
-            LOGGER.exception("트위터 영상 다운로드 오류: %s", url)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception(f"트위터 영상 다운로드 오류: {url}", exc)
             return None
 
     def _cache_image(self, url: str, data: bytes, content_type: str | None) -> None:
@@ -4024,7 +4243,7 @@ class NewsCog(commands.Cog):
         LOGGER.info("시작 시 동기화 시작: Steam 뉴스, 유튜브 기준선, X 게시물을 확인합니다.")
         if self.news_source is not None:
             try:
-                posts_by_language, _ = await self._sync_global_news_cache()
+                posts_by_language, _, _ = await self._sync_global_news_cache()
                 self._startup_synced = True
                 synced_posts = posts_by_language.get(self.config.steam_language) or next(
                     iter(posts_by_language.values()),
@@ -4044,8 +4263,11 @@ class NewsCog(commands.Cog):
                     )
                 else:
                     LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
-            except Exception:
-                LOGGER.exception("시작 시 뉴스 동기화 실패.")
+            except Exception as exc:
+                if _is_internet_exception(exc):
+                    _log_internet_exception("시작 시 뉴스 동기화 실패", exc)
+                else:
+                    LOGGER.exception("시작 시 뉴스 동기화 실패.")
         await self._sync_youtube_startup_baseline()
         try:
             if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
@@ -4068,9 +4290,15 @@ class NewsCog(commands.Cog):
                 else:
                     LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
         except XClientError as exc:
-            LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
-        except Exception:
-            LOGGER.exception("시작 시 X 게시물 동기화 실패.")
+            if _is_internet_exception(exc):
+                _log_internet_exception("시작 시 X 게시물 동기화 건너뜀", exc)
+            else:
+                LOGGER.warning("시작 시 X 게시물 동기화 건너뜀: %s", exc)
+        except Exception as exc:
+            if _is_internet_exception(exc):
+                _log_internet_exception("시작 시 X 게시물 동기화 실패", exc)
+            else:
+                LOGGER.exception("시작 시 X 게시물 동기화 실패.")
         LOGGER.info("시작 시 동기화 처리 완료.")
         await self.run_startup_news_delivery()
 
@@ -4081,8 +4309,11 @@ class NewsCog(commands.Cog):
                 announced = await self._poll_once()
                 self._last_poll_at = datetime.now(timezone.utc)
                 LOGGER.info("시작 시 새 소식 자동 전송 확인 완료: sent=%s.", announced)
-            except Exception:
-                LOGGER.exception("시작 시 새 소식 자동 전송 확인 실패.")
+            except Exception as exc:
+                if _is_internet_exception(exc):
+                    _log_internet_exception("시작 시 새 소식 자동 전송 확인 실패", exc)
+                else:
+                    LOGGER.exception("시작 시 새 소식 자동 전송 확인 실패.")
 
     async def _sync_youtube_startup_baseline(self) -> None:
         targets = self.storage.list_youtube_targets()
@@ -4091,11 +4322,14 @@ class NewsCog(commands.Cog):
 
         try:
             latest = await self.youtube_client.fetch_latest_stream()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("시작 시 유튜브 기준선 동기화 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("시작 시 유튜브 기준선 동기화 실패", exc)
             return
-        except Exception:
-            LOGGER.exception("시작 시 유튜브 기준선 동기화 실패.")
+        except Exception as exc:
+            if _is_internet_exception(exc):
+                _log_internet_exception("시작 시 유튜브 기준선 동기화 실패", exc)
+            else:
+                LOGGER.exception("시작 시 유튜브 기준선 동기화 실패.")
             return
 
         if latest is None:
@@ -4127,8 +4361,11 @@ class NewsCog(commands.Cog):
         if self.news_source is not None:
             try:
                 fresh = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
-            except Exception:
-                LOGGER.exception("최신 뉴스 조회 실패. 캐시를 유지합니다.")
+            except Exception as exc:
+                if _is_internet_exception(exc):
+                    _log_internet_exception("최신 뉴스 조회 실패. 캐시를 유지합니다", exc)
+                else:
+                    LOGGER.exception("최신 뉴스 조회 실패. 캐시를 유지합니다.")
             else:
                 if fresh:
                     self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
@@ -4138,7 +4375,10 @@ class NewsCog(commands.Cog):
             try:
                 await self._sync_twitter_posts()
             except XClientError as exc:
-                LOGGER.warning("X 게시물 조회 실패: %s", exc)
+                if _is_internet_exception(exc):
+                    _log_internet_exception("X 게시물 조회 실패", exc)
+                else:
+                    LOGGER.warning("X 게시물 조회 실패: %s", exc)
 
     async def _track_manual_message(
         self,
@@ -4167,7 +4407,10 @@ class NewsCog(commands.Cog):
         steam_by_id: dict[str, list[NewsPost]] = (
             self._steam_posts_by_twitter_post_id(posts) if posts else {}
         )
-        max_age = self.config.twitter_announce_max_age_seconds
+        max_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
 
         def post_info(post: TwitterPost) -> dict:
             created = post.created_at
@@ -4247,9 +4490,26 @@ class NewsCog(commands.Cog):
 
         _, posts = await self._sync_twitter_posts()
         if not posts:
+            self._twitter_recovery_baseline_pending = False
             return 0
 
         posts = posts[:TWITTER_POST_LIMIT]
+        if self._twitter_recovery_baseline_pending:
+            latest_post_id = posts[0].post_id
+            updated = 0
+            for target in targets:
+                if target.enabled and target.last_seen_post_id != latest_post_id:
+                    self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+                    updated += 1
+            self._twitter_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 X 게시물 기준선을 갱신했습니다. 누적 X 자동 전송은 건너뜁니다 "
+                "(post_id=%s, targets=%s).",
+                latest_post_id,
+                updated,
+            )
+            return 0
+
         await self._refresh_steam_cache_for_twitter_links(posts)
         steam_posts_by_twitter_id = self._steam_posts_by_twitter_post_id(posts)
         send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
@@ -4265,7 +4525,10 @@ class NewsCog(commands.Cog):
                 if not new_posts:
                     self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
                     return 0
-                max_age = self.config.twitter_announce_max_age_seconds
+                max_age = (
+                    self.config.twitter_announce_max_age_seconds
+                    or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+                )
                 if max_age > 0:
                     new_posts = [
                         post for post in new_posts
@@ -4440,6 +4703,22 @@ class NewsCog(commands.Cog):
                 ended += 1
             return ended
 
+        if self._chzzk_recovery_baseline_pending:
+            updated = 0
+            for target in targets:
+                if not target.enabled:
+                    continue
+                if str(target.last_live_id) != live.live_id or not target.is_live:
+                    self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+                    updated += 1
+            LOGGER.info(
+                "네트워크 복구 후 치지직 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
+                "(live_id=%s, targets=%s).",
+                live.live_id,
+                updated,
+            )
+            return 0
+
         announced = 0
         for target in targets:
             if not target.enabled:
@@ -4500,6 +4779,22 @@ class NewsCog(commands.Cog):
             for target in targets:
                 if target.enabled and target.is_live:
                     self.storage.mark_youtube_target_offline(target.guild_id)
+            return 0
+
+        if self._youtube_recovery_baseline_pending:
+            updated = 0
+            for target in targets:
+                if not target.enabled:
+                    continue
+                if str(target.last_live_id) != live.video_id or not target.is_live:
+                    self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+                    updated += 1
+            LOGGER.info(
+                "네트워크 복구 후 유튜브 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
+                "(video_id=%s, targets=%s).",
+                live.video_id,
+                updated,
+            )
             return 0
 
         announced = 0
@@ -5266,7 +5561,10 @@ class NewsCog(commands.Cog):
         errors: list[str] = []
         for (label, _), result in zip(tasks, results):
             if isinstance(result, Exception):
-                LOGGER.warning("%s 방송 현황 확인 실패: %s", label, result)
+                if _is_internet_exception(result):
+                    _log_internet_exception(f"{label} 방송 현황 확인 실패", result)
+                else:
+                    LOGGER.warning("%s 방송 현황 확인 실패: %s", label, result)
                 errors.append(label)
                 continue
             if label == "치지직":
@@ -5278,19 +5576,25 @@ class NewsCog(commands.Cog):
     async def _fetch_chzzk_latest_broadcast(self) -> ChzzkBroadcast | None:
         try:
             return await self.chzzk_client.fetch_latest_broadcast()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("치지직 최근 방송 확인 실패: %s", exc)
-        except Exception:
-            LOGGER.exception("치지직 최근 방송 확인 실패.")
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("치지직 최근 방송 확인 실패", exc)
+        except Exception as exc:
+            if _is_internet_exception(exc):
+                _log_internet_exception("치지직 최근 방송 확인 실패", exc)
+            else:
+                LOGGER.exception("치지직 최근 방송 확인 실패.")
         return None
 
     async def _fetch_youtube_latest_stream(self) -> YoutubeStream | None:
         try:
             return await self.youtube_client.fetch_latest_stream()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("유튜브 최근 방송 확인 실패: %s", exc)
-        except Exception:
-            LOGGER.exception("유튜브 최근 방송 확인 실패.")
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 최근 방송 확인 실패", exc)
+        except Exception as exc:
+            if _is_internet_exception(exc):
+                _log_internet_exception("유튜브 최근 방송 확인 실패", exc)
+            else:
+                LOGGER.exception("유튜브 최근 방송 확인 실패.")
         return None
 
     async def _resolve_broadcast_target_channel(
@@ -5777,8 +6081,8 @@ class NewsCog(commands.Cog):
         if enabled_value:
             try:
                 live = await self.chzzk_client.fetch_live()
-            except aiohttp.ClientError as exc:
-                LOGGER.warning("치지직 현재 라이브 확인 실패: %s", exc)
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                _log_internet_exception("치지직 현재 라이브 확인 실패", exc)
             if live is not None:
                 last_live_id = live.live_id
 
@@ -5806,8 +6110,8 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             live = await self.chzzk_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("치지직 방송 현황 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("치지직 방송 현황 확인 실패", exc)
             await interaction.followup.send(
                 "치지직 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
                 ephemeral=True,
@@ -5853,8 +6157,8 @@ class NewsCog(commands.Cog):
 
         try:
             live = await self.chzzk_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("치지직 수동 전송용 방송 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("치지직 수동 전송용 방송 확인 실패", exc)
             await interaction.followup.send(
                 "치지직 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
                 ephemeral=True,
@@ -5973,8 +6277,8 @@ class NewsCog(commands.Cog):
         if enabled_value:
             try:
                 live = await self.youtube_client.fetch_live()
-            except aiohttp.ClientError as exc:
-                LOGGER.warning("유튜브 현재 라이브 확인 실패: %s", exc)
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                _log_internet_exception("유튜브 현재 라이브 확인 실패", exc)
             if live is not None:
                 last_live_id = live.video_id
 
@@ -5999,8 +6303,8 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             live = await self.youtube_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("유튜브 방송 현황 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 방송 현황 확인 실패", exc)
             await interaction.followup.send(
                 "유튜브 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
                 ephemeral=True,
@@ -6044,8 +6348,8 @@ class NewsCog(commands.Cog):
 
         try:
             live = await self.youtube_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("유튜브 수동 전송용 방송 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 수동 전송용 방송 확인 실패", exc)
             await interaction.followup.send(
                 "유튜브 방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
                 ephemeral=True,
@@ -6131,7 +6435,10 @@ class NewsCog(commands.Cog):
         try:
             return await self.youtube_client.fetch_latest_live_url()
         except Exception as exc:
-            LOGGER.warning("유튜브 최신 라이브 링크 확인 실패: %s", exc)
+            if _is_internet_exception(exc):
+                _log_internet_exception("유튜브 최신 라이브 링크 확인 실패", exc)
+            else:
+                LOGGER.warning("유튜브 최신 라이브 링크 확인 실패: %s", exc)
             return PROJECT_MOON_YOUTUBE_STREAMS_URL
 
     @app_commands.command(name="유저설정", description="앱에서 사용할 봇 개인 설정을 변경합니다.")
@@ -6283,16 +6590,16 @@ class NewsCog(commands.Cog):
         youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         try:
             live = await self.chzzk_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("서버 설정 상태용 치지직 방송 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("서버 설정 상태용 치지직 방송 확인 실패", exc)
         else:
             if live is None and chzzk_target is not None and chzzk_target.is_live:
                 self.storage.mark_chzzk_target_offline(interaction.guild_id)
                 chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         try:
             youtube_live = await self.youtube_client.fetch_live()
-        except aiohttp.ClientError as exc:
-            LOGGER.warning("서버 설정 상태용 유튜브 방송 확인 실패: %s", exc)
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("서버 설정 상태용 유튜브 방송 확인 실패", exc)
         else:
             if youtube_live is None and youtube_target is not None and youtube_target.is_live:
                 self.storage.mark_youtube_target_offline(interaction.guild_id)
@@ -8094,6 +8401,16 @@ def _is_twitter_post_recent(post: TwitterPost, max_age_seconds: int) -> bool:
         return False
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - created).total_seconds()
+    return age <= max_age_seconds
+
+
+def _is_twitter_news_post_recent(post: NewsPost, max_age_seconds: int) -> bool:
+    if max_age_seconds <= 0:
+        return True
+    created = _as_utc_datetime(post.created_at)
+    if created is None:
+        return False
     age = (datetime.now(timezone.utc) - created).total_seconds()
     return age <= max_age_seconds
 
