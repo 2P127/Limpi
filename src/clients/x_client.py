@@ -939,7 +939,7 @@ def _photo_urls(tweet: dict[str, Any]) -> list[str]:
 def _highest_quality_photo_url(url: str) -> str:
     parsed = urlparse(url)
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-    query["name"] = "large"
+    query["name"] = "orig"
     if parsed.netloc.endswith("twimg.com") and "format" not in query:
         suffix = parsed.path.rsplit(".", 1)
         if len(suffix) == 2 and suffix[1]:

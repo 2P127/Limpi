@@ -235,6 +235,17 @@ class SQLiteStorage:
                 PRIMARY KEY (target_id, post_id)
             )
         """,
+        "news_post_image_messages": """
+            CREATE TABLE IF NOT EXISTS news_post_image_messages (
+                target_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                batch_index INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (target_id, post_id, batch_index)
+            )
+        """,
         "tracked_messages": """
             CREATE TABLE IF NOT EXISTS tracked_messages (
                 guild_id INTEGER NOT NULL,
@@ -1971,6 +1982,76 @@ class SQLiteStorage:
             )
             self._connection.commit()
 
+    def record_news_post_image_message(
+        self,
+        target_id: int,
+        post_id: str,
+        channel_id: int,
+        message_id: int,
+        batch_index: int,
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO news_post_image_messages (
+                    target_id, post_id, channel_id, message_id, batch_index, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(target_id, post_id, batch_index) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    created_at = excluded.created_at
+                """,
+                (target_id, post_id, channel_id, message_id, batch_index, now),
+            )
+            self._connection.commit()
+
+    def get_news_post_image_messages(
+        self, target_id: int, post_id: str
+    ) -> list[tuple[int, int, int]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT channel_id, message_id, batch_index
+                FROM news_post_image_messages
+                WHERE target_id = ? AND post_id = ?
+                ORDER BY batch_index
+                """,
+                (target_id, post_id),
+            ).fetchall()
+        return [
+            (int(row["channel_id"]), int(row["message_id"]), int(row["batch_index"]))
+            for row in rows
+        ]
+
+    def replace_news_post_image_messages(
+        self,
+        target_id: int,
+        post_id: str,
+        channel_id: int,
+        message_ids: list[int],
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                "DELETE FROM news_post_image_messages WHERE target_id = ? AND post_id = ?",
+                (target_id, post_id),
+            )
+            self._connection.executemany(
+                """
+                INSERT INTO news_post_image_messages (
+                    target_id, post_id, channel_id, message_id, batch_index, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (target_id, post_id, channel_id, message_id, index, now)
+                    for index, message_id in enumerate(message_ids)
+                ),
+            )
+            self._connection.commit()
+
     def queue_news_update_for_announced_targets(self, post_id: str) -> int:
         now = _now_iso()
         with self._lock:
@@ -2396,6 +2477,10 @@ class SQLiteStorage:
                 placeholders = ", ".join("?" for _ in target_ids)
                 self._connection.execute(
                     f"DELETE FROM guild_news_target_seen_posts WHERE target_id IN ({placeholders})",
+                    target_ids,
+                )
+                self._connection.execute(
+                    f"DELETE FROM news_post_image_messages WHERE target_id IN ({placeholders})",
                     target_ids,
                 )
             self._connection.execute(

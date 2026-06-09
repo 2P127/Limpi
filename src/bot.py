@@ -65,6 +65,8 @@ CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 NEWS_TARGET_SEND_CONCURRENCY = 12
+NEWS_ROLE_MENTION_COOLDOWN_SECONDS = 2 * 60 + 30
+TWITTER_STEAM_PREFERENCE_GRACE_SECONDS = 35
 USER_COMMAND_COOLDOWN_SECONDS = 3.0
 ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
 BRIGHTEN_CUSTOM_ID_PREFIX = "limpi:brighten:"
@@ -1169,6 +1171,8 @@ class NewsCog(commands.Cog):
         self._twitter_poll_lock = asyncio.Lock()
         self._chzzk_poll_lock = asyncio.Lock()
         self._youtube_poll_lock = asyncio.Lock()
+        self._news_role_mention_times: dict[int, float] = {}
+        self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
@@ -1718,7 +1722,11 @@ class NewsCog(commands.Cog):
 
             for target in target_list:
                 settings = self.storage.get_settings(target.guild_id)
-                guild_posts = self._posts_for_source_mode(posts, settings)[:NEWS_POST_LIMIT]
+                guild_posts = self._posts_for_source_mode(
+                    posts,
+                    settings,
+                    defer_linked_twitter=True,
+                )[:NEWS_POST_LIMIT]
                 if not guild_posts:
                     continue
                 newest_post_id = guild_posts[0].post_id
@@ -1935,6 +1943,8 @@ class NewsCog(commands.Cog):
         posts: list[NewsPost],
         settings: GuildSettings | None = None,
         source_mode: str | None = None,
+        *,
+        defer_linked_twitter: bool = False,
     ) -> list[NewsPost]:
         mode = (
             source_mode
@@ -1945,11 +1955,33 @@ class NewsCog(commands.Cog):
             return [post for post in posts if not _is_twitter_news_post(post)]
         if mode == NEWS_SOURCE_TWITTER:
             return [post for post in posts if _is_twitter_news_post(post)]
-        return [
-            post
-            for post in posts
-            if not _twitter_news_prefers_available_steam(post, posts)
-        ]
+        selected: list[NewsPost] = []
+        for post in posts:
+            if _twitter_news_prefers_available_steam(post, posts):
+                self._twitter_steam_grace_started_at.pop(post.post_id, None)
+                continue
+            if defer_linked_twitter and self._defer_linked_twitter_for_steam(post):
+                continue
+            selected.append(post)
+        return selected
+
+    def _defer_linked_twitter_for_steam(self, post: NewsPost) -> bool:
+        if not _is_twitter_news_post(post) or not _steam_news_link_keys_for_news_post(post):
+            return False
+
+        now = perf_counter()
+        started_at = self._twitter_steam_grace_started_at.setdefault(post.post_id, now)
+        elapsed = now - started_at
+        if elapsed >= TWITTER_STEAM_PREFERENCE_GRACE_SECONDS:
+            return False
+        if elapsed < 0.1:
+            LOGGER.info(
+                "Steam 링크가 있는 X 소식을 잠시 보류합니다. 다른 소식 전송은 계속 진행합니다 "
+                "(post_id=%s, grace=%s초).",
+                post.post_id,
+                TWITTER_STEAM_PREFERENCE_GRACE_SECONDS,
+            )
+        return True
 
     def _combined_cached_posts(
         self,
@@ -3007,11 +3039,16 @@ class NewsCog(commands.Cog):
         mention_role: bool = True,
     ) -> bool:
         channel_id = getattr(channel, "id", settings.channel_id)
+        role_id = self._claim_automatic_news_role_mention(
+            channel_id,
+            settings.role_id,
+            requested=mention_role,
+        )
         try:
             await self._broadcast_post(
                 channel,
                 post,
-                settings.role_id if mention_role else None,
+                role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
                 image_delivery=settings.image_delivery,
@@ -3078,14 +3115,21 @@ class NewsCog(commands.Cog):
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         mention_role: bool = True,
     ) -> bool:
+        channel_id = getattr(channel, "id", target.channel_id)
+        role_id = self._claim_automatic_news_role_mention(
+            channel_id,
+            settings.role_id,
+            requested=mention_role,
+        )
         try:
             sent_message = await self._broadcast_post(
                 channel,
                 post,
-                settings.role_id if mention_role else None,
+                role_id,
                 banner_filename=settings.notification_banner,
                 batch_tasks=batch_tasks,
                 image_delivery=settings.image_delivery,
+                news_target_id=target.target_id,
             )
             if sent_message is not None:
                 self.storage.record_news_post_message(
@@ -3149,6 +3193,34 @@ class NewsCog(commands.Cog):
                 post.title,
             )
             return False
+
+    def _claim_automatic_news_role_mention(
+        self,
+        channel_id: int | None,
+        role_id: int | None,
+        *,
+        requested: bool,
+    ) -> int | None:
+        if not requested or role_id is None:
+            return role_id if requested else None
+
+        now = perf_counter()
+        last_mentioned_at = self._news_role_mention_times.get(role_id)
+        if (
+            last_mentioned_at is not None
+            and now - last_mentioned_at < NEWS_ROLE_MENTION_COOLDOWN_SECONDS
+        ):
+            LOGGER.info(
+                "뉴스 역할 멘션 생략: 150초 중복 방지 적용 "
+                "(channel_id=%s, role_id=%s, remaining=%.1f초).",
+                channel_id,
+                role_id,
+                NEWS_ROLE_MENTION_COOLDOWN_SECONDS - (now - last_mentioned_at),
+            )
+            return None
+
+        self._news_role_mention_times[role_id] = now
+        return role_id
 
     async def _broadcast_post_updates(self, post_ids: list[str]) -> None:
         pending_targets = self.storage.get_pending_news_update_targets()
@@ -3244,6 +3316,8 @@ class NewsCog(commands.Cog):
             return
 
         await message.edit(view=updated_view)
+        if settings.image_delivery == IMAGE_DELIVERY_FILES:
+            await self._replace_news_post_image_messages(channel, target, post)
 
         last_notified: datetime | None = None
         if last_notified_at:
@@ -3277,6 +3351,65 @@ class NewsCog(commands.Cog):
                 post.post_id,
             )
 
+    async def _replace_news_post_image_messages(
+        self,
+        channel: discord.abc.Messageable,
+        target: GuildNewsTarget,
+        post: NewsPost,
+    ) -> None:
+        urls = _standalone_image_urls(post, attach_images=True)
+        self._invalidate_image_cache(urls)
+        file_batches = await self._image_file_batches_for_post(post, urls=urls)
+        existing = self.storage.get_news_post_image_messages(target.target_id, post.post_id)
+        message_ids: list[int] = []
+
+        for index, file_batch in enumerate(file_batches):
+            message: discord.Message | None = None
+            if index < len(existing):
+                _, message_id, _ = existing[index]
+                try:
+                    message = await channel.fetch_message(message_id)
+                except discord.NotFound:
+                    message = None
+            if message is None:
+                message = await channel.send(
+                    files=file_batch,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await message.edit(attachments=file_batch)
+            message_ids.append(message.id)
+
+        for channel_id, message_id, _ in existing[len(file_batches) :]:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.delete()
+            except discord.NotFound:
+                pass
+            self.storage.delete_tracked_message(target.guild_id, channel_id, message_id)
+
+        self.storage.replace_news_post_image_messages(
+            target.target_id,
+            post.post_id,
+            target.channel_id,
+            message_ids,
+        )
+        LOGGER.info(
+            "수정된 뉴스 첨부 이미지 반영 완료 "
+            "(guild_id=%s, channel_id=%s, post_id=%s, image_messages=%s).",
+            target.guild_id,
+            target.channel_id,
+            post.post_id,
+            len(message_ids),
+        )
+
+    def _invalidate_image_cache(self, urls: list[str]) -> None:
+        for url in urls:
+            for candidate in _original_image_download_candidates(url):
+                cached = self._image_cache.pop(candidate, None)
+                if cached is not None:
+                    self._image_cache_bytes -= len(cached[0])
+
     async def _broadcast_post(
         self,
         channel: discord.abc.Messageable,
@@ -3287,6 +3420,7 @@ class NewsCog(commands.Cog):
         is_update: bool = False,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         image_delivery: str = IMAGE_DELIVERY_EMBEDS,
+        news_target_id: int | None = None,
     ) -> discord.Message | None:
         mention = f"<@&{role_id}>" if role_id else None
         allowed_mentions = discord.AllowedMentions(
@@ -3330,6 +3464,7 @@ class NewsCog(commands.Cog):
                 post,
                 batch_tasks=batch_tasks,
                 image_urls=standalone_urls,
+                news_target_id=news_target_id,
             )
         youtube_content = _youtube_links_content(post)
         if youtube_content:
@@ -3486,9 +3621,9 @@ class NewsCog(commands.Cog):
         self, interaction: discord.Interaction, post_id: str
     ) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        post = self.storage.get_post(post_id)
+        post = await self._resolve_brighten_post(post_id)
         language = _post_language(post) if post is not None else "koreana"
-        if post is None or not _content_image_urls(post):
+        if post is None or not _downloadable_image_urls(post):
             await interaction.followup.send(
                 _news_ui_text(language, "zip_no_images"), ephemeral=True
             )
@@ -3688,7 +3823,7 @@ class NewsCog(commands.Cog):
         buffer = io.BytesIO()
         count = 0
         used_names: set[str] = set()
-        urls = _content_image_urls(post)
+        urls = _downloadable_image_urls(post)
         semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
 
         tasks = [
@@ -3716,14 +3851,25 @@ class NewsCog(commands.Cog):
         self, semaphore: asyncio.Semaphore, index: int, url: str, *, convert_png: bool = True
     ) -> tuple[int, str, str | None, bytes] | None:
         async with semaphore:
-            downloaded = await self._download_image(url)
+            download_urls = _original_image_download_candidates(url)
+            downloaded = None
+            for download_url in download_urls:
+                downloaded = await self._download_image(download_url)
+                if downloaded is not None:
+                    break
             if downloaded is None:
                 return None
 
             data, content_type = downloaded
             if convert_png:
-                data, content_type = _image_bytes_as_png(data, content_type)
-            return index, url, content_type, data
+                data, content_type = await asyncio.to_thread(
+                    _image_bytes_as_png,
+                    data,
+                    content_type,
+                )
+                if content_type != "image/png":
+                    return None
+            return index, download_urls[0], content_type, data
 
     def _schedule_channel_image_messages(
         self,
@@ -3734,6 +3880,7 @@ class NewsCog(commands.Cog):
         track_channel_id: int | None = None,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         image_urls: list[str] | None = None,
+        news_target_id: int | None = None,
     ) -> None:
         urls = (
             image_urls
@@ -3751,6 +3898,7 @@ class NewsCog(commands.Cog):
                 track_guild_id=track_guild_id,
                 track_channel_id=track_channel_id,
                 batch_tasks=resolved_tasks,
+                news_target_id=news_target_id,
             )
         )
         task.add_done_callback(self._log_background_task_result)
@@ -3842,6 +3990,7 @@ class NewsCog(commands.Cog):
         track_guild_id: int | None = None,
         track_channel_id: int | None = None,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
+        news_target_id: int | None = None,
     ) -> None:
         target = await self._resolve_background_channel(channel, track_channel_id)
         if target is None:
@@ -3849,6 +3998,7 @@ class NewsCog(commands.Cog):
             return
 
         tasks = batch_tasks or []
+        batch_index = 0
         for batch_task in asyncio.as_completed(tasks):
             file_batch = await batch_task
             if not file_batch:
@@ -3865,6 +4015,15 @@ class NewsCog(commands.Cog):
                 )
                 return
             await self._track_manual_message(track_guild_id, track_channel_id, message)
+            if news_target_id is not None:
+                self.storage.record_news_post_image_message(
+                    news_target_id,
+                    post.post_id,
+                    getattr(target, "id", track_channel_id),
+                    message.id,
+                    batch_index,
+                )
+            batch_index += 1
 
     async def _send_channel_image_embed_messages(
         self,
@@ -7386,6 +7545,12 @@ def _content_image_urls(post: NewsPost) -> list[str]:
     ]
 
 
+def _downloadable_image_urls(post: NewsPost) -> list[str]:
+    if _is_twitter_news_post(post):
+        return _filter_image_urls(post.image_urls)
+    return _content_image_urls(post)
+
+
 def _brightenable_image_urls(post: NewsPost) -> list[str]:
     if not _is_twitter_news_post(post):
         return []
@@ -7581,6 +7746,57 @@ def _twitter_image_urls(post: TwitterPost) -> list[str]:
         for url in post.image_urls
         if not _is_twitter_video_thumbnail_url(url)
     ]
+
+
+def _twitter_original_image_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not (parsed.hostname or "").endswith("twimg.com"):
+        return url
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query["name"] = ["orig"]
+    return parsed._replace(
+        query="&".join(
+            f"{quote(key)}={quote(value)}"
+            for key, values in query.items()
+            for value in values
+        )
+    ).geturl()
+
+
+def _steam_original_image_url(url: str) -> str:
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    if hostname not in {
+        "clan.fastly.steamstatic.com",
+        "cdn.fastly.steamstatic.com",
+        "steamcdn-a.akamaihd.net",
+    }:
+        return url
+
+    path = re.sub(
+        r"_(?:\d{2,5})x(?:\d{2,5})(?=\.[A-Za-z0-9]+$)",
+        "",
+        parsed.path,
+    )
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    for key in ("imw", "imh", "impolicy", "letterbox", "crop"):
+        query.pop(key, None)
+    return parsed._replace(
+        path=path,
+        query="&".join(
+            f"{quote(key)}={quote(value)}"
+            for key, values in query.items()
+            for value in values
+        ),
+    ).geturl()
+
+
+def _original_image_download_candidates(url: str) -> list[str]:
+    if (urlparse(url).hostname or "").endswith("twimg.com"):
+        original = _twitter_original_image_url(url)
+    else:
+        original = _steam_original_image_url(url)
+    return list(dict.fromkeys([original, url]))
 
 
 def _is_twitter_video_thumbnail_url(url: str) -> bool:
@@ -7944,7 +8160,7 @@ def _build_layout_view_for_post(
                 url=post.url,
             )
         )
-    if include_zip_button and _content_image_urls(post):
+    if include_zip_button and _downloadable_image_urls(post):
         action_row.add_item(ZipDownloadButton(post.post_id, language=language))
     if _brightenable_image_urls(post):
         action_row.add_item(
@@ -7999,7 +8215,7 @@ def _build_view_for_post(
                 url=post.url,
             )
         )
-    if include_zip_button and _content_image_urls(post):
+    if include_zip_button and _downloadable_image_urls(post):
         view.add_item(ZipDownloadButton(post.post_id, language=language))
     if _brightenable_image_urls(post):
         view.add_item(
@@ -8433,7 +8649,7 @@ def _matching_steam_posts_for_twitter(
 ) -> list[NewsPost]:
     link_urls = _raw_link_urls(post.raw)
     link_keys = _steam_news_link_keys_for_twitter(post)
-    twitter_candidates = _news_match_candidates(post.title, post.text)
+    twitter_candidates = _news_body_match_candidates(post.text)
     matched: list[NewsPost] = []
     seen: set[str] = set()
     for steam_post in steam_posts:
@@ -8458,12 +8674,14 @@ def _twitter_matches_steam_news(
     twitter_candidates: set[str],
 ) -> bool:
     steam_key = _steam_news_url_key(steam_post.url)
-    if steam_post.url in link_urls or (steam_key is not None and steam_key in link_keys):
-        return True
-    return _news_match_candidates_overlap(
-        twitter_candidates,
-        _news_match_candidates(steam_post.title, steam_post.text),
+    link_matches = steam_post.url in link_urls or (
+        steam_key is not None and steam_key in link_keys
     )
+    content_matches = _news_match_candidates_overlap(
+        twitter_candidates,
+        _news_body_match_candidates(steam_post.text),
+    )
+    return link_matches and content_matches
 
 
 def _raw_link_urls(raw: dict) -> list[str]:
@@ -8473,8 +8691,8 @@ def _raw_link_urls(raw: dict) -> list[str]:
     return [str(url) for url in link_urls if url]
 
 
-def _news_match_candidates(title: str, text: str) -> set[str]:
-    values = [title]
+def _news_body_match_candidates(text: str) -> set[str]:
+    values: list[str] = []
     line_count = 0
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         cleaned = line.strip()
@@ -8508,7 +8726,10 @@ def _normalize_news_match_text(value: str) -> str:
     value = re.sub(r"https?://\S+", " ", value)
     value = re.sub(r"#\S+", " ", value)
     value = re.sub(r"[\[【「『](.*?)[\]】」』]", r" \1 ", value)
-    value = re.sub(r"[^\w]+", " ", value.casefold())
+    value = "".join(
+        character if character.isalnum() or character == "_" else " "
+        for character in value.casefold()
+    )
     return re.sub(r"\s+", " ", value).strip()
 
 
