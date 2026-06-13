@@ -36,7 +36,16 @@ from .clients.chzzk_client import (
     PROJECT_MOON_CHZZK_LIVE_URL,
 )
 from .core.config import AppConfig, BOT_VERSION
-from .core.models import GuildChzzkTarget, GuildNewsTarget, GuildSettings, GuildYoutubeTarget, NewsPost, TwitterPost
+from .core.models import (
+    GuildChzzkTarget,
+    GuildHampangTarget,
+    GuildNewsTarget,
+    GuildSettings,
+    GuildYoutubeTarget,
+    GuildYoutubeUploadTarget,
+    NewsPost,
+    TwitterPost,
+)
 from .core.storage import (
     DEFAULT_NOTIFICATION_BANNER,
     DEFAULT_NEWS_SOURCE_MODE,
@@ -48,7 +57,14 @@ from .core.storage import (
 )
 from .clients.steam_client import NewsSource, build_news_source
 from .clients.x_client import LimbusXClient, XClientError
-from .clients.youtube_client import PROJECT_MOON_YOUTUBE_STREAMS_URL, YoutubeClient, YoutubeLive, YoutubeStream
+from .clients.youtube_client import (
+    PROJECT_MOON_YOUTUBE_STREAMS_URL,
+    PROJECT_MOON_YOUTUBE_VIDEOS_URL,
+    YoutubeClient,
+    YoutubeLive,
+    YoutubeStream,
+    YoutubeUpload,
+)
 
 
 POST_FORMAT_RICH = "rich"
@@ -61,6 +77,11 @@ NEWS_SELECT_POST_LIMIT = 250
 NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
 CHZZK_POLL_INTERVAL_SECONDS = 60
+YOUTUBE_UPLOAD_POLL_INTERVAL_SECONDS = 60
+HAMPANG_POLL_INTERVAL_SECONDS = 60
+HAMPANG_X_USERNAME = "Ham_PangPang"
+HAMPANG_X_URL = "https://x.com/Ham_PangPang"
+HAMPANG_YOUTUBE_TITLE_MARKER = "hamhampangpang"
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -919,7 +940,10 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
         options: list[discord.SelectOption] = []
         for index, gift in enumerate(page_gifts, start=start):
-            description = f"{gift.keyword or '키워드 없음'} · {_ego_gift_grade_label(gift.grade)}"
+            description = (
+                f"{_ego_gift_keyword(gift) or '키워드 없음'} · "
+                f"{_ego_gift_grade_label(gift.grade)}"
+            )
             if gift.category:
                 description += f" · {gift.category}"
             options.append(
@@ -1066,7 +1090,8 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
         if page_gifts:
             lines = [
-                f"`{index + 1}.` **{gift.name}** · {gift.keyword or '-'} · {_ego_gift_grade_label(gift.grade)}"
+                f"`{index + 1}.` **{gift.name}** · {_ego_gift_keyword(gift) or '-'} · "
+                f"{_ego_gift_grade_label(gift.grade)}"
                 for index, gift in enumerate(page_gifts, start=start)
             ]
             body = "\n".join(lines)
@@ -1162,6 +1187,11 @@ class NewsCog(commands.Cog):
         self.storage = storage
         self.news_source = news_source
         self.x_source = x_source
+        self.hampang_x_source = LimbusXClient(
+            config,
+            session,
+            account_username=HAMPANG_X_USERNAME,
+        )
         self.session = session
         self.test_mode = test_mode
         self._x_probe_active = test_mode and config.x_news_probe
@@ -1171,6 +1201,8 @@ class NewsCog(commands.Cog):
         self._twitter_poll_lock = asyncio.Lock()
         self._chzzk_poll_lock = asyncio.Lock()
         self._youtube_poll_lock = asyncio.Lock()
+        self._youtube_upload_poll_lock = asyncio.Lock()
+        self._hampang_poll_lock = asyncio.Lock()
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
@@ -1194,6 +1226,8 @@ class NewsCog(commands.Cog):
         self._twitter_recovery_baseline_pending = False
         self._chzzk_recovery_baseline_pending = False
         self._youtube_recovery_baseline_pending = False
+        self._youtube_upload_recovery_baseline_pending = False
+        self._hampang_recovery_baseline_pending = False
         self._in_high_frequency_window: bool = False
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
@@ -1209,6 +1243,8 @@ class NewsCog(commands.Cog):
         self.poll_twitter_posts.start()
         self.poll_chzzk_live.start()
         self.poll_youtube_live.start()
+        self.poll_youtube_uploads.start()
+        self.poll_hampang_news.start()
 
         if self.news_source is None and self.x_source is None:
             LOGGER.warning("뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -1227,6 +1263,10 @@ class NewsCog(commands.Cog):
             self.poll_chzzk_live.cancel()
         if self.poll_youtube_live.is_running():
             self.poll_youtube_live.cancel()
+        if self.poll_youtube_uploads.is_running():
+            self.poll_youtube_uploads.cancel()
+        if self.poll_hampang_news.is_running():
+            self.poll_hampang_news.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
         for task in self._brighten_tasks.values():
@@ -1452,6 +1492,51 @@ class NewsCog(commands.Cog):
 
     @poll_youtube_live.before_loop
     async def before_poll_youtube_live(self) -> None:
+        await self._wait_until_ready()
+
+    @tasks.loop(seconds=YOUTUBE_UPLOAD_POLL_INTERVAL_SECONDS)
+    async def poll_youtube_uploads(self) -> None:
+        async with self._youtube_upload_poll_lock:
+            try:
+                if not self.bot.is_ready():
+                    self._youtube_upload_recovery_baseline_pending = True
+                    return
+                await self._poll_youtube_uploads_once()
+                self._youtube_upload_recovery_baseline_pending = False
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                self._youtube_upload_recovery_baseline_pending = True
+                _log_internet_exception("유튜브 업로드 자동 확인 실패", exc)
+            except Exception as exc:
+                self._youtube_upload_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("유튜브 업로드 자동 확인 실패", exc)
+                else:
+                    LOGGER.exception("유튜브 업로드 자동 확인 실패.")
+
+    @poll_youtube_uploads.before_loop
+    async def before_poll_youtube_uploads(self) -> None:
+        await self._wait_until_ready()
+
+    @tasks.loop(seconds=HAMPANG_POLL_INTERVAL_SECONDS)
+    async def poll_hampang_news(self) -> None:
+        async with self._hampang_poll_lock:
+            try:
+                if not self.bot.is_ready():
+                    self._hampang_recovery_baseline_pending = True
+                    return
+                await self._poll_hampang_once()
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                self._hampang_recovery_baseline_pending = True
+                _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", exc)
+            except Exception as exc:
+                self._hampang_recovery_baseline_pending = True
+                if _is_internet_exception(exc):
+                    _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", exc)
+                else:
+                    LOGGER.exception("햄햄팡팡 소식 자동 확인 실패.")
+
+    @poll_hampang_news.before_loop
+    async def before_poll_hampang_news(self) -> None:
         await self._wait_until_ready()
 
     @tasks.loop(seconds=60)
@@ -5006,6 +5091,248 @@ class NewsCog(commands.Cog):
             announced += 1
         return announced
 
+    async def _poll_youtube_uploads_once(self) -> int:
+        targets = self.storage.list_youtube_upload_targets()
+        if not targets:
+            return 0
+
+        uploads = _regular_youtube_uploads(await self.youtube_client.fetch_recent_uploads())
+        if not uploads:
+            return 0
+
+        latest_video_id = uploads[0].video_id
+        if self._youtube_upload_recovery_baseline_pending:
+            for target in targets:
+                self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
+            LOGGER.info(
+                "네트워크 복구 후 유튜브 업로드 기준선을 갱신했습니다. 누적 영상 공지는 건너뜁니다 "
+                "(video_id=%s, targets=%s).",
+                latest_video_id,
+                len(targets),
+            )
+            return 0
+
+        announced = 0
+        upload_ids = [upload.video_id for upload in uploads]
+        for target in targets:
+            if not target.enabled:
+                continue
+
+            if not target.last_video_id or target.last_video_id not in upload_ids:
+                self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
+                LOGGER.info(
+                    "유튜브 업로드 기준선 설정: 기존 데이터가 없어 누적 영상 공지를 건너뜁니다 "
+                    "(guild_id=%s, video_id=%s).",
+                    target.guild_id,
+                    latest_video_id,
+                )
+                continue
+
+            last_seen_index = upload_ids.index(target.last_video_id)
+            new_uploads = list(reversed(uploads[:last_seen_index]))
+            if not new_uploads:
+                continue
+
+            channel = await self._resolve_youtube_upload_target_channel(target)
+            if channel is None:
+                continue
+            settings = self.storage.get_settings(target.guild_id)
+            target_announced = 0
+            for upload in new_uploads:
+                try:
+                    message = await self._send_youtube_upload_to_channel(
+                        channel,
+                        upload,
+                        role_id=settings.role_id if target_announced == 0 else None,
+                    )
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "유튜브 업로드 자동 전송 실패 "
+                        "(guild_id=%s, channel_id=%s, video_id=%s).",
+                        target.guild_id,
+                        target.channel_id,
+                        upload.video_id,
+                    )
+                    break
+
+                self.storage.mark_youtube_upload_target_seen(target.guild_id, upload.video_id)
+                await self._track_manual_message(target.guild_id, target.channel_id, message)
+                LOGGER.info(
+                    "새 유튜브 업로드 공지 (guild %s, channel %s): %s",
+                    target.guild_id,
+                    target.channel_id,
+                    upload.title,
+                )
+                target_announced += 1
+                announced += 1
+        return announced
+
+    async def _fetch_hampang_news_sources(
+        self,
+    ) -> tuple[list[TwitterPost], list[YoutubeUpload], bool]:
+        x_result, youtube_result = await asyncio.gather(
+            self.hampang_x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT),
+            self.youtube_client.fetch_recent_uploads(),
+            return_exceptions=True,
+        )
+        had_failure = False
+        x_posts: list[TwitterPost] = []
+        youtube_uploads: list[YoutubeUpload] = []
+
+        if isinstance(x_result, Exception):
+            had_failure = True
+            if _is_internet_exception(x_result):
+                _log_internet_exception("햄햄팡팡 공식 X 확인 실패", x_result)
+            else:
+                LOGGER.warning("햄햄팡팡 공식 X 확인 실패: %s", x_result)
+        else:
+            x_posts = x_result
+            had_failure = self.hampang_x_source.last_fetch_had_upstream_failure
+
+        if isinstance(youtube_result, Exception):
+            had_failure = True
+            if _is_internet_exception(youtube_result):
+                _log_internet_exception("햄햄팡팡 YouTube 영상 확인 실패", youtube_result)
+            else:
+                LOGGER.warning("햄햄팡팡 YouTube 영상 확인 실패: %s", youtube_result)
+        else:
+            youtube_uploads = [
+                upload for upload in youtube_result
+                if _is_hampang_youtube_upload(upload)
+            ]
+        return x_posts, youtube_uploads, had_failure
+
+    async def _poll_hampang_once(self) -> int:
+        targets = self.storage.list_hampang_targets()
+        if not targets:
+            return 0
+
+        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+        if had_failure:
+            self._hampang_recovery_baseline_pending = True
+            LOGGER.info(
+                "햄햄팡팡 소식 소스 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
+                "다음 정상 확인에서 기준선을 갱신합니다."
+            )
+            return 0
+        if not x_posts and not youtube_uploads:
+            return 0
+
+        latest_x_id = x_posts[0].post_id if x_posts else None
+        latest_youtube_id = youtube_uploads[0].video_id if youtube_uploads else None
+        if self._hampang_recovery_baseline_pending:
+            for target in targets:
+                self.storage.mark_hampang_target_seen(
+                    target.guild_id,
+                    x_post_id=latest_x_id,
+                    youtube_video_id=latest_youtube_id,
+                )
+            self._hampang_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 햄햄팡팡 소식 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
+                "(targets=%s).",
+                len(targets),
+            )
+            return 0
+
+        x_ids = [post.post_id for post in x_posts]
+        youtube_ids = [upload.video_id for upload in youtube_uploads]
+        announced = 0
+        for target in targets:
+            baseline_at = _as_utc_datetime(target.updated_at or target.created_at)
+            missing_x_baseline = bool(x_posts) and target.last_x_post_id not in x_ids
+            missing_youtube_baseline = (
+                bool(youtube_uploads) and target.last_youtube_video_id not in youtube_ids
+            )
+            if baseline_at is None and (missing_x_baseline or missing_youtube_baseline):
+                self.storage.mark_hampang_target_seen(
+                    target.guild_id,
+                    x_post_id=latest_x_id,
+                    youtube_video_id=latest_youtube_id,
+                )
+                LOGGER.info(
+                    "햄햄팡팡 소식 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
+                    "(guild_id=%s).",
+                    target.guild_id,
+                )
+                continue
+
+            if x_posts and target.last_x_post_id in x_ids:
+                new_x_posts = x_posts[:x_ids.index(target.last_x_post_id)]
+            else:
+                new_x_posts = [
+                    post
+                    for post in x_posts
+                    if baseline_at is not None
+                    and (created_at := _as_utc_datetime(post.created_at)) is not None
+                    and created_at > baseline_at
+                ]
+
+            if youtube_uploads and target.last_youtube_video_id in youtube_ids:
+                new_youtube_uploads = youtube_uploads[
+                    :youtube_ids.index(target.last_youtube_video_id)
+                ]
+            else:
+                new_youtube_uploads = [
+                    upload
+                    for upload in youtube_uploads
+                    if baseline_at is not None
+                    and (published_at := _as_utc_datetime(upload.published_at)) is not None
+                    and published_at > baseline_at
+                ]
+            items = _hampang_news_items(new_x_posts, new_youtube_uploads, newest_first=False)
+            if not items:
+                if missing_x_baseline or missing_youtube_baseline:
+                    self.storage.mark_hampang_target_seen(
+                        target.guild_id,
+                        x_post_id=latest_x_id if missing_x_baseline else None,
+                        youtube_video_id=(
+                            latest_youtube_id if missing_youtube_baseline else None
+                        ),
+                    )
+                continue
+
+            channel = await self._resolve_hampang_target_channel(target)
+            if channel is None:
+                continue
+            settings = self.storage.get_settings(target.guild_id)
+            target_announced = 0
+            for source, item in items:
+                try:
+                    role_id = settings.role_id if target_announced == 0 else None
+                    if source == "x":
+                        message = await self._send_twitter_post_to_channel(
+                            channel,
+                            item,
+                            role_id=role_id,
+                        )
+                        self.storage.mark_hampang_target_seen(
+                            target.guild_id,
+                            x_post_id=item.post_id,
+                        )
+                    else:
+                        message = await self._send_hampang_youtube_upload_to_channel(
+                            channel,
+                            item,
+                            role_id=role_id,
+                        )
+                        self.storage.mark_hampang_target_seen(
+                            target.guild_id,
+                            youtube_video_id=item.video_id,
+                        )
+                except discord.HTTPException:
+                    LOGGER.exception(
+                        "햄햄팡팡 소식 자동 전송 실패 (guild_id=%s, channel_id=%s, source=%s).",
+                        target.guild_id,
+                        target.channel_id,
+                        source,
+                    )
+                    break
+                await self._track_manual_message(target.guild_id, target.channel_id, message)
+                target_announced += 1
+                announced += 1
+        return announced
+
     async def _resolve_chzzk_target_channel(
         self, target: GuildChzzkTarget
     ) -> discord.abc.Messageable | None:
@@ -5023,6 +5350,56 @@ class NewsCog(commands.Cog):
             except discord.HTTPException:
                 LOGGER.exception(
                     "치지직 라이브 자동 전송 채널 조회 실패 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
+    async def _resolve_youtube_upload_target_channel(
+        self, target: GuildYoutubeUploadTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "유튜브 업로드 자동 전송 건너뜀: 채널 접근 불가 "
+                    "(guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "유튜브 업로드 자동 전송 채널 조회 실패 "
+                    "(guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
+    async def _resolve_hampang_target_channel(
+        self, target: GuildHampangTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "햄햄팡팡 소식 자동 전송 건너뜀: 채널 접근 불가 "
+                    "(guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "햄햄팡팡 소식 자동 전송 채널 조회 실패 "
+                    "(guild_id=%s, channel_id=%s).",
                     target.guild_id,
                     target.channel_id,
                 )
@@ -5111,6 +5488,50 @@ class NewsCog(commands.Cog):
         return await channel.send(
             embed=_embed_for_youtube_live(live),
             view=_youtube_live_view(live.url, include_chzzk=include_chzzk_button),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _send_youtube_upload_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        upload: YoutubeUpload,
+        *,
+        role_id: int | None = None,
+    ) -> discord.Message:
+        if role_id:
+            await channel.send(
+                content=f"<@&{role_id}>",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
+                ),
+            )
+        return await channel.send(
+            embed=_embed_for_youtube_upload(upload),
+            view=_youtube_upload_view(upload.url),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _send_hampang_youtube_upload_to_channel(
+        self,
+        channel: discord.abc.Messageable,
+        upload: YoutubeUpload,
+        *,
+        role_id: int | None = None,
+    ) -> discord.Message:
+        if role_id:
+            await channel.send(
+                content=f"<@&{role_id}>",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[discord.Object(id=role_id)],
+                ),
+            )
+        return await channel.send(
+            embed=_embed_for_hampang_youtube_upload(upload),
+            view=_youtube_upload_view(upload.url),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -5789,6 +6210,467 @@ class NewsCog(commands.Cog):
             interaction.channel
             if isinstance(interaction.channel, discord.TextChannel)
             else None
+        )
+
+    async def _resolve_youtube_upload_config_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
+
+        current = self.storage.get_youtube_upload_target(interaction.guild_id)
+        if current is not None:
+            resolved = await self._resolve_youtube_upload_target_channel(current)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
+
+        return (
+            interaction.channel
+            if isinstance(interaction.channel, discord.TextChannel)
+            else None
+        )
+
+    async def _resolve_hampang_config_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        settings = self.storage.get_settings(interaction.guild_id)
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
+        current = self.storage.get_hampang_target(interaction.guild_id)
+        if current is not None:
+            resolved = await self._resolve_hampang_target_channel(current)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
+        return (
+            interaction.channel
+            if isinstance(interaction.channel, discord.TextChannel)
+            else None
+        )
+
+    @app_commands.command(name="햄팡소식설정", description="햄햄팡팡 공식 X와 관련 YouTube 영상 알림을 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(enabled="허용", channel="채널")
+    @app_commands.describe(
+        enabled="햄햄팡팡 소식 자동 알림을 켜거나 끕니다.",
+        channel="알림 채널입니다. 비워두면 /서버설정 채널, 기존 햄햄팡팡 채널, 현재 채널 순서로 사용합니다.",
+    )
+    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    async def configure_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_channel = await self._resolve_hampang_config_channel(interaction, channel)
+        if target_channel is None:
+            await interaction.followup.send(
+                "햄햄팡팡 소식을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        x_posts: list[TwitterPost] = []
+        youtube_uploads: list[YoutubeUpload] = []
+        had_failure = False
+        if enabled_value:
+            x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+            if had_failure or (not x_posts and not youtube_uploads):
+                self._hampang_recovery_baseline_pending = True
+
+        target = self.storage.upsert_hampang_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=enabled_value,
+            last_x_post_id=x_posts[0].post_id if x_posts else None,
+            last_youtube_video_id=youtube_uploads[0].video_id if youtube_uploads else None,
+        )
+        lines = [
+            f"햄햄팡팡 소식 알림: {_bool_label(target.enabled)}",
+            f"채널: <#{target.channel_id}>",
+            f"공식 X: [@{HAMPANG_X_USERNAME}]({HAMPANG_X_URL})",
+            "YouTube: 제목에 HamHamPangPang이 포함된 일반 영상",
+        ]
+        if enabled_value:
+            lines.append("설정 시점 이전 소식은 전송하지 않고 기준선으로만 저장했습니다.")
+        if had_failure:
+            lines.append("일부 소스를 확인하지 못해 다음 정상 확인에서도 기준선만 갱신합니다.")
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="햄햄팡팡 소식 설정이 완료되었어요",
+                description="\n".join(lines),
+                color=_success_embed_color(),
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="햄팡소식해제", description="햄햄팡팡 소식 자동 알림 설정을 해제합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def remove_hampang_news(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+        removed = self.storage.delete_hampang_target(interaction.guild_id)
+        await interaction.response.send_message(
+            "햄햄팡팡 소식 자동 알림 설정을 해제했어요."
+            if removed else "이 서버에는 햄햄팡팡 소식 설정이 없어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="햄팡소식보기", description="가장 최근 햄햄팡팡 공식 X 또는 관련 YouTube 소식을 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def view_hampang_news(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+        items = _hampang_news_items(x_posts, youtube_uploads)
+        if not items:
+            await interaction.followup.send(
+                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
+                if had_failure else "아직 확인된 햄햄팡팡 소식이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        source, item = items[0]
+        if source == "x":
+            await interaction.followup.send(
+                embeds=_embeds_for_twitter_post(item, image_urls=_twitter_image_urls(item)),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.followup.send(
+                embed=_embed_for_hampang_youtube_upload(item),
+                view=_youtube_upload_view(item.url),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @app_commands.command(name="햄팡소식보내기", description="가장 최근 햄햄팡팡 소식을 지정 채널에 보냅니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(channel="채널", role="역할")
+    async def send_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_channel = await self._resolve_hampang_config_channel(interaction, channel)
+        if target_channel is None:
+            await interaction.followup.send(
+                "햄햄팡팡 소식을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+        items = _hampang_news_items(x_posts, youtube_uploads)
+        if not items:
+            await interaction.followup.send(
+                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
+                if had_failure else "보낼 수 있는 햄햄팡팡 소식이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        source, item = items[0]
+        settings = self.storage.get_settings(interaction.guild_id)
+        role_id = role.id if role is not None else settings.role_id
+        try:
+            if source == "x":
+                message = await self._send_twitter_post_to_channel(
+                    target_channel,
+                    item,
+                    role_id=role_id,
+                )
+            else:
+                message = await self._send_hampang_youtube_upload_to_channel(
+                    target_channel,
+                    item,
+                    role_id=role_id,
+                )
+        except discord.HTTPException:
+            LOGGER.exception("햄햄팡팡 소식 수동 전송 실패.")
+            await interaction.followup.send(
+                "햄햄팡팡 소식 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        target = self.storage.get_hampang_target(interaction.guild_id)
+        if target is not None:
+            self.storage.mark_hampang_target_seen(
+                interaction.guild_id,
+                x_post_id=item.post_id if source == "x" else None,
+                youtube_video_id=item.video_id if source == "youtube" else None,
+            )
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        await interaction.followup.send(
+            f"{target_channel.mention}에 최신 햄햄팡팡 소식을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="유튜브알림설정", description="ProjectMoon Official 일반 영상 업로드 알림을 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(enabled="허용", channel="채널")
+    @app_commands.describe(
+        enabled="일반 영상 업로드 알림을 켜거나 끕니다.",
+        channel="알림 채널입니다. 비워두면 /서버설정 채널, 기존 업로드 알림 채널, 현재 채널 순서로 사용합니다.",
+    )
+    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    async def configure_youtube_upload_notifications(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_channel = await self._resolve_youtube_upload_config_channel(interaction, channel)
+        if target_channel is None:
+            await interaction.followup.send(
+                "유튜브 업로드 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        latest_upload: YoutubeUpload | None = None
+        fetch_failed = False
+        if enabled_value:
+            try:
+                uploads = _regular_youtube_uploads(await self.youtube_client.fetch_recent_uploads())
+                latest_upload = uploads[0] if uploads else None
+            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+                fetch_failed = True
+                self._youtube_upload_recovery_baseline_pending = True
+                _log_internet_exception("유튜브 업로드 알림 기준선 확인 실패", exc)
+            if latest_upload is None:
+                self._youtube_upload_recovery_baseline_pending = True
+
+        target = self.storage.upsert_youtube_upload_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=enabled_value,
+            last_video_id=latest_upload.video_id if latest_upload is not None else None,
+        )
+        lines = [
+            f"유튜브 업로드 알림: {_bool_label(target.enabled)}",
+            f"채널: <#{target.channel_id}>",
+            "라이브·프리미어 영상은 업로드 알림에서 제외됩니다.",
+        ]
+        if latest_upload is not None:
+            lines.append(f"현재 업로드 기준선: {latest_upload.title}")
+        elif enabled_value and fetch_failed:
+            lines.append("현재 인터넷 오류로 기준선을 확인하지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다.")
+        elif enabled_value:
+            lines.append("일반 영상을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다.")
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="유튜브 업로드 알림 설정이 완료되었어요",
+                description="\n".join(lines),
+                color=_success_embed_color(),
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="유튜브알림해제", description="ProjectMoon Official 일반 영상 업로드 알림 설정을 해제합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def remove_youtube_upload_notifications(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        removed = self.storage.delete_youtube_upload_target(interaction.guild_id)
+        await interaction.response.send_message(
+            "유튜브 일반 영상 업로드 알림 설정을 해제했어요."
+            if removed
+            else "이 서버에는 유튜브 일반 영상 업로드 알림 설정이 없어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="유튜브알림현황보기", description="ProjectMoon Official 일반 영상 업로드 알림 현황을 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    async def youtube_upload_notification_status(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = self.storage.get_youtube_upload_target(interaction.guild_id)
+        settings = self.storage.get_settings(interaction.guild_id)
+        try:
+            uploads = _regular_youtube_uploads(await self.youtube_client.fetch_recent_uploads())
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 업로드 현황 확인 실패", exc)
+            uploads = []
+
+        if uploads:
+            embed = _embed_for_youtube_upload(uploads[0])
+            embed.description = (
+                "가장 최근에 확인된 ProjectMoon Official 일반 영상입니다.\n\n"
+                + _format_youtube_upload_target(target, settings.role_id)
+            )
+        else:
+            embed = discord.Embed(
+                title="유튜브 일반 영상 업로드 알림 현황",
+                description=(
+                    _format_youtube_upload_target(target, settings.role_id)
+                    + "\n\n최근 일반 영상을 확인하지 못했습니다."
+                ),
+                url=PROJECT_MOON_YOUTUBE_VIDEOS_URL,
+                color=discord.Color.from_rgb(255, 0, 0),
+            )
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="유튜브알림보내기", description="가장 최근 ProjectMoon Official 일반 영상을 지정 채널에 보냅니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(channel="채널", role="역할")
+    @app_commands.describe(
+        channel="영상을 보낼 채널입니다. 비워두면 업로드 알림 채널 또는 /서버설정 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정 역할을 사용합니다.",
+    )
+    async def send_latest_youtube_upload(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+        role: discord.Role | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = self.storage.get_youtube_upload_target(interaction.guild_id)
+        settings = self.storage.get_settings(interaction.guild_id)
+        target_channel = channel
+        if target_channel is None and target is not None:
+            resolved = await self._resolve_youtube_upload_target_channel(target)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None and settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
+        if target_channel is None:
+            target_channel = (
+                interaction.channel
+                if isinstance(interaction.channel, discord.TextChannel)
+                else None
+            )
+        if target_channel is None:
+            await interaction.followup.send(
+                "유튜브 영상을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        try:
+            uploads = _regular_youtube_uploads(await self.youtube_client.fetch_recent_uploads())
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 업로드 수동 전송용 영상 확인 실패", exc)
+            await interaction.followup.send(
+                "최근 유튜브 일반 영상을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        if not uploads:
+            await interaction.followup.send(
+                "보낼 수 있는 일반 유튜브 영상을 찾지 못했어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        upload = uploads[0]
+        try:
+            message = await self._send_youtube_upload_to_channel(
+                target_channel,
+                upload,
+                role_id=role.id if role is not None else settings.role_id,
+            )
+        except discord.HTTPException:
+            LOGGER.exception("유튜브 업로드 수동 전송 실패.")
+            await interaction.followup.send(
+                "유튜브 영상 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        if target is not None:
+            self.storage.mark_youtube_upload_target_seen(interaction.guild_id, upload.video_id)
+        await interaction.followup.send(
+            f"{target_channel.mention}에 최신 일반 유튜브 영상을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @app_commands.command(name="방송알림설정", description="ProjectMoon Official 방송 시작 알림을 설정합니다.")
@@ -6721,6 +7603,8 @@ class NewsCog(commands.Cog):
                 f"이미지 전송: {_image_delivery_label(settings.image_delivery)}\n"
                 "치지직 알림: 미설정\n"
                 "유튜브 알림: 미설정\n"
+                "유튜브 일반 영상 업로드 알림: 미설정\n"
+                "햄햄팡팡 소식 알림: 미설정\n"
                 "점검 알림: 꺼짐"
             ),
             color=_success_embed_color(),
@@ -6747,6 +7631,8 @@ class NewsCog(commands.Cog):
         targets = self.storage.list_news_targets(interaction.guild_id)
         chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         youtube_target = self.storage.get_youtube_target(interaction.guild_id)
+        youtube_upload_target = self.storage.get_youtube_upload_target(interaction.guild_id)
+        hampang_target = self.storage.get_hampang_target(interaction.guild_id)
         try:
             live = await self.chzzk_client.fetch_live()
         except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
@@ -6815,6 +7701,16 @@ class NewsCog(commands.Cog):
         embed.add_field(
             name="유튜브 알림",
             value=_format_youtube_target(youtube_target, settings.role_id),
+            inline=False,
+        )
+        embed.add_field(
+            name="유튜브 일반 영상 업로드 알림",
+            value=_format_youtube_upload_target(youtube_upload_target, settings.role_id),
+            inline=False,
+        )
+        embed.add_field(
+            name="햄햄팡팡 소식 알림",
+            value=_format_hampang_target(hampang_target, settings.role_id),
             inline=False,
         )
 
@@ -7061,7 +7957,13 @@ class NewsCog(commands.Cog):
                 "### 📢 **소식 채널 · 자동 알림**\n"
                 "> `/소식채널설정` — 언어별 자동 소식 채널 등록\n"
                 "> `/소식채널해제` — 자동 소식 채널 등록 해제\n"
-                "> `/점검알림설정` — 주간 점검 · 업데이트 알림 설정"
+                "> `/점검알림설정` — 주간 점검 · 업데이트 알림 설정\n"
+                "> `/유튜브알림설정` — 일반 영상 업로드 알림 설정\n"
+                "> `/유튜브알림해제` — 일반 영상 업로드 알림 해제\n"
+                "> `/유튜브알림현황보기` — 최근 일반 영상과 알림 현황 보기\n"
+                "> `/유튜브알림보내기` — 최근 일반 영상을 지정 채널에 전송\n"
+                "> `/햄팡소식설정` · `/햄팡소식해제` — 햄햄팡팡 소식 자동 알림 관리\n"
+                "> `/햄팡소식보기` · `/햄팡소식보내기` — 최신 햄햄팡팡 소식 확인·전송"
             )
         )
         container.add_item(discord.ui.Separator())
@@ -7257,13 +8159,16 @@ def _load_ego_gifts() -> tuple[EgoGift, ...]:
     with path.open("r", encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
         for row in reader:
-            name = (row.get("이름") or "").strip()
+            name, grade = _split_ego_gift_name_and_grade(
+                (row.get("이름") or "").strip(),
+                (row.get("등급") or "").strip(),
+            )
             if not name:
                 continue
             gifts.append(
                 EgoGift(
                     name=name,
-                    grade=(row.get("등급") or "").strip(),
+                    grade=grade,
                     keyword=(row.get("키워드") or "").strip(),
                     category=(row.get("카테고리") or "").strip(),
                     related=(row.get("연관") or "").strip(),
@@ -7287,8 +8192,24 @@ def _find_ego_gifts(query: str) -> list[EgoGift]:
     return _filter_ego_gifts(query)
 
 
+def _split_ego_gift_name_and_grade(name: str, grade: str) -> tuple[str, str]:
+    if grade:
+        return name, grade
+
+    match = re.match(r"^EX\s+(.+)$", name, flags=re.IGNORECASE)
+    if match is None:
+        return name, grade
+    return match.group(1).strip(), "EX"
+
+
 def _ego_gift_sort_key(gift: EgoGift) -> tuple[int, str, str]:
-    return _ego_gift_grade_value(gift.grade), gift.keyword, gift.name
+    return _ego_gift_grade_value(gift.grade), _ego_gift_keyword(gift), gift.name
+
+
+def _ego_gift_keyword(gift: EgoGift) -> str:
+    if gift.grade.strip().upper() == "EX":
+        return "EX"
+    return gift.keyword
 
 
 def _ego_gift_grade_value(grade: str) -> int:
@@ -7304,6 +8225,7 @@ def _ego_gift_grade_value(grade: str) -> int:
         "IV": 4,
         "Ⅴ": 5,
         "V": 5,
+        "EX": 6,
     }
     if normalized in roman_grades:
         return roman_grades[normalized]
@@ -7318,15 +8240,23 @@ def _filter_ego_gifts(query: str, *, keyword: str | None = None) -> list[EgoGift
     gifts = [
         gift
         for gift in _load_ego_gifts()
-        if keyword is None or gift.keyword == keyword
+        if keyword is None or _ego_gift_keyword(gift) == keyword
     ]
     if not normalized_query:
         return gifts
 
+    grade_matches = [
+        gift
+        for gift in gifts
+        if _normalize_search_text(gift.grade) == normalized_query
+    ]
+    if grade_matches:
+        return grade_matches
+
     exact = [
         gift
         for gift in gifts
-        if _normalize_search_text(gift.name) == normalized_query
+        if normalized_query in _ego_gift_search_values(gift)
     ]
     if exact:
         return exact
@@ -7334,24 +8264,31 @@ def _filter_ego_gifts(query: str, *, keyword: str | None = None) -> list[EgoGift
     startswith = [
         gift
         for gift in gifts
-        if _normalize_search_text(gift.name).startswith(normalized_query)
+        if any(value.startswith(normalized_query) for value in _ego_gift_search_values(gift))
     ]
     contains = [
         gift
         for gift in gifts
-        if normalized_query in _normalize_search_text(gift.name)
+        if any(normalized_query in value for value in _ego_gift_search_values(gift))
         and gift not in startswith
     ]
     return [*startswith, *contains]
+
+
+def _ego_gift_search_values(gift: EgoGift) -> tuple[str, ...]:
+    name = _normalize_search_text(gift.name)
+    grade_and_name = _normalize_search_text(f"{gift.grade} {gift.name}")
+    return name, grade_and_name
 
 
 @lru_cache(maxsize=1)
 def _ego_gift_keyword_counts() -> tuple[tuple[str, int], ...]:
     counts: dict[str, int] = {}
     for gift in _load_ego_gifts():
-        if not gift.keyword:
+        keyword = _ego_gift_keyword(gift)
+        if not keyword:
             continue
-        counts[gift.keyword] = counts.get(gift.keyword, 0) + 1
+        counts[keyword] = counts.get(keyword, 0) + 1
     return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
@@ -7375,7 +8312,7 @@ def _ego_gift_component_markdown(gift: EgoGift, *, status_text: str) -> str:
     )
     return (
         f"## **{gift.name}**\n"
-        f"-# 분류: **{gift.keyword or '-'}**\n\n"
+        f"-# 분류: **{_ego_gift_keyword(gift) or '-'}**\n\n"
         "## **기프트 상세 정보**\n"
         f"{quoted_details}\n\n"
         "## **효과**\n"
@@ -7390,6 +8327,8 @@ def _format_ego_gift_flag(value: str) -> str:
 
 def _ego_gift_grade_label(grade: str) -> str:
     value = grade.strip()
+    if value.upper() == "EX":
+        return "EX"
     return f"{value}등급" if value else "-"
 
 
@@ -8023,6 +8962,30 @@ def _embed_for_youtube_live(live: YoutubeLive) -> discord.Embed:
     return embed
 
 
+def _embed_for_youtube_upload(upload: YoutubeUpload) -> discord.Embed:
+    embed = discord.Embed(
+        title=upload.title[:256],
+        description="ProjectMoon Official 유튜브 채널에 새 영상이 업로드되었습니다.",
+        url=upload.url,
+        color=discord.Color.from_rgb(255, 0, 0),
+    )
+    if upload.thumbnail_url:
+        embed.set_image(url=upload.thumbnail_url)
+    if upload.published_at is not None:
+        embed.timestamp = upload.published_at
+        embed.set_footer(text=f"출처: YouTube · 업로드: {_format_kst(upload.published_at)}")
+    else:
+        embed.set_footer(text="출처: YouTube")
+    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_VIDEOS_URL)
+    return embed
+
+
+def _embed_for_hampang_youtube_upload(upload: YoutubeUpload) -> discord.Embed:
+    embed = _embed_for_youtube_upload(upload)
+    embed.description = "ProjectMoon Official YouTube 채널에 햄햄팡팡 관련 영상이 업로드되었습니다."
+    return embed
+
+
 def _embed_for_youtube_offline(previous: YoutubeStream | None = None) -> discord.Embed:
     embed = discord.Embed(
         title="ProjectMoon Official 유튜브는 현재 오프라인 상태입니다.",
@@ -8088,6 +9051,18 @@ def _youtube_live_view(
                 url=PROJECT_MOON_CHZZK_LIVE_URL,
             )
         )
+    return view
+
+
+def _youtube_upload_view(youtube_url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="영상 보러가기",
+            style=discord.ButtonStyle.link,
+            url=youtube_url,
+        )
+    )
     return view
 
 
@@ -8328,6 +9303,75 @@ def _format_youtube_target(target: GuildYoutubeTarget | None, role_id: int | Non
         f"현재 방송 상태: {'방송중' if target.is_live else '방송 없음 / 오프라인'}\n"
         f"최근 라이브 기준선: {target.last_live_id or '없음'}"
     )
+
+
+def _format_youtube_upload_target(
+    target: GuildYoutubeUploadTarget | None,
+    role_id: int | None,
+) -> str:
+    role_text = f"<@&{role_id}>" if role_id else "없음"
+    if target is None:
+        return (
+            "업로드 알림 상태: 미설정\n"
+            "채널: 미설정\n"
+            f"역할 핑: {role_text}\n"
+            "최근 일반 영상 기준선: 없음"
+        )
+
+    return (
+        f"업로드 알림 상태: {'켜짐' if target.enabled else '꺼짐'}\n"
+        f"채널: <#{target.channel_id}>\n"
+        f"역할 핑: {role_text}\n"
+        f"최근 일반 영상 기준선: {target.last_video_id or '없음'}"
+    )
+
+
+def _format_hampang_target(target: GuildHampangTarget | None, role_id: int | None) -> str:
+    role_text = f"<@&{role_id}>" if role_id else "없음"
+    if target is None:
+        return (
+            "상태: 미설정\n"
+            "채널: 미설정\n"
+            f"역할 핑: {role_text}\n"
+            "최근 X 기준선: 없음\n"
+            "최근 YouTube 기준선: 없음"
+        )
+    return (
+        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
+        f"채널: <#{target.channel_id}>\n"
+        f"역할 핑: {role_text}\n"
+        f"최근 X 기준선: {target.last_x_post_id or '없음'}\n"
+        f"최근 YouTube 기준선: {target.last_youtube_video_id or '없음'}"
+    )
+
+
+def _is_hampang_youtube_upload(upload: YoutubeUpload) -> bool:
+    normalized_title = re.sub(r"[^a-z0-9]+", "", upload.title.casefold())
+    return HAMPANG_YOUTUBE_TITLE_MARKER in normalized_title
+
+
+def _regular_youtube_uploads(uploads: list[YoutubeUpload]) -> list[YoutubeUpload]:
+    return [upload for upload in uploads if not _is_hampang_youtube_upload(upload)]
+
+
+def _hampang_news_items(
+    x_posts: list[TwitterPost],
+    youtube_uploads: list[YoutubeUpload],
+    *,
+    newest_first: bool = True,
+) -> list[tuple[str, TwitterPost | YoutubeUpload]]:
+    items: list[tuple[str, TwitterPost | YoutubeUpload]] = [
+        *(("x", post) for post in x_posts),
+        *(("youtube", upload) for upload in youtube_uploads),
+    ]
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+
+    def item_time(item: tuple[str, TwitterPost | YoutubeUpload]) -> datetime:
+        source, value = item
+        moment = value.created_at if source == "x" else value.published_at
+        return _as_utc_datetime(moment) or minimum
+
+    return sorted(items, key=item_time, reverse=newest_first)
 
 
 

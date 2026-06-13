@@ -129,9 +129,18 @@ class XServerError(XClientError):
 
 
 class LimbusXClient:
-    def __init__(self, config: AppConfig, session: Any) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        session: Any,
+        *,
+        account_username: str | None = None,
+    ) -> None:
         self.config = config
         self.session = session
+        self.account_username = (
+            account_username or config.x_account_username
+        ).strip() or config.x_account_username
         self._x_user_id: str | None = None
         self._fetch_lock = Lock()
         self._cached_posts: list[TwitterPost] = []
@@ -140,6 +149,7 @@ class LimbusXClient:
         self._rate_limit_failures: int = 0
         self._server_error_failures: int = 0
         self._last_backoff_log_until: datetime | None = None
+        self.last_fetch_had_upstream_failure: bool = False
 
     def _has_twitter_auth(self) -> bool:
         cfg = self.config
@@ -198,10 +208,12 @@ class LimbusXClient:
                 "X_AUTH_TOKEN 또는 X_CT0가 설정되지 않아 Twitter 게시물을 가져올 수 없습니다."
             )
         async with self._fetch_lock:
+            self.last_fetch_had_upstream_failure = False
             now = datetime.now(timezone.utc)
             if self._cached_posts and self._cached_at and now - self._cached_at < X_POST_CACHE_TTL:
                 return self._cached_posts[:limit]
             if self._rate_limited_until and now < self._rate_limited_until:
+                self.last_fetch_had_upstream_failure = True
                 if self._cached_posts:
                     self._log_backoff_active()
                     return self._cached_posts[:limit]
@@ -212,6 +224,7 @@ class LimbusXClient:
             try:
                 posts = await self._fetch_via_twitter_api(limit=limit)
             except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                self.last_fetch_had_upstream_failure = True
                 self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
                 self._server_error_failures += 1
                 LOGGER.warning(
@@ -223,11 +236,13 @@ class LimbusXClient:
                     return self._cached_posts[:limit]
                 raise XClientError(f"X API 네트워크 오류: {exc}") from exc
             except XRateLimitError as exc:
+                self.last_fetch_had_upstream_failure = True
                 self._handle_rate_limit(exc)
                 if self._cached_posts:
                     return self._cached_posts[:limit]
                 raise
             except XServerError as exc:
+                self.last_fetch_had_upstream_failure = True
                 seconds = _server_error_backoff_seconds(self._server_error_failures)
                 if exc.retry_after is not None and exc.retry_after > 0:
                     seconds = min(max(exc.retry_after + 1, seconds), X_SERVER_ERROR_BACKOFF_MAX.total_seconds())
@@ -244,10 +259,12 @@ class LimbusXClient:
                 raise
             except XClientError as exc:
                 if _is_rate_limit_error(exc):
+                    self.last_fetch_had_upstream_failure = True
                     self._handle_rate_limit(None)
                     if self._cached_posts:
                         return self._cached_posts[:limit]
                 elif _is_transient_server_error(exc):
+                    self.last_fetch_had_upstream_failure = True
                     self._apply_backoff(_server_error_backoff_seconds(self._server_error_failures))
                     self._server_error_failures += 1
                     LOGGER.warning(
@@ -328,7 +345,7 @@ class LimbusXClient:
         )
 
     async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
-        username = self.config.x_account_username
+        username = self.account_username
         user_id = await self._fetch_user_id(username)
         posts: list[TwitterPost] = []
         cursor: str | None = None

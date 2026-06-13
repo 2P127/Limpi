@@ -92,6 +92,27 @@ class GuildYoutubeTarget:
 
 
 @dataclass(frozen=True)
+class GuildYoutubeUploadTarget:
+    guild_id: int
+    channel_id: int
+    enabled: bool
+    last_video_id: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class GuildHampangTarget:
+    guild_id: int
+    channel_id: int
+    enabled: bool
+    last_x_post_id: str | None
+    last_youtube_video_id: str | None
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
 class UserSettings:
     user_id: int
     username: str

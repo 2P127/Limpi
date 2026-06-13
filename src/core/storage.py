@@ -13,9 +13,11 @@ LOGGER = logging.getLogger(__name__)
 
 from .models import (
     GuildChzzkTarget,
+    GuildHampangTarget,
     GuildNewsTarget,
     GuildTwitterTarget,
     GuildYoutubeTarget,
+    GuildYoutubeUploadTarget,
     GuildSettings,
     NewsPost,
     TrackedMessage,
@@ -201,6 +203,27 @@ class SQLiteStorage:
                 updated_at TEXT NOT NULL
             )
         """,
+        "guild_youtube_upload_targets": """
+            CREATE TABLE IF NOT EXISTS guild_youtube_upload_targets (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_video_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
+        "guild_hampang_targets": """
+            CREATE TABLE IF NOT EXISTS guild_hampang_targets (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_x_post_id TEXT,
+                last_youtube_video_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """,
         "guild_news_target_seen_posts": """
             CREATE TABLE IF NOT EXISTS guild_news_target_seen_posts (
                 target_id INTEGER NOT NULL,
@@ -324,6 +347,18 @@ class SQLiteStorage:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_youtube_targets_channel
                 ON guild_youtube_targets(channel_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_youtube_upload_targets_channel
+                ON guild_youtube_upload_targets(channel_id)
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_hampang_targets_channel
+                ON guild_hampang_targets(channel_id)
                 """
             )
             self._dedupe_news_target_channels()
@@ -1063,6 +1098,24 @@ class SQLiteStorage:
             self._connection.commit()
         return cursor.rowcount > 0
 
+    def delete_youtube_upload_target(self, guild_id: int) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM guild_youtube_upload_targets WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.commit()
+        return cursor.rowcount > 0
+
+    def delete_hampang_target(self, guild_id: int) -> bool:
+        with self._lock:
+            cursor = self._connection.execute(
+                "DELETE FROM guild_hampang_targets WHERE guild_id = ?",
+                (guild_id,),
+            )
+            self._connection.commit()
+        return cursor.rowcount > 0
+
     def get_twitter_target(self, guild_id: int) -> GuildTwitterTarget | None:
         with self._lock:
             row = self._connection.execute(
@@ -1349,6 +1402,190 @@ class SQLiteStorage:
                 WHERE guild_id = ?
                 """,
                 (now, guild_id),
+            )
+            self._connection.commit()
+
+    def get_youtube_upload_target(self, guild_id: int) -> GuildYoutubeUploadTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_video_id, created_at, updated_at
+                FROM guild_youtube_upload_targets
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return self._row_to_youtube_upload_target(row) if row is not None else None
+
+    def list_youtube_upload_targets(self) -> list[GuildYoutubeUploadTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_video_id, created_at, updated_at
+                FROM guild_youtube_upload_targets
+                WHERE enabled = 1
+                ORDER BY guild_id
+                """
+            ).fetchall()
+        return [self._row_to_youtube_upload_target(row) for row in rows]
+
+    def upsert_youtube_upload_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        enabled: bool = True,
+        last_video_id: str | None = None,
+    ) -> GuildYoutubeUploadTarget:
+        current = self.get_youtube_upload_target(guild_id)
+        now = _now_iso()
+        next_last_video_id = (
+            last_video_id if last_video_id is not None else (
+                current.last_video_id if current is not None else None
+            )
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO guild_youtube_upload_targets (
+                    guild_id, channel_id, enabled, last_video_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    enabled = excluded.enabled,
+                    last_video_id = COALESCE(
+                        excluded.last_video_id,
+                        guild_youtube_upload_targets.last_video_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (guild_id, channel_id, int(enabled), next_last_video_id, now, now),
+            )
+            self._connection.commit()
+        target = self.get_youtube_upload_target(guild_id)
+        if target is None:
+            raise RuntimeError("Failed to upsert guild youtube upload target")
+        return target
+
+    def mark_youtube_upload_target_seen(self, guild_id: int, video_id: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                UPDATE guild_youtube_upload_targets
+                SET last_video_id = ?, updated_at = ?
+                WHERE guild_id = ?
+                """,
+                (video_id, now, guild_id),
+            )
+            self._connection.commit()
+
+    def get_hampang_target(self, guild_id: int) -> GuildHampangTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_x_post_id,
+                       last_youtube_video_id, created_at, updated_at
+                FROM guild_hampang_targets
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return self._row_to_hampang_target(row) if row is not None else None
+
+    def list_hampang_targets(self) -> list[GuildHampangTarget]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT guild_id, channel_id, enabled, last_x_post_id,
+                       last_youtube_video_id, created_at, updated_at
+                FROM guild_hampang_targets
+                WHERE enabled = 1
+                ORDER BY guild_id
+                """
+            ).fetchall()
+        return [self._row_to_hampang_target(row) for row in rows]
+
+    def upsert_hampang_target(
+        self,
+        guild_id: int,
+        *,
+        channel_id: int,
+        enabled: bool = True,
+        last_x_post_id: str | None = None,
+        last_youtube_video_id: str | None = None,
+    ) -> GuildHampangTarget:
+        current = self.get_hampang_target(guild_id)
+        now = _now_iso()
+        next_x_id = last_x_post_id if last_x_post_id is not None else (
+            current.last_x_post_id if current is not None else None
+        )
+        next_youtube_id = (
+            last_youtube_video_id if last_youtube_video_id is not None else (
+                current.last_youtube_video_id if current is not None else None
+            )
+        )
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO guild_hampang_targets (
+                    guild_id, channel_id, enabled, last_x_post_id,
+                    last_youtube_video_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    enabled = excluded.enabled,
+                    last_x_post_id = COALESCE(
+                        excluded.last_x_post_id,
+                        guild_hampang_targets.last_x_post_id
+                    ),
+                    last_youtube_video_id = COALESCE(
+                        excluded.last_youtube_video_id,
+                        guild_hampang_targets.last_youtube_video_id
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    int(enabled),
+                    next_x_id,
+                    next_youtube_id,
+                    now,
+                    now,
+                ),
+            )
+            self._connection.commit()
+        target = self.get_hampang_target(guild_id)
+        if target is None:
+            raise RuntimeError("Failed to upsert guild hampang target")
+        return target
+
+    def mark_hampang_target_seen(
+        self,
+        guild_id: int,
+        *,
+        x_post_id: str | None = None,
+        youtube_video_id: str | None = None,
+    ) -> None:
+        if x_post_id is None and youtube_video_id is None:
+            return
+        now = _now_iso()
+        assignments = ["updated_at = ?"]
+        values: list[object] = [now]
+        if x_post_id is not None:
+            assignments.append("last_x_post_id = ?")
+            values.append(x_post_id)
+        if youtube_video_id is not None:
+            assignments.append("last_youtube_video_id = ?")
+            values.append(youtube_video_id)
+        values.append(guild_id)
+        with self._lock:
+            self._connection.execute(
+                f"UPDATE guild_hampang_targets SET {', '.join(assignments)} WHERE guild_id = ?",
+                values,
             )
             self._connection.commit()
 
@@ -2496,6 +2733,12 @@ class SQLiteStorage:
                 "DELETE FROM guild_youtube_targets WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
+                "DELETE FROM guild_youtube_upload_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM guild_hampang_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
                 "DELETE FROM guild_settings WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
@@ -2581,6 +2824,29 @@ class SQLiteStorage:
             enabled=bool(row["enabled"]),
             last_live_id=row["last_live_id"],
             is_live=bool(row["is_live"]),
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_youtube_upload_target(row: sqlite3.Row) -> GuildYoutubeUploadTarget:
+        return GuildYoutubeUploadTarget(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            enabled=bool(row["enabled"]),
+            last_video_id=row["last_video_id"],
+            created_at=_datetime_from_iso(row["created_at"]),
+            updated_at=_datetime_from_iso(row["updated_at"]),
+        )
+
+    @staticmethod
+    def _row_to_hampang_target(row: sqlite3.Row) -> GuildHampangTarget:
+        return GuildHampangTarget(
+            guild_id=int(row["guild_id"]),
+            channel_id=int(row["channel_id"]),
+            enabled=bool(row["enabled"]),
+            last_x_post_id=row["last_x_post_id"],
+            last_youtube_video_id=row["last_youtube_video_id"],
             created_at=_datetime_from_iso(row["created_at"]),
             updated_at=_datetime_from_iso(row["updated_at"]),
         )
