@@ -8679,7 +8679,10 @@ def _twitter_matches_steam_news(
     )
     content_matches = _news_match_candidates_overlap(
         twitter_candidates,
-        _news_body_match_candidates(steam_post.text),
+        {
+            *_news_body_match_candidates(steam_post.title),
+            *_news_body_match_candidates(steam_post.text),
+        },
     )
     return link_matches and content_matches
 
