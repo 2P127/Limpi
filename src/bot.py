@@ -82,6 +82,9 @@ HAMPANG_POLL_INTERVAL_SECONDS = 60
 HAMPANG_X_USERNAME = "Ham_PangPang"
 HAMPANG_X_URL = "https://x.com/Ham_PangPang"
 HAMPANG_YOUTUBE_TITLE_MARKER = "hamhampangpang"
+HAMPANG_SOURCE_BOTH = "both"
+HAMPANG_SOURCE_X = "x"
+HAMPANG_SOURCE_YOUTUBE = "youtube"
 CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
 YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
@@ -161,6 +164,11 @@ NEWS_SOURCE_CHOICES = [
 NEWS_LOOKUP_SOURCE_CHOICES = [
     app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
     app_commands.Choice(name="트위터", value=NEWS_SOURCE_TWITTER),
+]
+HAMPANG_SOURCE_CHOICES = [
+    app_commands.Choice(name="X(트위터) & YouTube", value=HAMPANG_SOURCE_BOTH),
+    app_commands.Choice(name="X(트위터)", value=HAMPANG_SOURCE_X),
+    app_commands.Choice(name="YouTube", value=HAMPANG_SOURCE_YOUTUBE),
 ]
 LANGUAGE_CHOICES = [
     app_commands.Choice(name="한국어", value="koreana"),
@@ -792,6 +800,164 @@ class NewsPostSelectView(discord.ui.View):
             language=self.language,
             private=self.private,
             attach_photos=self.attach_photos,
+        )
+
+
+class HampangNewsSelect(discord.ui.Select):
+    def __init__(self, parent: "HampangNewsSelectView") -> None:
+        options = parent.current_options()
+        super().__init__(
+            placeholder="햄햄팡팡 소식을 선택해주세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=not options,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_select(interaction, self.values[0])
+
+
+class HampangNewsSelectView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "NewsCog",
+        author_id: int,
+        items: list[tuple[str, TwitterPost | YoutubeUpload]],
+        *,
+        mode: str,
+        private: bool = True,
+        channel_id: int | None = None,
+        role_id: int | None = None,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.author_id = author_id
+        self.items = items
+        self.mode = mode
+        self.private = private
+        self.channel_id = channel_id
+        self.role_id = role_id
+        self.page = 0
+        self.refresh_items()
+
+    @property
+    def max_page(self) -> int:
+        if not self.items:
+            return 0
+        return (len(self.items) - 1) // NEWS_SELECT_PAGE_SIZE
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        await interaction.response.send_message(
+            "이 선택 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
+            ephemeral=True,
+        )
+        return False
+
+    def current_options(self) -> list[discord.SelectOption]:
+        start = self.page * NEWS_SELECT_PAGE_SIZE
+        page_items = self.items[start:start + NEWS_SELECT_PAGE_SIZE]
+        options: list[discord.SelectOption] = []
+        for source, item in page_items:
+            index = start + len(options)
+            options.append(
+                discord.SelectOption(
+                    label=_hampang_choice_name(source, item)[:100],
+                    value=str(index),
+                    description=_hampang_choice_description(source, item)[:100],
+                )
+            )
+        return options
+
+    def refresh_items(self) -> None:
+        self.clear_items()
+        self.add_item(HampangNewsSelect(self))
+        prev_button = discord.ui.Button(
+            label="이전",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0,
+        )
+        next_button = discord.ui.Button(
+            label="다음",
+            style=discord.ButtonStyle.secondary,
+            disabled=self.page >= self.max_page,
+        )
+        prev_button.callback = self.previous_page
+        next_button.callback = self.next_page
+        self.add_item(prev_button)
+        self.add_item(next_button)
+
+    async def previous_page(self, interaction: discord.Interaction) -> None:
+        if self.page > 0:
+            self.page -= 1
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        if self.page < self.max_page:
+            self.page += 1
+        self.refresh_items()
+        await self.update_message(interaction)
+
+    async def update_message(self, interaction: discord.Interaction) -> None:
+        await interaction.response.edit_message(
+            embed=self.build_embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    def build_embed(self) -> discord.Embed:
+        title = (
+            "보낼 햄햄팡팡 소식을 선택해주세요"
+            if self.mode == "send"
+            else "확인할 햄햄팡팡 이전 소식을 선택해주세요"
+        )
+        x_count = sum(1 for source, _ in self.items if source == HAMPANG_SOURCE_X)
+        youtube_count = len(self.items) - x_count
+        description = (
+            f"{self.page + 1} / {self.max_page + 1} 페이지"
+            f"\nX(트위터) {x_count}개 · YouTube {youtube_count}개"
+        )
+        return discord.Embed(
+            title=title,
+            description=description,
+            color=discord.Color.from_rgb(179, 28, 28),
+        )
+
+    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
+        try:
+            source, item = self.items[int(value)]
+        except (IndexError, ValueError):
+            await interaction.response.send_message(
+                "선택한 햄햄팡팡 소식을 찾지 못했어요.",
+                ephemeral=True,
+            )
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="선택한 햄햄팡팡 소식을 처리하고 있어요.",
+            embed=None,
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        if self.mode == "send":
+            await self.cog._send_selected_hampang_news(
+                interaction,
+                source,
+                item,
+                channel_id=self.channel_id,
+                role_id=self.role_id,
+            )
+            return
+        await self.cog._show_selected_hampang_news(
+            interaction,
+            source,
+            item,
+            private=self.private,
         )
 
 
@@ -2837,6 +3003,51 @@ class NewsCog(commands.Cog):
                 continue
             filtered.append(post)
         return filtered
+
+    def _auto_sendable_hampang_x_posts(
+        self,
+        posts: list[TwitterPost],
+        *,
+        target: GuildHampangTarget,
+    ) -> list[TwitterPost]:
+        if not posts:
+            return []
+
+        created_after = _as_utc_datetime(target.created_at)
+        max_twitter_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
+        filtered: list[TwitterPost] = []
+        for post in posts:
+            created = _as_utc_datetime(post.created_at)
+            if created is None:
+                continue
+            if created_after is not None and created <= created_after:
+                continue
+            if max_twitter_age > 0 and not _is_twitter_post_recent(post, max_twitter_age):
+                continue
+            filtered.append(post)
+        return filtered
+
+    def _auto_sendable_hampang_youtube_uploads(
+        self,
+        uploads: list[YoutubeUpload],
+        *,
+        target: GuildHampangTarget,
+    ) -> list[YoutubeUpload]:
+        if not uploads:
+            return []
+
+        created_after = _as_utc_datetime(target.created_at)
+        if created_after is None:
+            return uploads
+        return [
+            upload
+            for upload in uploads
+            if (published_at := _as_utc_datetime(upload.published_at)) is not None
+            and published_at > created_after
+        ]
 
     async def _resolve_automatic_news_channel(
         self, target: GuildNewsTarget
@@ -5186,7 +5397,7 @@ class NewsCog(commands.Cog):
             else:
                 LOGGER.warning("햄햄팡팡 공식 X 확인 실패: %s", x_result)
         else:
-            x_posts = x_result
+            x_posts = _sort_twitter_posts_newest_first(x_result)
             had_failure = self.hampang_x_source.last_fetch_had_upstream_failure
 
         if isinstance(youtube_result, Exception):
@@ -5196,10 +5407,12 @@ class NewsCog(commands.Cog):
             else:
                 LOGGER.warning("햄햄팡팡 YouTube 영상 확인 실패: %s", youtube_result)
         else:
-            youtube_uploads = [
-                upload for upload in youtube_result
-                if _is_hampang_youtube_upload(upload)
-            ]
+            youtube_uploads = _sort_youtube_uploads_newest_first(
+                [
+                    upload for upload in youtube_result
+                    if _is_hampang_youtube_upload(upload)
+                ]
+            )
         return x_posts, youtube_uploads, had_failure
 
     async def _poll_hampang_once(self) -> int:
@@ -5258,9 +5471,9 @@ class NewsCog(commands.Cog):
                 continue
 
             if x_posts and target.last_x_post_id in x_ids:
-                new_x_posts = x_posts[:x_ids.index(target.last_x_post_id)]
+                raw_new_x_posts = x_posts[:x_ids.index(target.last_x_post_id)]
             else:
-                new_x_posts = [
+                raw_new_x_posts = [
                     post
                     for post in x_posts
                     if baseline_at is not None
@@ -5269,17 +5482,54 @@ class NewsCog(commands.Cog):
                 ]
 
             if youtube_uploads and target.last_youtube_video_id in youtube_ids:
-                new_youtube_uploads = youtube_uploads[
+                raw_new_youtube_uploads = youtube_uploads[
                     :youtube_ids.index(target.last_youtube_video_id)
                 ]
             else:
-                new_youtube_uploads = [
+                raw_new_youtube_uploads = [
                     upload
                     for upload in youtube_uploads
                     if baseline_at is not None
                     and (published_at := _as_utc_datetime(upload.published_at)) is not None
                     and published_at > baseline_at
                 ]
+
+            new_x_posts = self._auto_sendable_hampang_x_posts(
+                raw_new_x_posts,
+                target=target,
+            )
+            new_youtube_uploads = self._auto_sendable_hampang_youtube_uploads(
+                raw_new_youtube_uploads,
+                target=target,
+            )
+            if raw_new_x_posts and not new_x_posts and latest_x_id is not None:
+                self.storage.mark_hampang_target_seen(
+                    target.guild_id,
+                    x_post_id=latest_x_id,
+                )
+                LOGGER.info(
+                    "햄햄팡팡 오래된 X 소식 자동 전송 건너뜀: 최신 기준선으로 갱신 "
+                    "(guild_id=%s, skipped=%s, latest_x_id=%s).",
+                    target.guild_id,
+                    len(raw_new_x_posts),
+                    latest_x_id,
+                )
+            if (
+                raw_new_youtube_uploads
+                and not new_youtube_uploads
+                and latest_youtube_id is not None
+            ):
+                self.storage.mark_hampang_target_seen(
+                    target.guild_id,
+                    youtube_video_id=latest_youtube_id,
+                )
+                LOGGER.info(
+                    "햄햄팡팡 설정 이전 YouTube 영상 자동 전송 건너뜀: 최신 기준선으로 갱신 "
+                    "(guild_id=%s, skipped=%s, latest_youtube_id=%s).",
+                    target.guild_id,
+                    len(raw_new_youtube_uploads),
+                    latest_youtube_id,
+                )
             items = _hampang_news_items(new_x_posts, new_youtube_uploads, newest_first=False)
             if not items:
                 if missing_x_baseline or missing_youtube_baseline:
@@ -6261,6 +6511,180 @@ class NewsCog(commands.Cog):
             else None
         )
 
+    async def _send_hampang_news_select_menu(
+        self,
+        interaction: discord.Interaction,
+        items: list[tuple[str, TwitterPost | YoutubeUpload]],
+        *,
+        mode: str,
+        private: bool = True,
+        channel_id: int | None = None,
+        role_id: int | None = None,
+        had_failure: bool = False,
+    ) -> None:
+        if not items:
+            message = (
+                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
+                if had_failure
+                else "선택할 수 있는 햄햄팡팡 소식이 없어요."
+            )
+            if interaction.response.is_done():
+                await interaction.followup.send(message, ephemeral=True)
+            else:
+                await interaction.response.send_message(message, ephemeral=True)
+            return
+
+        view = HampangNewsSelectView(
+            self,
+            interaction.user.id,
+            items,
+            mode=mode,
+            private=private,
+            channel_id=channel_id,
+            role_id=role_id,
+        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                embed=view.build_embed(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=view.build_embed(),
+                view=view,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _show_selected_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        source: str,
+        item: TwitterPost | YoutubeUpload,
+        *,
+        private: bool,
+    ) -> None:
+        sent_messages: list[discord.Message | None]
+        if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
+            sent_messages = await self._send_twitter_post_followups(
+                interaction,
+                item,
+                private=private,
+            )
+        elif source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
+            sent_messages = [
+                await interaction.followup.send(
+                    embed=_embed_for_hampang_youtube_upload(item),
+                    view=_youtube_upload_view(item.url),
+                    ephemeral=private,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                    wait=True,
+                )
+            ]
+        else:
+            await interaction.followup.send(
+                "선택한 햄햄팡팡 소식 형식을 확인하지 못했어요.",
+                ephemeral=True,
+            )
+            return
+
+        if not private and interaction.guild_id is not None and interaction.channel_id is not None:
+            for message in sent_messages:
+                await self._track_manual_message(
+                    interaction.guild_id,
+                    interaction.channel_id,
+                    message,
+                )
+
+    async def _show_latest_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        *,
+        private: bool,
+    ) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=private, thinking=True)
+        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+        items = _hampang_news_items(x_posts, youtube_uploads)
+        if not items:
+            await interaction.followup.send(
+                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
+                if had_failure else "아직 확인된 햄햄팡팡 소식이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        source, item = items[0]
+        await self._show_selected_hampang_news(
+            interaction,
+            source,
+            item,
+            private=private,
+        )
+
+    async def _send_selected_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        source: str,
+        item: TwitterPost | YoutubeUpload,
+        *,
+        channel_id: int | None,
+        role_id: int | None,
+    ) -> None:
+        if interaction.guild_id is None or channel_id is None:
+            await interaction.followup.send(
+                "햄햄팡팡 소식을 보낼 채널을 찾지 못했어요.",
+                ephemeral=True,
+            )
+            return
+        target_channel = await self._resolve_target_channel(None, channel_id)
+        if target_channel is None:
+            await interaction.followup.send(
+                "햄햄팡팡 소식을 보낼 채널에 접근하지 못했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+            )
+            return
+
+        settings = self.storage.get_settings(interaction.guild_id)
+        role_to_send = role_id if role_id is not None else settings.role_id
+        try:
+            if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
+                message = await self._send_twitter_post_to_channel(
+                    target_channel,
+                    item,
+                    role_id=role_to_send,
+                )
+            elif source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
+                message = await self._send_hampang_youtube_upload_to_channel(
+                    target_channel,
+                    item,
+                    role_id=role_to_send,
+                )
+            else:
+                await interaction.followup.send(
+                    "선택한 햄햄팡팡 소식 형식을 확인하지 못했어요.",
+                    ephemeral=True,
+                )
+                return
+        except discord.HTTPException:
+            LOGGER.exception("햄햄팡팡 소식 수동 전송 실패.")
+            await interaction.followup.send(
+                "햄햄팡팡 소식 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        await self._track_manual_message(interaction.guild_id, channel_id, message)
+        channel_mention = getattr(target_channel, "mention", f"<#{channel_id}>")
+        await interaction.followup.send(
+            f"{channel_mention}에 선택한 햄햄팡팡 소식을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     @app_commands.command(name="햄팡소식설정", description="햄햄팡팡 공식 X와 관련 YouTube 영상 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -6348,41 +6772,80 @@ class NewsCog(commands.Cog):
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def view_hampang_news(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
-        items = _hampang_news_items(x_posts, youtube_uploads)
-        if not items:
-            await interaction.followup.send(
-                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
-                if had_failure else "아직 확인된 햄햄팡팡 소식이 없어요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        source, item = items[0]
-        if source == "x":
-            await interaction.followup.send(
-                embeds=_embeds_for_twitter_post(item, image_urls=_twitter_image_urls(item)),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        else:
-            await interaction.followup.send(
-                embed=_embed_for_hampang_youtube_upload(item),
-                view=_youtube_upload_view(item.url),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        await self._show_latest_hampang_news(interaction, private=True)
 
-    @app_commands.command(name="햄팡소식보내기", description="가장 최근 햄햄팡팡 소식을 지정 채널에 보냅니다.")
+    @app_commands.command(name="햄팡최근소식보기", description="가장 최근 햄햄팡팡 소식을 즉시 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(private="나만보기")
+    @app_commands.describe(
+        private="켜면 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+    )
+    @app_commands.choices(private=BOOLEAN_CHOICES)
+    async def view_latest_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        private: app_commands.Choice[str] | None = None,
+    ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        if not await self._allow_public_news_send(interaction, private=private_value):
+            return
+        if not await self._confirm_external_news_send(interaction):
+            return
+        await self._show_latest_hampang_news(interaction, private=private_value)
+
+    @app_commands.command(name="햄팡이전소식보기", description="최근 수집한 햄햄팡팡 이전 소식을 골라서 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.rename(source="소스", private="나만보기")
+    @app_commands.describe(
+        source="확인할 햄햄팡팡 소식의 출처입니다.",
+        private="켜면 선택한 소식이 나에게만 보이고, 끄면 채널에 메시지를 보냅니다.",
+    )
+    @app_commands.choices(source=HAMPANG_SOURCE_CHOICES, private=BOOLEAN_CHOICES)
+    async def view_previous_hampang_news(
+        self,
+        interaction: discord.Interaction,
+        source: app_commands.Choice[str] | None = None,
+        private: app_commands.Choice[str] | None = None,
+    ) -> None:
+        private_value = bool(_choice_bool(private, True))
+        if not await self._allow_public_news_send(interaction, private=private_value):
+            return
+        if not await self._confirm_external_news_send(interaction):
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
+        items = _hampang_news_items_for_source(
+            x_posts,
+            youtube_uploads,
+            source.value if source is not None else HAMPANG_SOURCE_BOTH,
+        )
+        await self._send_hampang_news_select_menu(
+            interaction,
+            items,
+            mode="previous",
+            private=private_value,
+            had_failure=had_failure,
+        )
+
+    @app_commands.command(name="햄팡소식보내기", description="햄햄팡팡 소식을 골라서 지정 채널에 보냅니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
-    @app_commands.rename(channel="채널", role="역할")
+    @app_commands.rename(source="소스", channel="채널", role="역할")
+    @app_commands.describe(
+        source="보낼 햄햄팡팡 소식의 출처입니다.",
+        channel="보낼 채널입니다. 비워두면 설정 채널이나 현재 채널을 사용합니다.",
+        role="함께 핑할 역할입니다. 비워두면 /서버설정에서 지정한 역할을 사용합니다.",
+    )
+    @app_commands.choices(source=HAMPANG_SOURCE_CHOICES)
     async def send_hampang_news(
         self,
         interaction: discord.Interaction,
+        source: app_commands.Choice[str] | None = None,
         channel: discord.TextChannel | None = None,
         role: discord.Role | None = None,
     ) -> None:
@@ -6399,53 +6862,18 @@ class NewsCog(commands.Cog):
             )
             return
         x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
-        items = _hampang_news_items(x_posts, youtube_uploads)
-        if not items:
-            await interaction.followup.send(
-                "최근 햄햄팡팡 소식을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요."
-                if had_failure else "보낼 수 있는 햄햄팡팡 소식이 없어요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        source, item = items[0]
-        settings = self.storage.get_settings(interaction.guild_id)
-        role_id = role.id if role is not None else settings.role_id
-        try:
-            if source == "x":
-                message = await self._send_twitter_post_to_channel(
-                    target_channel,
-                    item,
-                    role_id=role_id,
-                )
-            else:
-                message = await self._send_hampang_youtube_upload_to_channel(
-                    target_channel,
-                    item,
-                    role_id=role_id,
-                )
-        except discord.HTTPException:
-            LOGGER.exception("햄햄팡팡 소식 수동 전송 실패.")
-            await interaction.followup.send(
-                "햄햄팡팡 소식 전송에 실패했어요. 채널 권한을 확인해주세요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        target = self.storage.get_hampang_target(interaction.guild_id)
-        if target is not None:
-            self.storage.mark_hampang_target_seen(
-                interaction.guild_id,
-                x_post_id=item.post_id if source == "x" else None,
-                youtube_video_id=item.video_id if source == "youtube" else None,
-            )
-        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
-        await interaction.followup.send(
-            f"{target_channel.mention}에 최신 햄햄팡팡 소식을 보냈어요.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
+        items = _hampang_news_items_for_source(
+            x_posts,
+            youtube_uploads,
+            source.value if source is not None else HAMPANG_SOURCE_BOTH,
+        )
+        await self._send_hampang_news_select_menu(
+            interaction,
+            items,
+            mode="send",
+            channel_id=target_channel.id,
+            role_id=role.id if role is not None else None,
+            had_failure=had_failure,
         )
 
     @app_commands.command(name="유튜브알림설정", description="ProjectMoon Official 일반 영상 업로드 알림을 설정합니다.")
@@ -7963,7 +8391,9 @@ class NewsCog(commands.Cog):
                 "> `/유튜브알림현황보기` — 최근 일반 영상과 알림 현황 보기\n"
                 "> `/유튜브알림보내기` — 최근 일반 영상을 지정 채널에 전송\n"
                 "> `/햄팡소식설정` · `/햄팡소식해제` — 햄햄팡팡 소식 자동 알림 관리\n"
-                "> `/햄팡소식보기` · `/햄팡소식보내기` — 최신 햄햄팡팡 소식 확인·전송"
+                "> `/햄팡최근소식보기` — 최신 햄햄팡팡 소식 확인\n"
+                "> `/햄팡이전소식보기` — 최근 수집한 햄햄팡팡 소식을 골라서 확인\n"
+                "> `/햄팡소식보내기` — 햄햄팡팡 소식을 골라서 채널에 전송"
             )
         )
         container.add_item(discord.ui.Separator())
@@ -9354,6 +9784,26 @@ def _regular_youtube_uploads(uploads: list[YoutubeUpload]) -> list[YoutubeUpload
     return [upload for upload in uploads if not _is_hampang_youtube_upload(upload)]
 
 
+def _sort_twitter_posts_newest_first(posts: list[TwitterPost]) -> list[TwitterPost]:
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(
+        posts,
+        key=lambda post: _as_utc_datetime(post.created_at) or minimum,
+        reverse=True,
+    )
+
+
+def _sort_youtube_uploads_newest_first(
+    uploads: list[YoutubeUpload],
+) -> list[YoutubeUpload]:
+    minimum = datetime.min.replace(tzinfo=timezone.utc)
+    return sorted(
+        uploads,
+        key=lambda upload: _as_utc_datetime(upload.published_at) or minimum,
+        reverse=True,
+    )
+
+
 def _hampang_news_items(
     x_posts: list[TwitterPost],
     youtube_uploads: list[YoutubeUpload],
@@ -9372,6 +9822,47 @@ def _hampang_news_items(
         return _as_utc_datetime(moment) or minimum
 
     return sorted(items, key=item_time, reverse=newest_first)
+
+
+def _hampang_news_items_for_source(
+    x_posts: list[TwitterPost],
+    youtube_uploads: list[YoutubeUpload],
+    source: str,
+) -> list[tuple[str, TwitterPost | YoutubeUpload]]:
+    selected_x_posts = x_posts if source in {HAMPANG_SOURCE_BOTH, HAMPANG_SOURCE_X} else []
+    selected_youtube_uploads = (
+        youtube_uploads
+        if source in {HAMPANG_SOURCE_BOTH, HAMPANG_SOURCE_YOUTUBE}
+        else []
+    )
+    return _hampang_news_items(selected_x_posts, selected_youtube_uploads)
+
+
+def _hampang_choice_name(
+    source: str,
+    item: TwitterPost | YoutubeUpload,
+) -> str:
+    source_label = "X" if source == HAMPANG_SOURCE_X else "YouTube"
+    title = item.title.strip() or (
+        item.post_id if isinstance(item, TwitterPost) else item.video_id
+    )
+    prefix = f"[{source_label}] "
+    max_title_length = max(1, 100 - len(prefix))
+    if len(title) <= max_title_length:
+        return f"{prefix}{title}"
+    if max_title_length <= 3:
+        return f"{prefix}{title[:max_title_length]}"
+    return f"{prefix}{title[: max_title_length - 3]}..."
+
+
+def _hampang_choice_description(
+    source: str,
+    item: TwitterPost | YoutubeUpload,
+) -> str:
+    moment = item.created_at if source == HAMPANG_SOURCE_X else item.published_at
+    if moment is None:
+        return "작성 시간을 확인할 수 없어요."
+    return _format_kst(moment)
 
 
 
