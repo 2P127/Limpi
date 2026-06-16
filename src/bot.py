@@ -9,6 +9,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import signal
 import socket
 import sys
@@ -103,6 +104,7 @@ BRIGHTEN_CACHE_MAX_ITEM_BYTES = 16 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEMS = 128
 IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
 IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
+IMAGE_FAILED_URL_CACHE_MAX_ITEMS = 1024
 # 처리 완료된 에고 기프트 첨부 이미지(150px PNG)는 작아서 넉넉히 캐싱한다.
 EGO_GIFT_IMAGE_CACHE_MAX_ITEMS = 512
 EGO_GIFT_IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
@@ -118,6 +120,7 @@ TCP_KEEPALIVE_INTERVAL_SECONDS = 10
 TCP_KEEPALIVE_PROBES = 3
 WINDOWS_KEEPALIVE_TIME_MS = TCP_KEEPALIVE_IDLE_SECONDS * 1000
 WINDOWS_KEEPALIVE_INTERVAL_MS = TCP_KEEPALIVE_INTERVAL_SECONDS * 1000
+ASYNCIO_RESET_LOG_COOLDOWN_SECONDS = 300
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 NEWS_BANNER_DIR = Path("img")
@@ -241,6 +244,69 @@ MAINTENANCE_UPDATE_DESCRIPTION = (
     "지금 림버스 컴퍼니가 점검이 끝나고 업데이트가 되었어요! "
     "스팀 또는 앱 스토어에 들어가서 림버스를 업데이트 해주세요! <3"
 )
+_last_asyncio_reset_log_at = 0.0
+
+
+def _install_windows_selector_event_loop_policy() -> None:
+    if sys.platform != "win32":
+        return
+    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy_factory is None:
+        return
+    try:
+        asyncio.set_event_loop_policy(policy_factory())
+    except RuntimeError:
+        pass
+
+
+def _is_asyncio_transport_reset_context(context: dict[str, object]) -> bool:
+    exc = context.get("exception")
+    if not isinstance(exc, ConnectionResetError):
+        return False
+    if getattr(exc, "winerror", None) != 10054:
+        return False
+    message = str(context.get("message") or "")
+    handle = str(context.get("handle") or "")
+    return (
+        "Exception in callback" in message
+        and "_ProactorBasePipeTransport._call_connection_lost" in handle
+    )
+
+
+def _install_asyncio_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
+    previous_handler = loop.get_exception_handler()
+
+    def _handle_exception(
+        current_loop: asyncio.AbstractEventLoop,
+        context: dict[str, object],
+    ) -> None:
+        global _last_asyncio_reset_log_at
+        if _is_asyncio_transport_reset_context(context):
+            now = current_loop.time()
+            if now - _last_asyncio_reset_log_at >= ASYNCIO_RESET_LOG_COOLDOWN_SECONDS:
+                _last_asyncio_reset_log_at = now
+                LOGGER.warning(
+                    "네트워크 연결이 원격에서 끊겨 비동기 전송을 정리했습니다 "
+                    "(WinError 10054)."
+                )
+            exc = context.get("exception")
+            LOGGER.debug(
+                "asyncio 연결 종료 콜백 오류 전체 정보: %s",
+                context,
+                exc_info=(
+                    (type(exc), exc, exc.__traceback__)
+                    if isinstance(exc, BaseException)
+                    else None
+                ),
+            )
+            return
+
+        if previous_handler is not None:
+            previous_handler(current_loop, context)
+        else:
+            current_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_handle_exception)
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -275,10 +341,20 @@ def _internet_error_detail(exc: BaseException) -> tuple[str, str] | None:
             return "네트워크 연결 오류", type(item).__name__
 
     message = str(exc)
+    if any(
+        marker in message
+        for marker in (
+            "Cannot write to closing transport",
+            "closing transport",
+            "WinError 10054",
+        )
+    ):
+        return "네트워크 연결 오류", type(exc).__name__
     if isinstance(exc, XClientError) and any(
         marker in message
         for marker in (
             "네트워크",
+            "백오프",
             "Cannot connect",
             "getaddrinfo",
             "Name or service not known",
@@ -432,11 +508,19 @@ class LimpiBot(commands.Bot):
         self._logged_startup_summary = False
 
     async def update_presence_status(self, text: str | None = None) -> None:
-        await self.change_presence(
-            activity=discord.Game(
-                name=text or f"림피가 {len(self.guilds)}개의 서버에서 활동중이에요!"
+        if self.is_closed() or not self.is_ready():
+            return
+        try:
+            await self.change_presence(
+                activity=discord.Game(
+                    name=text or f"림피가 {len(self.guilds)}개의 서버에서 활동중이에요!"
+                )
             )
-        )
+        except (aiohttp.ClientConnectionError, ConnectionError, discord.ConnectionClosed) as exc:
+            LOGGER.debug(
+                "Discord 상태 갱신을 건너뜁니다: 연결 재수립 중입니다.",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     async def setup_hook(self) -> None:
         self.add_dynamic_items(ZipDownloadButton)
@@ -812,6 +896,7 @@ class HampangNewsSelect(discord.ui.Select):
             max_values=1,
             options=options,
             disabled=not options,
+            custom_id="limpi:hampang:select",
         )
         self.parent_view = parent
 
@@ -831,7 +916,7 @@ class HampangNewsSelectView(discord.ui.View):
         channel_id: int | None = None,
         role_id: int | None = None,
     ) -> None:
-        super().__init__(timeout=120)
+        super().__init__(timeout=900)
         self.cog = cog
         self.author_id = author_id
         self.items = items
@@ -879,11 +964,13 @@ class HampangNewsSelectView(discord.ui.View):
             label="이전",
             style=discord.ButtonStyle.secondary,
             disabled=self.page <= 0,
+            custom_id="limpi:hampang:previous",
         )
         next_button = discord.ui.Button(
             label="다음",
             style=discord.ButtonStyle.secondary,
             disabled=self.page >= self.max_page,
+            custom_id="limpi:hampang:next",
         )
         prev_button.callback = self.previous_page
         next_button.callback = self.next_page
@@ -991,6 +1078,7 @@ class EgoGiftKeywordSelect(discord.ui.Select):
             min_values=1,
             max_values=1,
             options=options,
+            custom_id="limpi:ego-gift:keyword",
         )
         self.parent_view = parent
 
@@ -1012,6 +1100,7 @@ class EgoGiftSelect(discord.ui.Select):
             max_values=1,
             options=options,
             disabled=not parent.has_active_filter or not parent.filtered_gifts,
+            custom_id="limpi:ego-gift:select",
         )
         self.parent_view = parent
 
@@ -1028,7 +1117,7 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         query: str = "",
         private: bool = True,
     ) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=900)
         self.cog = cog
         self.author_id = author_id
         self.query = query.strip()
@@ -1036,6 +1125,7 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         self.keyword: str | None = None
         self.page = 0
         self.selected_gift: EgoGift | None = None
+        self._update_lock = asyncio.Lock()
         self.refresh_items()
 
     @property
@@ -1176,21 +1266,25 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         search_button = discord.ui.Button(
             label="검색",
             style=discord.ButtonStyle.primary,
+            custom_id="limpi:ego-gift:search",
         )
         reset_button = discord.ui.Button(
             label="초기화",
             style=discord.ButtonStyle.secondary,
             disabled=not self.query and self.keyword is None,
+            custom_id="limpi:ego-gift:reset",
         )
         prev_button = discord.ui.Button(
             label="이전",
             style=discord.ButtonStyle.secondary,
             disabled=self.page <= 0,
+            custom_id="limpi:ego-gift:previous",
         )
         next_button = discord.ui.Button(
             label="다음",
             style=discord.ButtonStyle.secondary,
             disabled=self.page >= self.max_page,
+            custom_id="limpi:ego-gift:next",
         )
         search_button.callback = self.open_search
         reset_button.callback = self.reset_filters
@@ -1236,12 +1330,13 @@ class EgoGiftSelectView(discord.ui.LayoutView):
         # 이후 15분 창을 가진 webhook(edit_original_response)으로 편집한다.
         if not interaction.response.is_done():
             await interaction.response.defer()
-        attachments = await self.build_response()
-        await interaction.edit_original_response(
-            attachments=attachments,
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        async with self._update_lock:
+            attachments = await self.build_response()
+            await interaction.edit_original_response(
+                attachments=attachments,
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     async def build_response(self) -> list[discord.File]:
         file = None
@@ -1371,14 +1466,17 @@ class NewsCog(commands.Cog):
         self._hampang_poll_lock = asyncio.Lock()
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
+        self._twitter_steam_defer_logged_post_ids: set[str] = set()
         self._zip_cache: dict[str, tuple[bytes, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
+        self._failed_image_urls: dict[str, None] = {}
         self._brighten_cache: dict[str, bytes] = {}
         self._brighten_cache_bytes: int = 0
         self._brighten_tasks: dict[str, asyncio.Task[bytes | None]] = {}
         self._brighten_semaphore = asyncio.Semaphore(BRIGHTEN_PROCESS_CONCURRENCY)
         self._ego_gift_image_fallbacks: dict[str, str] | None = None
+        self._ego_gift_image_fallbacks_task: asyncio.Task[dict[str, str]] | None = None
         # 처리 완료(PNG 변환 + 150px 리사이즈)된 첨부 바이트를 기프트 이름으로 캐싱.
         # 연속 전환/다중 사용자 조회 시 재다운로드·재인코딩을 막는다.
         self._ego_gift_image_cache: dict[str, bytes] = {}
@@ -1394,6 +1492,7 @@ class NewsCog(commands.Cog):
         self._youtube_recovery_baseline_pending = False
         self._youtube_upload_recovery_baseline_pending = False
         self._hampang_recovery_baseline_pending = False
+        self._hampang_source_failure_logged = False
         self._in_high_frequency_window: bool = False
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
@@ -2210,6 +2309,7 @@ class NewsCog(commands.Cog):
         for post in posts:
             if _twitter_news_prefers_available_steam(post, posts):
                 self._twitter_steam_grace_started_at.pop(post.post_id, None)
+                self._twitter_steam_defer_logged_post_ids.discard(post.post_id)
                 continue
             if defer_linked_twitter and self._defer_linked_twitter_for_steam(post):
                 continue
@@ -2224,8 +2324,11 @@ class NewsCog(commands.Cog):
         started_at = self._twitter_steam_grace_started_at.setdefault(post.post_id, now)
         elapsed = now - started_at
         if elapsed >= TWITTER_STEAM_PREFERENCE_GRACE_SECONDS:
+            self._twitter_steam_grace_started_at.pop(post.post_id, None)
+            self._twitter_steam_defer_logged_post_ids.discard(post.post_id)
             return False
-        if elapsed < 0.1:
+        if post.post_id not in self._twitter_steam_defer_logged_post_ids:
+            self._twitter_steam_defer_logged_post_ids.add(post.post_id)
             LOGGER.info(
                 "Steam 링크가 있는 X 소식을 잠시 보류합니다. 다른 소식 전송은 계속 진행합니다 "
                 "(post_id=%s, grace=%s초).",
@@ -2739,13 +2842,20 @@ class NewsCog(commands.Cog):
         if not image_url:
             return None
 
-        downloaded = await self._download_image(image_url)
+        fallback_url = await self._ego_gift_fallback_image_url(gift.name)
+        downloaded = None
+        # i.namu.wiki 이미지 주소는 브라우저에서는 열려도 봇 요청에는 자주 403을
+        # 반환한다. 해당 주소는 안정적인 대체 CDN을 먼저 사용해 응답 지연을 줄인다.
+        if fallback_url and _is_namu_wiki_image_url(image_url):
+            downloaded = await self._download_image(fallback_url)
+            if downloaded is not None:
+                image_url = fallback_url
         if downloaded is None:
-            fallback_url = await self._ego_gift_fallback_image_url(gift.name)
-            if fallback_url:
-                downloaded = await self._download_image(fallback_url)
-                if downloaded is not None:
-                    image_url = fallback_url
+            downloaded = await self._download_image(image_url)
+        if downloaded is None and fallback_url and fallback_url != image_url:
+            downloaded = await self._download_image(fallback_url)
+            if downloaded is not None:
+                image_url = fallback_url
         if downloaded is None:
             LOGGER.warning("에고 기프트 이미지 첨부 변환 실패: %s (%s)", gift.name, image_url)
             return None
@@ -2772,7 +2882,14 @@ class NewsCog(commands.Cog):
 
     async def _ego_gift_fallback_image_url(self, name: str) -> str | None:
         if self._ego_gift_image_fallbacks is None:
-            self._ego_gift_image_fallbacks = await self._load_ego_gift_image_fallbacks()
+            if self._ego_gift_image_fallbacks_task is None:
+                self._ego_gift_image_fallbacks_task = asyncio.create_task(
+                    self._load_ego_gift_image_fallbacks()
+                )
+            try:
+                self._ego_gift_image_fallbacks = await self._ego_gift_image_fallbacks_task
+            finally:
+                self._ego_gift_image_fallbacks_task = None
         return self._ego_gift_image_fallbacks.get(name)
 
     async def _load_ego_gift_image_fallbacks(self) -> dict[str, str]:
@@ -4542,6 +4659,9 @@ class NewsCog(commands.Cog):
         if cached is not None:
             self._image_cache[url] = self._image_cache.pop(url)
             return cached
+        if url in self._failed_image_urls:
+            self._failed_image_urls[url] = self._failed_image_urls.pop(url)
+            return None
 
         timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
         for attempt in range(1, IMAGE_DOWNLOAD_ATTEMPTS + 1):
@@ -4552,7 +4672,12 @@ class NewsCog(commands.Cog):
                     headers=_image_request_headers(url),
                 ) as response:
                     if 400 <= response.status < 500:
-                        LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
+                        if response.status in {400, 401, 403, 404, 410}:
+                            self._remember_failed_image_url(url)
+                        if response.status == 403 and _is_namu_wiki_image_url(url):
+                            LOGGER.debug("나무위키 이미지 직접 다운로드 거부 (403): %s", url)
+                        else:
+                            LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
                         return None
                     if response.status >= 500:
                         if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
@@ -4613,6 +4738,13 @@ class NewsCog(commands.Cog):
                 )
                 await asyncio.sleep(0.5 * attempt)
         return None
+
+    def _remember_failed_image_url(self, url: str) -> None:
+        self._failed_image_urls.pop(url, None)
+        self._failed_image_urls[url] = None
+        while len(self._failed_image_urls) > IMAGE_FAILED_URL_CACHE_MAX_ITEMS:
+            oldest_url = next(iter(self._failed_image_urls))
+            self._failed_image_urls.pop(oldest_url, None)
 
     async def _download_twitter_video(self, url: str) -> discord.File | None:
         max_bytes = 23 * 1024 * 1024
@@ -5423,10 +5555,16 @@ class NewsCog(commands.Cog):
         x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
         if had_failure:
             self._hampang_recovery_baseline_pending = True
-            LOGGER.info(
-                "햄햄팡팡 소식 소스 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
-                "다음 정상 확인에서 기준선을 갱신합니다."
-            )
+            if self._hampang_source_failure_logged:
+                LOGGER.debug(
+                    "햄햄팡팡 소식 소스 확인 실패가 계속되어 이번 자동 전송을 건너뜁니다."
+                )
+            else:
+                self._hampang_source_failure_logged = True
+                LOGGER.info(
+                    "햄햄팡팡 소식 소스 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
+                    "다음 정상 확인에서 기준선을 갱신합니다."
+                )
             return 0
         if not x_posts and not youtube_uploads:
             return 0
@@ -5441,12 +5579,14 @@ class NewsCog(commands.Cog):
                     youtube_video_id=latest_youtube_id,
                 )
             self._hampang_recovery_baseline_pending = False
+            self._hampang_source_failure_logged = False
             LOGGER.info(
                 "네트워크 복구 후 햄햄팡팡 소식 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
                 "(targets=%s).",
                 len(targets),
             )
             return 0
+        self._hampang_source_failure_logged = False
 
         x_ids = [post.post_id for post in x_posts]
         youtube_ids = [upload.video_id for upload in youtube_uploads]
@@ -8816,6 +8956,11 @@ def _image_request_headers(url: str) -> dict[str, str]:
     return headers
 
 
+def _is_namu_wiki_image_url(url: str) -> bool:
+    hostname = (urlparse(url).hostname or "").casefold()
+    return hostname == "namu.wiki" or hostname.endswith(".namu.wiki")
+
+
 def _resource_path(relative_path: Path) -> Path:
     base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
     return base_path / relative_path
@@ -10212,6 +10357,10 @@ def _twitter_matches_steam_news(
     link_matches = steam_post.url in link_urls or (
         steam_key is not None and steam_key in link_keys
     )
+    if steam_key is not None and steam_key in link_keys:
+        return True
+    if steam_post.url in link_urls:
+        return True
     content_matches = _news_match_candidates_overlap(
         twitter_candidates,
         {
@@ -11014,9 +11163,20 @@ async def main() -> None:
     _console_handler = logging.StreamHandler(_stdout_stream)
     _console_handler.setLevel(_log_level)
     _console_handler.setFormatter(_fmt)
+    _log_queue: queue.Queue[logging.LogRecord] = queue.Queue()
+    _queue_handler = logging.handlers.QueueHandler(_log_queue)
+    _queue_handler.setLevel(logging.DEBUG)
+    _log_listener = logging.handlers.QueueListener(
+        _log_queue,
+        _file_handler,
+        _debug_file_handler,
+        _console_handler,
+        respect_handler_level=True,
+    )
+    _log_listener.start()
     logging.basicConfig(
         level=logging.DEBUG,
-        handlers=[_file_handler, _debug_file_handler, _console_handler],
+        handlers=[_queue_handler],
         force=True,
     )
     logging.captureWarnings(True)
@@ -11053,6 +11213,7 @@ async def main() -> None:
     bot_task: asyncio.Task[None] | None = None
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    _install_asyncio_exception_handler(loop)
 
     def _request_shutdown(signum: int, _frame: object | None = None) -> None:
         LOGGER.info("종료 신호를 받았습니다 (signal=%s). Discord 상태를 오프라인으로 전환합니다.", signum)
@@ -11180,9 +11341,11 @@ async def main() -> None:
                 signal.signal(signum, handler)
             except (ValueError, OSError):
                 pass
+        _log_listener.stop()
 
 
 if __name__ == "__main__":
+    _install_windows_selector_event_loop_policy()
     asyncio.run(main())
 
 

@@ -24,6 +24,7 @@ X_RATE_LIMIT_RESET_CAP = timedelta(minutes=20)
 X_SERVER_ERROR_BACKOFF = timedelta(seconds=30)
 X_SERVER_ERROR_BACKOFF_MAX = timedelta(minutes=5)
 KST = timezone(timedelta(hours=9))
+_SHARED_RATE_LIMIT_UNTIL: dict[str, datetime] = {}
 
 _VIDEO_THUMBNAIL_URL_FRAGMENTS = (
     "/ext_tw_video_thumb/",
@@ -212,13 +213,15 @@ class LimbusXClient:
             now = datetime.now(timezone.utc)
             if self._cached_posts and self._cached_at and now - self._cached_at < X_POST_CACHE_TTL:
                 return self._cached_posts[:limit]
-            if self._rate_limited_until and now < self._rate_limited_until:
+            backoff_until = self._active_rate_limited_until()
+            if backoff_until and now < backoff_until:
+                self._rate_limited_until = backoff_until
                 self.last_fetch_had_upstream_failure = True
                 if self._cached_posts:
                     self._log_backoff_active()
                     return self._cached_posts[:limit]
                 raise XClientError(
-                    f"X API 백오프 중입니다: {self._rate_limited_until.isoformat()}"
+                    f"X API 백오프 중입니다: {backoff_until.isoformat()}"
                 )
 
             try:
@@ -279,6 +282,7 @@ class LimbusXClient:
             self._cached_posts = posts
             self._cached_at = datetime.now(timezone.utc)
             self._rate_limited_until = None
+            _SHARED_RATE_LIMIT_UNTIL.pop(self._shared_backoff_key(), None)
             self._rate_limit_failures = 0
             self._server_error_failures = 0
             self._last_backoff_log_until = None
@@ -298,8 +302,31 @@ class LimbusXClient:
                 return candidate
         return await self.enrich_post(post)
 
-    def _apply_backoff(self, seconds: float) -> None:
-        self._rate_limited_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    def _shared_backoff_key(self) -> str:
+        return f"{self.config.x_auth_token or ''}:{self.config.x_ct0 or ''}"
+
+    def _active_rate_limited_until(self) -> datetime | None:
+        candidates = [
+            value
+            for value in (
+                self._rate_limited_until,
+                _SHARED_RATE_LIMIT_UNTIL.get(self._shared_backoff_key()),
+            )
+            if value is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates)
+
+    def _apply_backoff(self, seconds: float, *, shared: bool = False) -> None:
+        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        if self._rate_limited_until is None or self._rate_limited_until < until:
+            self._rate_limited_until = until
+        if shared:
+            key = self._shared_backoff_key()
+            current = _SHARED_RATE_LIMIT_UNTIL.get(key)
+            if current is None or current < self._rate_limited_until:
+                _SHARED_RATE_LIMIT_UNTIL[key] = self._rate_limited_until
         self._last_backoff_log_until = None
 
     def _twitter_backoff_seconds(self, failures: int) -> float:
@@ -316,7 +343,7 @@ class LimbusXClient:
             delta = (reset_at - datetime.now(timezone.utc)).total_seconds()
             if delta > 0:
                 seconds = max(seconds, delta + 1)
-        self._apply_backoff(seconds)
+        self._apply_backoff(seconds, shared=True)
         self._rate_limit_failures += 1
         LOGGER.warning(
             "X API 429 레이트리밋. consecutive_429=%s backoff_seconds=%.0f "

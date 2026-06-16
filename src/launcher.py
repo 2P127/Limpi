@@ -10,6 +10,9 @@ _WORKER_FLAG = "--bot-worker"
 if _WORKER_FLAG in sys.argv:
     import asyncio
     from src import bot
+
+    bot._install_windows_selector_event_loop_policy()
+
     try:
         sys.exit(asyncio.run(bot.main()))
     except KeyboardInterrupt:
