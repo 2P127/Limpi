@@ -39,7 +39,6 @@ from .clients.chzzk_client import (
 from .core.config import AppConfig, BOT_VERSION
 from .core.models import (
     GuildChzzkTarget,
-    GuildHampangTarget,
     GuildNewsTarget,
     GuildSettings,
     GuildYoutubeTarget,
@@ -79,7 +78,6 @@ NEWS_POLL_TICK_SECONDS = 10
 TWITTER_POLL_TICK_SECONDS = 5
 CHZZK_POLL_INTERVAL_SECONDS = 60
 YOUTUBE_UPLOAD_POLL_INTERVAL_SECONDS = 60
-HAMPANG_POLL_INTERVAL_SECONDS = 60
 HAMPANG_X_USERNAME = "Ham_PangPang"
 HAMPANG_X_URL = "https://x.com/Ham_PangPang"
 HAMPANG_YOUTUBE_TITLE_MARKER = "hamhampangpang"
@@ -1463,7 +1461,6 @@ class NewsCog(commands.Cog):
         self._chzzk_poll_lock = asyncio.Lock()
         self._youtube_poll_lock = asyncio.Lock()
         self._youtube_upload_poll_lock = asyncio.Lock()
-        self._hampang_poll_lock = asyncio.Lock()
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._twitter_steam_defer_logged_post_ids: set[str] = set()
@@ -1491,8 +1488,6 @@ class NewsCog(commands.Cog):
         self._chzzk_recovery_baseline_pending = False
         self._youtube_recovery_baseline_pending = False
         self._youtube_upload_recovery_baseline_pending = False
-        self._hampang_recovery_baseline_pending = False
-        self._hampang_source_failure_logged = False
         self._in_high_frequency_window: bool = False
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
@@ -1509,7 +1504,6 @@ class NewsCog(commands.Cog):
         self.poll_chzzk_live.start()
         self.poll_youtube_live.start()
         self.poll_youtube_uploads.start()
-        self.poll_hampang_news.start()
 
         if self.news_source is None and self.x_source is None:
             LOGGER.warning("뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -1530,8 +1524,6 @@ class NewsCog(commands.Cog):
             self.poll_youtube_live.cancel()
         if self.poll_youtube_uploads.is_running():
             self.poll_youtube_uploads.cancel()
-        if self.poll_hampang_news.is_running():
-            self.poll_hampang_news.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
         for task in self._brighten_tasks.values():
@@ -1780,28 +1772,6 @@ class NewsCog(commands.Cog):
 
     @poll_youtube_uploads.before_loop
     async def before_poll_youtube_uploads(self) -> None:
-        await self._wait_until_ready()
-
-    @tasks.loop(seconds=HAMPANG_POLL_INTERVAL_SECONDS)
-    async def poll_hampang_news(self) -> None:
-        async with self._hampang_poll_lock:
-            try:
-                if not self.bot.is_ready():
-                    self._hampang_recovery_baseline_pending = True
-                    return
-                await self._poll_hampang_once()
-            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
-                self._hampang_recovery_baseline_pending = True
-                _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", exc)
-            except Exception as exc:
-                self._hampang_recovery_baseline_pending = True
-                if _is_internet_exception(exc):
-                    _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", exc)
-                else:
-                    LOGGER.exception("햄햄팡팡 소식 자동 확인 실패.")
-
-    @poll_hampang_news.before_loop
-    async def before_poll_hampang_news(self) -> None:
         await self._wait_until_ready()
 
     @tasks.loop(seconds=60)
@@ -3120,51 +3090,6 @@ class NewsCog(commands.Cog):
                 continue
             filtered.append(post)
         return filtered
-
-    def _auto_sendable_hampang_x_posts(
-        self,
-        posts: list[TwitterPost],
-        *,
-        target: GuildHampangTarget,
-    ) -> list[TwitterPost]:
-        if not posts:
-            return []
-
-        created_after = _as_utc_datetime(target.created_at)
-        max_twitter_age = (
-            self.config.twitter_announce_max_age_seconds
-            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
-        )
-        filtered: list[TwitterPost] = []
-        for post in posts:
-            created = _as_utc_datetime(post.created_at)
-            if created is None:
-                continue
-            if created_after is not None and created <= created_after:
-                continue
-            if max_twitter_age > 0 and not _is_twitter_post_recent(post, max_twitter_age):
-                continue
-            filtered.append(post)
-        return filtered
-
-    def _auto_sendable_hampang_youtube_uploads(
-        self,
-        uploads: list[YoutubeUpload],
-        *,
-        target: GuildHampangTarget,
-    ) -> list[YoutubeUpload]:
-        if not uploads:
-            return []
-
-        created_after = _as_utc_datetime(target.created_at)
-        if created_after is None:
-            return uploads
-        return [
-            upload
-            for upload in uploads
-            if (published_at := _as_utc_datetime(upload.published_at)) is not None
-            and published_at > created_after
-        ]
 
     async def _resolve_automatic_news_channel(
         self, target: GuildNewsTarget
@@ -5547,182 +5472,6 @@ class NewsCog(commands.Cog):
             )
         return x_posts, youtube_uploads, had_failure
 
-    async def _poll_hampang_once(self) -> int:
-        targets = self.storage.list_hampang_targets()
-        if not targets:
-            return 0
-
-        x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
-        if had_failure:
-            self._hampang_recovery_baseline_pending = True
-            if self._hampang_source_failure_logged:
-                LOGGER.debug(
-                    "햄햄팡팡 소식 소스 확인 실패가 계속되어 이번 자동 전송을 건너뜁니다."
-                )
-            else:
-                self._hampang_source_failure_logged = True
-                LOGGER.info(
-                    "햄햄팡팡 소식 소스 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
-                    "다음 정상 확인에서 기준선을 갱신합니다."
-                )
-            return 0
-        if not x_posts and not youtube_uploads:
-            return 0
-
-        latest_x_id = x_posts[0].post_id if x_posts else None
-        latest_youtube_id = youtube_uploads[0].video_id if youtube_uploads else None
-        if self._hampang_recovery_baseline_pending:
-            for target in targets:
-                self.storage.mark_hampang_target_seen(
-                    target.guild_id,
-                    x_post_id=latest_x_id,
-                    youtube_video_id=latest_youtube_id,
-                )
-            self._hampang_recovery_baseline_pending = False
-            self._hampang_source_failure_logged = False
-            LOGGER.info(
-                "네트워크 복구 후 햄햄팡팡 소식 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
-                "(targets=%s).",
-                len(targets),
-            )
-            return 0
-        self._hampang_source_failure_logged = False
-
-        x_ids = [post.post_id for post in x_posts]
-        youtube_ids = [upload.video_id for upload in youtube_uploads]
-        announced = 0
-        for target in targets:
-            baseline_at = _as_utc_datetime(target.updated_at or target.created_at)
-            missing_x_baseline = bool(x_posts) and target.last_x_post_id not in x_ids
-            missing_youtube_baseline = (
-                bool(youtube_uploads) and target.last_youtube_video_id not in youtube_ids
-            )
-            if baseline_at is None and (missing_x_baseline or missing_youtube_baseline):
-                self.storage.mark_hampang_target_seen(
-                    target.guild_id,
-                    x_post_id=latest_x_id,
-                    youtube_video_id=latest_youtube_id,
-                )
-                LOGGER.info(
-                    "햄햄팡팡 소식 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
-                    "(guild_id=%s).",
-                    target.guild_id,
-                )
-                continue
-
-            if x_posts and target.last_x_post_id in x_ids:
-                raw_new_x_posts = x_posts[:x_ids.index(target.last_x_post_id)]
-            else:
-                raw_new_x_posts = [
-                    post
-                    for post in x_posts
-                    if baseline_at is not None
-                    and (created_at := _as_utc_datetime(post.created_at)) is not None
-                    and created_at > baseline_at
-                ]
-
-            if youtube_uploads and target.last_youtube_video_id in youtube_ids:
-                raw_new_youtube_uploads = youtube_uploads[
-                    :youtube_ids.index(target.last_youtube_video_id)
-                ]
-            else:
-                raw_new_youtube_uploads = [
-                    upload
-                    for upload in youtube_uploads
-                    if baseline_at is not None
-                    and (published_at := _as_utc_datetime(upload.published_at)) is not None
-                    and published_at > baseline_at
-                ]
-
-            new_x_posts = self._auto_sendable_hampang_x_posts(
-                raw_new_x_posts,
-                target=target,
-            )
-            new_youtube_uploads = self._auto_sendable_hampang_youtube_uploads(
-                raw_new_youtube_uploads,
-                target=target,
-            )
-            if raw_new_x_posts and not new_x_posts and latest_x_id is not None:
-                self.storage.mark_hampang_target_seen(
-                    target.guild_id,
-                    x_post_id=latest_x_id,
-                )
-                LOGGER.info(
-                    "햄햄팡팡 오래된 X 소식 자동 전송 건너뜀: 최신 기준선으로 갱신 "
-                    "(guild_id=%s, skipped=%s, latest_x_id=%s).",
-                    target.guild_id,
-                    len(raw_new_x_posts),
-                    latest_x_id,
-                )
-            if (
-                raw_new_youtube_uploads
-                and not new_youtube_uploads
-                and latest_youtube_id is not None
-            ):
-                self.storage.mark_hampang_target_seen(
-                    target.guild_id,
-                    youtube_video_id=latest_youtube_id,
-                )
-                LOGGER.info(
-                    "햄햄팡팡 설정 이전 YouTube 영상 자동 전송 건너뜀: 최신 기준선으로 갱신 "
-                    "(guild_id=%s, skipped=%s, latest_youtube_id=%s).",
-                    target.guild_id,
-                    len(raw_new_youtube_uploads),
-                    latest_youtube_id,
-                )
-            items = _hampang_news_items(new_x_posts, new_youtube_uploads, newest_first=False)
-            if not items:
-                if missing_x_baseline or missing_youtube_baseline:
-                    self.storage.mark_hampang_target_seen(
-                        target.guild_id,
-                        x_post_id=latest_x_id if missing_x_baseline else None,
-                        youtube_video_id=(
-                            latest_youtube_id if missing_youtube_baseline else None
-                        ),
-                    )
-                continue
-
-            channel = await self._resolve_hampang_target_channel(target)
-            if channel is None:
-                continue
-            settings = self.storage.get_settings(target.guild_id)
-            target_announced = 0
-            for source, item in items:
-                try:
-                    role_id = settings.role_id if target_announced == 0 else None
-                    if source == "x":
-                        message = await self._send_twitter_post_to_channel(
-                            channel,
-                            item,
-                            role_id=role_id,
-                        )
-                        self.storage.mark_hampang_target_seen(
-                            target.guild_id,
-                            x_post_id=item.post_id,
-                        )
-                    else:
-                        message = await self._send_hampang_youtube_upload_to_channel(
-                            channel,
-                            item,
-                            role_id=role_id,
-                        )
-                        self.storage.mark_hampang_target_seen(
-                            target.guild_id,
-                            youtube_video_id=item.video_id,
-                        )
-                except discord.HTTPException:
-                    LOGGER.exception(
-                        "햄햄팡팡 소식 자동 전송 실패 (guild_id=%s, channel_id=%s, source=%s).",
-                        target.guild_id,
-                        target.channel_id,
-                        source,
-                    )
-                    break
-                await self._track_manual_message(target.guild_id, target.channel_id, message)
-                target_announced += 1
-                announced += 1
-        return announced
-
     async def _resolve_chzzk_target_channel(
         self, target: GuildChzzkTarget
     ) -> discord.abc.Messageable | None:
@@ -5764,31 +5513,6 @@ class NewsCog(commands.Cog):
             except discord.HTTPException:
                 LOGGER.exception(
                     "유튜브 업로드 자동 전송 채널 조회 실패 "
-                    "(guild_id=%s, channel_id=%s).",
-                    target.guild_id,
-                    target.channel_id,
-                )
-                return None
-        return channel if isinstance(channel, discord.abc.Messageable) else None
-
-    async def _resolve_hampang_target_channel(
-        self, target: GuildHampangTarget
-    ) -> discord.abc.Messageable | None:
-        channel = self.bot.get_channel(target.channel_id)
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(target.channel_id)
-            except (discord.Forbidden, discord.NotFound):
-                LOGGER.warning(
-                    "햄햄팡팡 소식 자동 전송 건너뜀: 채널 접근 불가 "
-                    "(guild_id=%s, channel_id=%s).",
-                    target.guild_id,
-                    target.channel_id,
-                )
-                return None
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "햄햄팡팡 소식 자동 전송 채널 조회 실패 "
                     "(guild_id=%s, channel_id=%s).",
                     target.guild_id,
                     target.channel_id,
@@ -6640,11 +6364,6 @@ class NewsCog(commands.Cog):
             resolved = await self._resolve_target_channel(None, settings.channel_id)
             if isinstance(resolved, discord.TextChannel):
                 return resolved
-        current = self.storage.get_hampang_target(interaction.guild_id)
-        if current is not None:
-            resolved = await self._resolve_hampang_target_channel(current)
-            if isinstance(resolved, discord.TextChannel):
-                return resolved
         return (
             interaction.channel
             if isinstance(interaction.channel, discord.TextChannel)
@@ -6821,89 +6540,6 @@ class NewsCog(commands.Cog):
         channel_mention = getattr(target_channel, "mention", f"<#{channel_id}>")
         await interaction.followup.send(
             f"{channel_mention}에 선택한 햄햄팡팡 소식을 보냈어요.",
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @app_commands.command(name="햄팡소식설정", description="햄햄팡팡 공식 X와 관련 YouTube 영상 알림을 설정합니다.")
-    @app_commands.allowed_installs(guilds=True, users=False)
-    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    @app_commands.rename(enabled="허용", channel="채널")
-    @app_commands.describe(
-        enabled="햄햄팡팡 소식 자동 알림을 켜거나 끕니다.",
-        channel="알림 채널입니다. 비워두면 /서버설정 채널, 기존 햄햄팡팡 채널, 현재 채널 순서로 사용합니다.",
-    )
-    @app_commands.choices(enabled=BOOLEAN_CHOICES)
-    async def configure_hampang_news(
-        self,
-        interaction: discord.Interaction,
-        enabled: app_commands.Choice[str],
-        channel: discord.TextChannel | None = None,
-    ) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        target_channel = await self._resolve_hampang_config_channel(interaction, channel)
-        if target_channel is None:
-            await interaction.followup.send(
-                "햄햄팡팡 소식을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        enabled_value = _choice_bool(enabled, False)
-        x_posts: list[TwitterPost] = []
-        youtube_uploads: list[YoutubeUpload] = []
-        had_failure = False
-        if enabled_value:
-            x_posts, youtube_uploads, had_failure = await self._fetch_hampang_news_sources()
-            if had_failure or (not x_posts and not youtube_uploads):
-                self._hampang_recovery_baseline_pending = True
-
-        target = self.storage.upsert_hampang_target(
-            interaction.guild_id,
-            channel_id=target_channel.id,
-            enabled=enabled_value,
-            last_x_post_id=x_posts[0].post_id if x_posts else None,
-            last_youtube_video_id=youtube_uploads[0].video_id if youtube_uploads else None,
-        )
-        lines = [
-            f"햄햄팡팡 소식 알림: {_bool_label(target.enabled)}",
-            f"채널: <#{target.channel_id}>",
-            f"공식 X: [@{HAMPANG_X_USERNAME}]({HAMPANG_X_URL})",
-            "YouTube: 제목에 HamHamPangPang이 포함된 일반 영상",
-        ]
-        if enabled_value:
-            lines.append("설정 시점 이전 소식은 전송하지 않고 기준선으로만 저장했습니다.")
-        if had_failure:
-            lines.append("일부 소스를 확인하지 못해 다음 정상 확인에서도 기준선만 갱신합니다.")
-        await interaction.followup.send(
-            embed=discord.Embed(
-                title="햄햄팡팡 소식 설정이 완료되었어요",
-                description="\n".join(lines),
-                color=_success_embed_color(),
-            ),
-            ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @app_commands.command(name="햄팡소식해제", description="햄햄팡팡 소식 자동 알림 설정을 해제합니다.")
-    @app_commands.allowed_installs(guilds=True, users=False)
-    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-    @app_commands.guild_only()
-    @app_commands.default_permissions(manage_guild=True)
-    async def remove_hampang_news(self, interaction: discord.Interaction) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
-            return
-        removed = self.storage.delete_hampang_target(interaction.guild_id)
-        await interaction.response.send_message(
-            "햄햄팡팡 소식 자동 알림 설정을 해제했어요."
-            if removed else "이 서버에는 햄햄팡팡 소식 설정이 없어요.",
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -8172,7 +7808,7 @@ class NewsCog(commands.Cog):
                 "치지직 알림: 미설정\n"
                 "유튜브 알림: 미설정\n"
                 "유튜브 일반 영상 업로드 알림: 미설정\n"
-                "햄햄팡팡 소식 알림: 미설정\n"
+                "햄햄팡팡 소식: 수동 조회 전용\n"
                 "점검 알림: 꺼짐"
             ),
             color=_success_embed_color(),
@@ -8200,7 +7836,6 @@ class NewsCog(commands.Cog):
         chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         youtube_upload_target = self.storage.get_youtube_upload_target(interaction.guild_id)
-        hampang_target = self.storage.get_hampang_target(interaction.guild_id)
         try:
             live = await self.chzzk_client.fetch_live()
         except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
@@ -8277,8 +7912,12 @@ class NewsCog(commands.Cog):
             inline=False,
         )
         embed.add_field(
-            name="햄햄팡팡 소식 알림",
-            value=_format_hampang_target(hampang_target, settings.role_id),
+            name="햄햄팡팡 소식",
+            value=(
+                "자동 알림: 사용 안 함\n"
+                "`/햄팡최근소식보기`로 최신 소식을 확인하고, "
+                "`/햄팡소식보내기`로 원하는 채널에 전송할 수 있어요."
+            ),
             inline=False,
         )
 
@@ -8530,10 +8169,10 @@ class NewsCog(commands.Cog):
                 "> `/유튜브알림해제` — 일반 영상 업로드 알림 해제\n"
                 "> `/유튜브알림현황보기` — 최근 일반 영상과 알림 현황 보기\n"
                 "> `/유튜브알림보내기` — 최근 일반 영상을 지정 채널에 전송\n"
-                "> `/햄팡소식설정` · `/햄팡소식해제` — 햄햄팡팡 소식 자동 알림 관리\n"
                 "> `/햄팡최근소식보기` — 최신 햄햄팡팡 소식 확인\n"
                 "> `/햄팡이전소식보기` — 최근 수집한 햄햄팡팡 소식을 골라서 확인\n"
-                "> `/햄팡소식보내기` — 햄햄팡팡 소식을 골라서 채널에 전송"
+                "> `/햄팡소식보내기` — 햄햄팡팡 소식을 골라서 채널에 전송\n"
+                "-# 햄햄팡팡 소식은 자동 알림 없이 사용자가 원할 때만 조회합니다."
             )
         )
         container.add_item(discord.ui.Separator())
@@ -9901,25 +9540,6 @@ def _format_youtube_upload_target(
     )
 
 
-def _format_hampang_target(target: GuildHampangTarget | None, role_id: int | None) -> str:
-    role_text = f"<@&{role_id}>" if role_id else "없음"
-    if target is None:
-        return (
-            "상태: 미설정\n"
-            "채널: 미설정\n"
-            f"역할 핑: {role_text}\n"
-            "최근 X 기준선: 없음\n"
-            "최근 YouTube 기준선: 없음"
-        )
-    return (
-        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
-        f"채널: <#{target.channel_id}>\n"
-        f"역할 핑: {role_text}\n"
-        f"최근 X 기준선: {target.last_x_post_id or '없음'}\n"
-        f"최근 YouTube 기준선: {target.last_youtube_video_id or '없음'}"
-    )
-
-
 def _is_hampang_youtube_upload(upload: YoutubeUpload) -> bool:
     normalized_title = re.sub(r"[^a-z0-9]+", "", upload.title.casefold())
     return HAMPANG_YOUTUBE_TITLE_MARKER in normalized_title
@@ -10868,146 +10488,234 @@ def _process_ego_gift_image_bytes(data: bytes, content_type: str | None) -> byte
     return _resize_image_to_fit(data, EGO_GIFT_IMAGE_MAX_SIZE)
 
 
-_SHADOW_GAMMA_RED = 0.43
-_SHADOW_GAMMA_GREEN = 0.39
-_SHADOW_GAMMA_BLUE = 0.34
-_CLAHE_CLIP_LIMIT = 2.8
-_CLAHE_TILE_GRID = (8, 8)
-_STRETCH_LOW_PCT = 0.8
-_STRETCH_HIGH_PCT = 99.2
-_SATURATION_GAIN = 1.12
-_NLM_LUMINANCE = 2.2
-_NLM_COLOR = 2.2
-_NLM_TEMPLATE_WINDOW = 7
-_NLM_SEARCH_WINDOW = 21
-_TEXT_MASK_HUE_LOW = np.array([80, 50, 100], dtype=np.uint8)
-_TEXT_MASK_HUE_HIGH = np.array([100, 255, 255], dtype=np.uint8)
-_TEXT_MASK_DILATE_KERNEL = (5, 5)
-_TEXT_MASK_DILATE_ITERATIONS = 1
-_TEXT_MASK_BLUR_KERNEL = (5, 5)
-_BILATERAL_DIAMETER = 7
-_BILATERAL_SIGMA_COLOR = 72
-_BILATERAL_SIGMA_SPACE = 64
-_SHADOW_COLOR_THRESHOLD = 150.0
-_SHADOW_COOL_RED_GAIN = 0.92
-_SHADOW_COOL_GREEN_GAIN = 1.02
-_SHADOW_COOL_BLUE_GAIN = 1.12
-_SHADOW_LIFT_GAIN = 0.10
-_MIDTONE_DETAIL_AMOUNT = 0.16
-_UNSHARP_SIGMA = 1.35
-_UNSHARP_AMOUNT = 1.48
-_UNSHARP_THRESHOLD = 0.0
+@dataclass(frozen=True)
+class _DcRecoverParams:
+    gamma: float
+    red_gain: float
+    green_gain: float
+    blue_gain: float
+    saturation: float
+    contrast: float
+    brightness: float
+    highlight_strength: float
+    red_shadow_boost: float
+    clahe_clip: float
+    sharpen: float
+    shadow_deblock: float
+    shadow_detail: float
+    shadow_sharpen: float
 
 
-def _build_gamma_lut(gamma: float) -> "np.ndarray":
-    scale = np.linspace(0.0, 1.0, 256, dtype=np.float32)
-    return np.clip(np.power(scale, gamma) * 255.0, 0, 255).astype(np.uint8)
+_DC_RECOVER_PARAMS = _DcRecoverParams(
+    gamma=0.48,
+    red_gain=1.22,
+    green_gain=1.15,
+    blue_gain=1.10,
+    saturation=1.10,
+    contrast=1.00,
+    brightness=0.0,
+    highlight_strength=0.18,
+    red_shadow_boost=0.020,
+    clahe_clip=0.22,
+    sharpen=0.00,
+    shadow_deblock=0.66,
+    shadow_detail=0.34,
+    shadow_sharpen=0.24,
+)
+_DC_CLAHE_TILE_GRID = (8, 8)
+_DC_SHADOW_MASK_LOW = 0.08
+_DC_SHADOW_MASK_HIGH = 0.58
+_DC_EDGE_PROTECT_LOW = 3.0
+_DC_EDGE_PROTECT_HIGH = 18.0
 
 
-_SHADOW_GAMMA_RED_LUT = _build_gamma_lut(_SHADOW_GAMMA_RED)
-_SHADOW_GAMMA_GREEN_LUT = _build_gamma_lut(_SHADOW_GAMMA_GREEN)
-_SHADOW_GAMMA_BLUE_LUT = _build_gamma_lut(_SHADOW_GAMMA_BLUE)
+def _smoothstep(edge0: float, edge1: float, value: "np.ndarray") -> "np.ndarray":
+    x = np.clip((value - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return x * x * (3.0 - (2.0 * x))
+
+
+def _dc_luminance(rgb: "np.ndarray") -> "np.ndarray":
+    image = rgb.astype(np.float32) / 255.0
+    return (
+        0.2126 * image[..., 0]
+        + 0.7152 * image[..., 1]
+        + 0.0722 * image[..., 2]
+    )
+
+
+def _dc_shadow_weight(rgb: "np.ndarray") -> "np.ndarray":
+    luminance = _dc_luminance(rgb)
+    weight = 1.0 - _smoothstep(_DC_SHADOW_MASK_LOW, _DC_SHADOW_MASK_HIGH, luminance)
+    return np.clip(weight, 0.0, 1.0) ** 1.35
+
+
+def _dc_edge_weight(rgb: "np.ndarray") -> "np.ndarray":
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+    return _smoothstep(_DC_EDGE_PROTECT_LOW, _DC_EDGE_PROTECT_HIGH, edges)
+
+
+def _apply_dc_gamma_and_gain(
+    rgb: "np.ndarray",
+    params: _DcRecoverParams,
+) -> "np.ndarray":
+    image = rgb.astype(np.float32) / 255.0
+    image = np.power(np.clip(image, 0.0, 1.0), params.gamma)
+
+    gains = np.array(
+        [params.red_gain, params.green_gain, params.blue_gain],
+        dtype=np.float32,
+    ).reshape(1, 1, 3)
+    image = image * 255.0 * gains
+    image = (image - 127.5) * params.contrast + 127.5 + params.brightness
+    return np.clip(image, 0.0, 255.0).astype(np.uint8)
+
+
+def _boost_dc_red_in_shadows(
+    rgb: "np.ndarray",
+    strength: float,
+) -> "np.ndarray":
+    if strength <= 0.0:
+        return rgb
+
+    image = rgb.astype(np.float32) / 255.0
+    red = image[..., 0]
+    green = image[..., 1]
+    blue = image[..., 2]
+    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    shadow_weight = np.clip(1.0 - luminance, 0.0, 1.0) ** 2
+    image[..., 0] += shadow_weight * strength
+    return np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _boost_dc_highlights(
+    rgb: "np.ndarray",
+    strength: float,
+) -> "np.ndarray":
+    if strength <= 0.0:
+        return rgb
+
+    image = rgb.astype(np.float32) / 255.0
+    value = np.max(image, axis=2)
+    highlight_weight = np.clip((value - 0.65) / 0.35, 0.0, 1.0)[..., None]
+    image = image + (1.0 - image) * highlight_weight * strength
+    return np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def _deblock_dc_shadows(
+    original_rgb: "np.ndarray",
+    lifted_rgb: "np.ndarray",
+    strength: float,
+) -> "np.ndarray":
+    if strength <= 0.0:
+        return lifted_rgb
+
+    shadow_weight = _dc_shadow_weight(original_rgb)
+    edge_weight = _dc_edge_weight(original_rgb)
+    blend_weight = shadow_weight * (1.0 - (edge_weight * 0.72)) * strength
+
+    denoised = cv2.fastNlMeansDenoisingColored(
+        lifted_rgb,
+        None,
+        4.2,
+        4.2,
+        7,
+        21,
+    )
+    smoothed = cv2.bilateralFilter(
+        denoised,
+        d=5,
+        sigmaColor=34,
+        sigmaSpace=32,
+    )
+    mixed = (
+        lifted_rgb.astype(np.float32) * (1.0 - blend_weight[..., np.newaxis])
+        + smoothed.astype(np.float32) * blend_weight[..., np.newaxis]
+    )
+    return np.clip(mixed, 0.0, 255.0).astype(np.uint8)
+
+
+def _change_dc_saturation(
+    rgb: "np.ndarray",
+    saturation: float,
+) -> "np.ndarray":
+    if abs(saturation - 1.0) < 1e-6:
+        return rgb
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 255.0)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+
+
+def _apply_dc_clahe(
+    rgb: "np.ndarray",
+    clip_limit: float,
+) -> "np.ndarray":
+    if clip_limit <= 0.0:
+        return rgb
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    lightness, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=_DC_CLAHE_TILE_GRID,
+    )
+    lightness = clahe.apply(lightness)
+    return cv2.cvtColor(cv2.merge([lightness, a_channel, b_channel]), cv2.COLOR_LAB2RGB)
+
+
+def _enhance_dc_shadow_detail(
+    original_rgb: "np.ndarray",
+    rgb: "np.ndarray",
+    strength: float,
+) -> "np.ndarray":
+    if strength <= 0.0:
+        return rgb
+
+    shadow_weight = _dc_shadow_weight(original_rgb)
+    edge_weight = _dc_edge_weight(original_rgb)
+    detail_weight = shadow_weight * (0.35 + (0.65 * edge_weight)) * strength
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    lightness = lab[..., 0].astype(np.float32)
+    base = cv2.bilateralFilter(
+        np.clip(lightness, 0, 255).astype(np.uint8),
+        d=7,
+        sigmaColor=46,
+        sigmaSpace=44,
+    ).astype(np.float32)
+    detail = lightness - base
+
+    lightness = lightness + detail * detail_weight * 1.55
+    midtone_lift = (255.0 - lightness) * shadow_weight * strength * 0.035
+    lab[..., 0] = np.clip(lightness + midtone_lift, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+
+def _sharpen_dc_image(
+    rgb: "np.ndarray",
+    amount: float,
+) -> "np.ndarray":
+    if amount <= 0.0:
+        return rgb
+
+    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=1.0)
+    return cv2.addWeighted(rgb, 1.0 + amount, blurred, -amount, 0.0)
 
 
 def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
-    hsv_src = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-    text_mask = cv2.inRange(hsv_src, _TEXT_MASK_HUE_LOW, _TEXT_MASK_HUE_HIGH)
-    mask_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, _TEXT_MASK_DILATE_KERNEL)
-    dilated_mask = cv2.dilate(
-        text_mask,
-        mask_kernel,
-        iterations=_TEXT_MASK_DILATE_ITERATIONS,
-    )
-    smooth_mask = cv2.GaussianBlur(dilated_mask, _TEXT_MASK_BLUR_KERNEL, 0)
-    text_alpha = smooth_mask.astype(np.float32) / 255.0
-
-    red, green, blue = cv2.split(rgb)
-    gamma_img = cv2.merge((
-        cv2.LUT(red, _SHADOW_GAMMA_RED_LUT),
-        cv2.LUT(green, _SHADOW_GAMMA_GREEN_LUT),
-        cv2.LUT(blue, _SHADOW_GAMMA_BLUE_LUT),
-    ))
-
-    ycrcb = cv2.cvtColor(gamma_img, cv2.COLOR_RGB2YCrCb)
-    y, cr, cb = cv2.split(ycrcb)
-    clahe = cv2.createCLAHE(
-        clipLimit=_CLAHE_CLIP_LIMIT, tileGridSize=_CLAHE_TILE_GRID
-    )
-    y_enhanced = clahe.apply(y)
-    y_enhanced = cv2.bilateralFilter(
-        y_enhanced,
-        d=_BILATERAL_DIAMETER,
-        sigmaColor=_BILATERAL_SIGMA_COLOR,
-        sigmaSpace=_BILATERAL_SIGMA_SPACE,
-    )
-
-    lo, hi = np.percentile(y_enhanced, (_STRETCH_LOW_PCT, _STRETCH_HIGH_PCT))
-    if hi > lo:
-        y_stretched = np.clip(
-            (y_enhanced.astype(np.float32) - lo) * 255.0 / (hi - lo),
-            0,
-            255,
-        ).astype(np.uint8)
-    else:
-        y_stretched = y_enhanced
-
-    restored = cv2.cvtColor(cv2.merge((y_stretched, cr, cb)), cv2.COLOR_YCrCb2RGB)
-    shadow_weight = np.clip(
-        (_SHADOW_COLOR_THRESHOLD - y_stretched.astype(np.float32))
-        / _SHADOW_COLOR_THRESHOLD,
-        0.0,
-        1.0,
-    )[..., np.newaxis]
-    restored_float = restored.astype(np.float32)
-    restored_float[..., 0] *= 1.0 + ((_SHADOW_COOL_RED_GAIN - 1.0) * shadow_weight[..., 0])
-    restored_float[..., 1] *= 1.0 + ((_SHADOW_COOL_GREEN_GAIN - 1.0) * shadow_weight[..., 0])
-    restored_float[..., 2] *= 1.0 + ((_SHADOW_COOL_BLUE_GAIN - 1.0) * shadow_weight[..., 0])
-    restored_float += (255.0 - restored_float) * shadow_weight * _SHADOW_LIFT_GAIN
-    restored = np.clip(restored_float, 0, 255).astype(np.uint8)
-
-    denoised = cv2.fastNlMeansDenoisingColored(
-        restored,
-        None,
-        _NLM_LUMINANCE,
-        _NLM_COLOR,
-        _NLM_TEMPLATE_WINDOW,
-        _NLM_SEARCH_WINDOW,
-    )
-
-    detail_base = cv2.bilateralFilter(
-        denoised,
-        d=5,
-        sigmaColor=36,
-        sigmaSpace=36,
-    )
-    denoised = cv2.addWeighted(
-        denoised,
-        1.0 + _MIDTONE_DETAIL_AMOUNT,
-        detail_base,
-        -_MIDTONE_DETAIL_AMOUNT,
-        0,
-    )
-
-    blur = cv2.GaussianBlur(denoised, (0, 0), _UNSHARP_SIGMA)
-    sharpened = cv2.addWeighted(
-        denoised,
-        _UNSHARP_AMOUNT,
-        blur,
-        -(_UNSHARP_AMOUNT - 1.0),
-        _UNSHARP_THRESHOLD,
-    )
-
-    hsv = cv2.cvtColor(sharpened, cv2.COLOR_RGB2HSV).astype(np.float32)
-    hsv[..., 1] = np.clip(hsv[..., 1] * _SATURATION_GAIN, 0, 255)
-    final_background = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-    text_alpha_3d = text_alpha[..., np.newaxis]
-    final_img = (
-        rgb.astype(np.float32) * text_alpha_3d
-        + final_background.astype(np.float32) * (1.0 - text_alpha_3d)
-    )
-
-    return np.clip(final_img, 0, 255).astype(np.uint8)
+    params = _DC_RECOVER_PARAMS
+    result = _apply_dc_gamma_and_gain(rgb, params)
+    result = _deblock_dc_shadows(rgb, result, params.shadow_deblock)
+    result = _boost_dc_red_in_shadows(result, params.red_shadow_boost)
+    result = _boost_dc_highlights(result, params.highlight_strength)
+    result = _change_dc_saturation(result, params.saturation)
+    result = _apply_dc_clahe(result, params.clahe_clip)
+    result = _enhance_dc_shadow_detail(rgb, result, params.shadow_detail)
+    result = _sharpen_dc_image(result, params.shadow_sharpen)
+    result = _sharpen_dc_image(result, params.sharpen)
+    return result
 
 
 def _brighten_image_bytes(data: bytes, content_type: str | None) -> bytes | None:
