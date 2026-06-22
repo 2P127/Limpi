@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import csv
@@ -67,322 +67,20 @@ from .clients.youtube_client import (
 )
 
 
-POST_FORMAT_RICH = "rich"
+from .bot_constants import *
+from .bot_helpers import *
+from .bot_runtime import *
+from .bot_views import (
+    BrightenSpoilerButton,
+    BrightenSpoilerVisibilityView,
+    EgoGiftSelectView,
+    ExternalNewsSendConfirmView,
+    HampangNewsSelectView,
+    NewsPostSelectView,
+    ZipDownloadButton,
+)
+
 LOGGER = logging.getLogger(__name__)
-KST = timezone(timedelta(hours=9))
-NEWS_POST_LIMIT = 30
-TWITTER_POST_LIMIT = 30
-NEWS_SELECT_PAGE_SIZE = 25
-NEWS_SELECT_POST_LIMIT = 250
-NEWS_POLL_TICK_SECONDS = 10
-TWITTER_POLL_TICK_SECONDS = 5
-CHZZK_POLL_INTERVAL_SECONDS = 60
-YOUTUBE_UPLOAD_POLL_INTERVAL_SECONDS = 60
-HAMPANG_X_USERNAME = "Ham_PangPang"
-HAMPANG_X_URL = "https://x.com/Ham_PangPang"
-HAMPANG_YOUTUBE_TITLE_MARKER = "hamhampangpang"
-HAMPANG_SOURCE_BOTH = "both"
-HAMPANG_SOURCE_X = "x"
-HAMPANG_SOURCE_YOUTUBE = "youtube"
-CHZZK_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
-CHZZK_LIVE_END_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
-YOUTUBE_LIVE_ANNOUNCE_MAX_AGE = timedelta(minutes=10)
-NEWS_TARGET_SEND_CONCURRENCY = 12
-NEWS_ROLE_MENTION_COOLDOWN_SECONDS = 2 * 60 + 30
-TWITTER_STEAM_PREFERENCE_GRACE_SECONDS = 35
-USER_COMMAND_COOLDOWN_SECONDS = 3.0
-ZIP_CUSTOM_ID_PREFIX = "limpi:zip:"
-BRIGHTEN_CUSTOM_ID_PREFIX = "limpi:brighten:"
-ZIP_IMAGE_CONCURRENCY = 20
-ZIP_CACHE_MAX_ITEMS = 8
-BRIGHTEN_PROCESS_CONCURRENCY = 2
-BRIGHTEN_CACHE_MAX_ITEMS = 24
-BRIGHTEN_CACHE_MAX_BYTES = 64 * 1024 * 1024
-BRIGHTEN_CACHE_MAX_ITEM_BYTES = 16 * 1024 * 1024
-IMAGE_CACHE_MAX_ITEMS = 128
-IMAGE_CACHE_MAX_BYTES = 128 * 1024 * 1024
-IMAGE_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
-IMAGE_FAILED_URL_CACHE_MAX_ITEMS = 1024
-# 처리 완료된 에고 기프트 첨부 이미지(150px PNG)는 작아서 넉넉히 캐싱한다.
-EGO_GIFT_IMAGE_CACHE_MAX_ITEMS = 512
-EGO_GIFT_IMAGE_CACHE_MAX_BYTES = 64 * 1024 * 1024
-IMAGE_CACHE_WARM_POST_LIMIT = 10
-IMAGE_DOWNLOAD_ATTEMPTS = 3
-IMAGE_DOWNLOAD_TIMEOUT_SECONDS = 15
-EGO_GIFT_FALLBACK_IMAGE_INDEX_URL = "https://www.archivum.dev/ko/limbus/egoGifts"
-EGO_GIFT_FALLBACK_IMAGE_BASE_URL = "https://cdn.archivum.dev/file/butterflytheory/limbus/ego_gift"
-DISCORD_HEARTBEAT_TIMEOUT_SECONDS = 120.0
-AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS = 90
-TCP_KEEPALIVE_IDLE_SECONDS = 30
-TCP_KEEPALIVE_INTERVAL_SECONDS = 10
-TCP_KEEPALIVE_PROBES = 3
-WINDOWS_KEEPALIVE_TIME_MS = TCP_KEEPALIVE_IDLE_SECONDS * 1000
-WINDOWS_KEEPALIVE_INTERVAL_MS = TCP_KEEPALIVE_INTERVAL_SECONDS * 1000
-ASYNCIO_RESET_LOG_COOLDOWN_SECONDS = 300
-ES_CONTINUOUS = 0x80000000
-ES_SYSTEM_REQUIRED = 0x00000001
-NEWS_BANNER_DIR = Path("img")
-NEWS_BANNER_ATTACHMENT_NAME = "limpi_news_banner.png"
-MAX_INLINE_GALLERY_IMAGES = 10
-NEWS_UPDATE_NOTICE_COOLDOWN = timedelta(minutes=30)
-COMMAND_GUIDE_IMAGE_NAME = "honglu.jpg"
-EGO_GIFT_CSV_PATH = Path("ego_gifts.csv")
-EGO_GIFT_SELECT_PAGE_SIZE = 25
-NEWS_BANNER_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-NEWS_BANNER_DISABLED_LABEL = "사용 안 함"
-YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT = "youtube_16x9_placeholder.gif"
-LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS = (
-)
-EMBEDS_PER_MESSAGE = 10
-IMAGE_ONLY_EMBEDS_PER_MESSAGE = 10
-MAX_TWITTER_EMBED_IMAGES = EMBEDS_PER_MESSAGE
-EMBED_DESCRIPTION_LIMIT = 8096
-FILES_PER_MESSAGE = 10
-IMAGE_FILES_PER_MESSAGE = 4
-BOOLEAN_TRUE = "true"
-BOOLEAN_FALSE = "false"
-BOOLEAN_CHOICES = [
-    app_commands.Choice(name="허용", value=BOOLEAN_TRUE),
-    app_commands.Choice(name="비허용", value=BOOLEAN_FALSE),
-]
-BROADCAST_SOURCE_BOTH = "both"
-BROADCAST_SOURCE_CHZZK = "chzzk"
-BROADCAST_SOURCE_YOUTUBE = "youtube"
-BROADCAST_SOURCE_CHOICES = [
-    app_commands.Choice(name="치지직 & 유튜브", value=BROADCAST_SOURCE_BOTH),
-    app_commands.Choice(name="치지직", value=BROADCAST_SOURCE_CHZZK),
-    app_commands.Choice(name="유튜브", value=BROADCAST_SOURCE_YOUTUBE),
-]
-NEWS_SOURCE_BOTH = "both"
-NEWS_SOURCE_STEAM = "steam"
-NEWS_SOURCE_TWITTER = "twitter"
-TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS = 24 * 60 * 60
-NEWS_SOURCE_CHOICES = [
-    app_commands.Choice(name="Steam & X(트위터)", value=NEWS_SOURCE_BOTH),
-    app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
-    app_commands.Choice(name="X(트위터)", value=NEWS_SOURCE_TWITTER),
-]
-NEWS_LOOKUP_SOURCE_CHOICES = [
-    app_commands.Choice(name="Steam", value=NEWS_SOURCE_STEAM),
-    app_commands.Choice(name="트위터", value=NEWS_SOURCE_TWITTER),
-]
-HAMPANG_SOURCE_CHOICES = [
-    app_commands.Choice(name="X(트위터) & YouTube", value=HAMPANG_SOURCE_BOTH),
-    app_commands.Choice(name="X(트위터)", value=HAMPANG_SOURCE_X),
-    app_commands.Choice(name="YouTube", value=HAMPANG_SOURCE_YOUTUBE),
-]
-LANGUAGE_CHOICES = [
-    app_commands.Choice(name="한국어", value="koreana"),
-    app_commands.Choice(name="English", value="english"),
-    app_commands.Choice(name="日本語", value="japanese"),
-]
-IMAGE_DELIVERY_FILES = "files"
-IMAGE_DELIVERY_EMBEDS = "embeds"
-IMAGE_DELIVERY_CHOICES = [
-    app_commands.Choice(name="임베드에 이미지 표시", value=IMAGE_DELIVERY_EMBEDS),
-    app_commands.Choice(name="첨부파일로 따로 전송", value=IMAGE_DELIVERY_FILES),
-]
-LANGUAGE_LABELS = {
-    "koreana": "한국어",
-    "english": "English",
-    "japanese": "日本語",
-}
-NEWS_UI_TEXT = {
-    "koreana": {
-        "schedule": "일정",
-        "original": "원문 보기",
-        "download_images": "이미지 다운로드",
-        "updated": "-# 🔄 수정된 소식입니다.",
-        "reply_context": "> @{username} 님에게 보내는 답글:",
-        "retweet_context": "> @{username} 님의 게시물 리트윗:",
-        "zip_unavailable": "지금은 다운로드를 처리할 수 없어요.",
-        "zip_no_images": "이 게시물에는 이미지가 없어요.",
-        "zip_fetch_failed": "이미지를 가져오는 중 문제가 생겼어요. 잠시 후 다시 시도해주세요.",
-        "zip_empty": "이미지를 다운로드하지 못했어요.",
-        "zip_ready": "이미지 {count}장을 압축했어요.",
-    },
-    "english": {
-        "schedule": "Schedule",
-        "original": "View original",
-        "download_images": "Download images",
-        "updated": "-# 🔄 This news was updated.",
-        "reply_context": "> Replying to @{username}:",
-        "retweet_context": "> Retweeted @{username}'s post:",
-        "zip_unavailable": "Downloads are unavailable right now.",
-        "zip_no_images": "This post has no images.",
-        "zip_fetch_failed": "Something went wrong while fetching the images. Please try again later.",
-        "zip_empty": "Could not download the images.",
-        "zip_ready": "Compressed {count} images.",
-    },
-    "japanese": {
-        "schedule": "日程",
-        "original": "原文を見る",
-        "download_images": "画像をダウンロード",
-        "updated": "-# 🔄 このお知らせは更新されました。",
-        "reply_context": "> @{username} さんへの返信:",
-        "retweet_context": "> @{username} さんの投稿をリツイート:",
-        "zip_unavailable": "現在、ダウンロードを処理できません。",
-        "zip_no_images": "この投稿には画像がありません。",
-        "zip_fetch_failed": "画像の取得中に問題が発生しました。しばらくしてからもう一度お試しください。",
-        "zip_empty": "画像をダウンロードできませんでした。",
-        "zip_ready": "画像{count}枚を圧縮しました。",
-    },
-}
-SYNC_LANGUAGES = ("koreana", "english", "japanese")
-MAINTENANCE_WEEKDAY = 3
-MAINTENANCE_START_HOUR = 10
-MAINTENANCE_UPDATE_HOUR = 12
-MAINTENANCE_START_TITLE = "림버스 컴퍼니 점검 알림"
-MAINTENANCE_START_DESCRIPTION = (
-    "지금부터 림버스 컴퍼니가 점검에 들어가요! "
-    "관리자 분들은 점검이 끝날때까지 기다리시면 될거에요! <3"
-)
-MAINTENANCE_UPDATE_TITLE = "림버스 컴퍼니 업데이트"
-MAINTENANCE_UPDATE_DESCRIPTION = (
-    "지금 림버스 컴퍼니가 점검이 끝나고 업데이트가 되었어요! "
-    "스팀 또는 앱 스토어에 들어가서 림버스를 업데이트 해주세요! <3"
-)
-_last_asyncio_reset_log_at = 0.0
-
-
-def _install_windows_selector_event_loop_policy() -> None:
-    if sys.platform != "win32":
-        return
-    policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
-    if policy_factory is None:
-        return
-    try:
-        asyncio.set_event_loop_policy(policy_factory())
-    except RuntimeError:
-        pass
-
-
-def _is_asyncio_transport_reset_context(context: dict[str, object]) -> bool:
-    exc = context.get("exception")
-    if not isinstance(exc, ConnectionResetError):
-        return False
-    if getattr(exc, "winerror", None) != 10054:
-        return False
-    message = str(context.get("message") or "")
-    handle = str(context.get("handle") or "")
-    return (
-        "Exception in callback" in message
-        and "_ProactorBasePipeTransport._call_connection_lost" in handle
-    )
-
-
-def _install_asyncio_exception_handler(loop: asyncio.AbstractEventLoop) -> None:
-    previous_handler = loop.get_exception_handler()
-
-    def _handle_exception(
-        current_loop: asyncio.AbstractEventLoop,
-        context: dict[str, object],
-    ) -> None:
-        global _last_asyncio_reset_log_at
-        if _is_asyncio_transport_reset_context(context):
-            now = current_loop.time()
-            if now - _last_asyncio_reset_log_at >= ASYNCIO_RESET_LOG_COOLDOWN_SECONDS:
-                _last_asyncio_reset_log_at = now
-                LOGGER.warning(
-                    "네트워크 연결이 원격에서 끊겨 비동기 전송을 정리했습니다 "
-                    "(WinError 10054)."
-                )
-            exc = context.get("exception")
-            LOGGER.debug(
-                "asyncio 연결 종료 콜백 오류 전체 정보: %s",
-                context,
-                exc_info=(
-                    (type(exc), exc, exc.__traceback__)
-                    if isinstance(exc, BaseException)
-                    else None
-                ),
-            )
-            return
-
-        if previous_handler is not None:
-            previous_handler(current_loop, context)
-        else:
-            current_loop.default_exception_handler(context)
-
-    loop.set_exception_handler(_handle_exception)
-
-
-def _exception_chain(exc: BaseException) -> list[BaseException]:
-    chain: list[BaseException] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        chain.append(current)
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return chain
-
-
-def _internet_error_detail(exc: BaseException) -> tuple[str, str] | None:
-    dns_error_type = getattr(aiohttp, "ClientConnectorDNSError", None)
-    for item in _exception_chain(exc):
-        if dns_error_type is not None and isinstance(item, dns_error_type):
-            return "DNS 확인 실패", type(item).__name__
-        if isinstance(item, socket.gaierror):
-            return "DNS 확인 실패", type(item).__name__
-        if isinstance(item, (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)):
-            return "요청 시간 초과", type(item).__name__
-        if isinstance(item, aiohttp.ClientResponseError):
-            return "HTTP 응답 오류", type(item).__name__
-        if isinstance(item, aiohttp.ClientConnectorError):
-            return "서버 연결 실패", type(item).__name__
-        if isinstance(item, aiohttp.ClientConnectionError):
-            return "네트워크 연결 오류", type(item).__name__
-        if isinstance(item, aiohttp.ClientError):
-            return "네트워크 요청 오류", type(item).__name__
-        if isinstance(item, ConnectionError):
-            return "네트워크 연결 오류", type(item).__name__
-
-    message = str(exc)
-    if any(
-        marker in message
-        for marker in (
-            "Cannot write to closing transport",
-            "closing transport",
-            "WinError 10054",
-        )
-    ):
-        return "네트워크 연결 오류", type(exc).__name__
-    if isinstance(exc, XClientError) and any(
-        marker in message
-        for marker in (
-            "네트워크",
-            "백오프",
-            "Cannot connect",
-            "getaddrinfo",
-            "Name or service not known",
-            "Temporary failure in name resolution",
-            "timed out",
-            "Timeout",
-        )
-    ):
-        return "X API 네트워크 오류", type(exc).__name__
-    return None
-
-
-def _is_internet_exception(exc: BaseException) -> bool:
-    return _internet_error_detail(exc) is not None
-
-
-def _log_internet_exception(
-    message: str,
-    exc: BaseException,
-    *,
-    level: int = logging.WARNING,
-) -> None:
-    reason, error_type = _internet_error_detail(exc) or ("인터넷 관련 오류", type(exc).__name__)
-    LOGGER.log(level, "%s: %s (%s)", message, reason, error_type)
-    LOGGER.debug(
-        "%s 전체 오류: %s",
-        message,
-        exc,
-        exc_info=(type(exc), exc, exc.__traceback__),
-    )
 
 
 class LoggingCommandTree(app_commands.CommandTree):
@@ -593,840 +291,6 @@ class LimpiBot(commands.Bot):
         self._synced_connected_guilds = True
 
 
-class ZipDownloadButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"limpi:zip:(?P<post_id>.+)",
-):
-    def __init__(self, post_id: str, *, language: str = "koreana") -> None:
-        super().__init__(
-            discord.ui.Button(
-                label=_news_ui_text(language, "download_images"),
-                style=discord.ButtonStyle.primary,
-                custom_id=f"{ZIP_CUSTOM_ID_PREFIX}{post_id}",
-                emoji="🗂️",
-            )
-        )
-        self.post_id = post_id
-
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match):
-        return cls(match["post_id"])
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        cog = interaction.client.get_cog("NewsCog")
-        if not isinstance(cog, NewsCog):
-            await interaction.response.send_message(
-                _news_ui_text("koreana", "zip_unavailable"), ephemeral=True
-            )
-            return
-        await cog.handle_zip_request(interaction, self.post_id)
-
-
-class BrightenSpoilerButton(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"limpi:brighten:(?P<post_id>.+):(?P<index>\d+)",
-):
-    def __init__(
-        self, post_id: str, *, image_index: int = 0, language: str = "koreana"
-    ) -> None:
-        super().__init__(
-            discord.ui.Button(
-                label="밝기 올리기",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"{BRIGHTEN_CUSTOM_ID_PREFIX}{post_id}:{image_index}",
-                emoji="🔆",
-            )
-        )
-        self.post_id = post_id
-        self.image_index = image_index
-        self.language = language
-
-    @classmethod
-    async def from_custom_id(cls, interaction, item, match):
-        return cls(match["post_id"], image_index=int(match["index"]))
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        if not interaction.permissions.send_messages:
-            await interaction.response.send_message(
-                "이 채널에서는 밝기 올리기를 사용할 수 없어요. 당신의 권한을 확인해주세요.", ephemeral=True
-            )
-            return
-        cog = interaction.client.get_cog("NewsCog")
-        if not isinstance(cog, NewsCog):
-            await interaction.response.send_message(
-                "지금은 이미지를 처리할 수 없어요.", ephemeral=True
-            )
-            return
-        await cog.prompt_brighten_spoiler_visibility(
-            interaction,
-            self.post_id,
-            image_index=self.image_index,
-        )
-
-
-class BrightenSpoilerVisibilityView(discord.ui.View):
-    def __init__(self, author_id: int, post_id: str, image_index: int) -> None:
-        super().__init__(timeout=30)
-        self.author_id = author_id
-        self.post_id = post_id
-        self.image_index = image_index
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-
-        await interaction.response.send_message(
-            "이 선택 버튼은 처음 누른 사람만 사용할 수 있어요.",
-            ephemeral=True,
-        )
-        return False
-
-    async def _send_result(self, interaction: discord.Interaction, *, ephemeral: bool) -> None:
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content="이미지를 처리하고 있어요.",
-            embed=None,
-            view=self,
-        )
-        cog = interaction.client.get_cog("NewsCog")
-        if not isinstance(cog, NewsCog):
-            await interaction.followup.send(
-                "지금은 이미지를 처리할 수 없어요.",
-                ephemeral=True,
-            )
-            return
-        await cog.handle_brighten_spoiler_request(
-            interaction,
-            self.post_id,
-            image_index=self.image_index,
-            ephemeral=ephemeral,
-        )
-
-    @discord.ui.button(label="나만 보기", style=discord.ButtonStyle.primary)
-    async def private_result(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self._send_result(interaction, ephemeral=True)
-
-    @discord.ui.button(label="채널에 보내기", style=discord.ButtonStyle.danger)
-    async def public_result(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await self._send_result(interaction, ephemeral=False)
-
-
-class NewsPostSelect(discord.ui.Select):
-    def __init__(self, parent: "NewsPostSelectView") -> None:
-        options = parent.current_options()
-        super().__init__(
-            placeholder="게시물을 선택해주세요.",
-            min_values=1,
-            max_values=1,
-            options=options,
-            disabled=not options,
-        )
-        self.parent_view = parent
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent_view.handle_select(interaction, self.values[0])
-
-
-class NewsPostSelectView(discord.ui.View):
-    def __init__(
-        self,
-        cog: "NewsCog",
-        author_id: int,
-        posts: list[NewsPost],
-        *,
-        mode: str,
-        source_mode: str,
-        language: str,
-        private: bool = True,
-        attach_photos: bool = True,
-        channel_id: int | None = None,
-        role_id: int | None = None,
-    ) -> None:
-        super().__init__(timeout=120)
-        self.cog = cog
-        self.author_id = author_id
-        self.posts = posts
-        self.mode = mode
-        self.source_mode = source_mode
-        self.language = language
-        self.private = private
-        self.attach_photos = attach_photos
-        self.channel_id = channel_id
-        self.role_id = role_id
-        self.page = 0
-        self.refresh_items()
-
-    @property
-    def max_page(self) -> int:
-        if not self.posts:
-            return 0
-        return (len(self.posts) - 1) // NEWS_SELECT_PAGE_SIZE
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-
-        await interaction.response.send_message(
-            "이 선택 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
-            ephemeral=True,
-        )
-        return False
-
-    def current_options(self) -> list[discord.SelectOption]:
-        start = self.page * NEWS_SELECT_PAGE_SIZE
-        page_posts = self.posts[start:start + NEWS_SELECT_PAGE_SIZE]
-        options: list[discord.SelectOption] = []
-        for post in page_posts:
-            label = _choice_name(post, include_language=False, include_source=False)
-            description = _choice_name(post, include_language=True, include_source=True)
-            index = start + len(options)
-            options.append(
-                discord.SelectOption(
-                    label=label[:100],
-                    value=str(index),
-                    description=description[:100],
-                )
-            )
-        return options
-
-    def refresh_items(self) -> None:
-        self.clear_items()
-        self.add_item(NewsPostSelect(self))
-        prev_button = discord.ui.Button(
-            label="이전",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page <= 0,
-        )
-        next_button = discord.ui.Button(
-            label="다음",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page >= self.max_page,
-        )
-        prev_button.callback = self.previous_page
-        next_button.callback = self.next_page
-        self.add_item(prev_button)
-        self.add_item(next_button)
-
-    async def previous_page(self, interaction: discord.Interaction) -> None:
-        if self.page > 0:
-            self.page -= 1
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def next_page(self, interaction: discord.Interaction) -> None:
-        if self.page < self.max_page:
-            self.page += 1
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def update_message(self, interaction: discord.Interaction) -> None:
-        await interaction.response.edit_message(
-            embed=self.build_embed(),
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    def build_embed(self) -> discord.Embed:
-        title = "게시물을 선택해주세요"
-        if self.mode == "send":
-            title = "보낼 게시물을 선택해주세요"
-        description = f"{self.page + 1} / {self.max_page + 1} 페이지"
-        if not self.posts:
-            description = "선택할 수 있는 게시물이 없어요."
-        return discord.Embed(
-            title=title,
-            description=description,
-            color=discord.Color.from_rgb(179, 28, 28),
-        )
-
-    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
-        try:
-            post = self.posts[int(value)]
-        except (IndexError, ValueError):
-            await interaction.response.send_message(
-                "선택한 게시물을 찾지 못했어요.",
-                ephemeral=True,
-            )
-            return
-        for item in self.children:
-            item.disabled = True
-        await interaction.response.edit_message(
-            content="선택한 게시물을 처리하고 있어요.",
-            embed=None,
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        if self.mode == "send":
-            await self.cog._send_news_by_selected_post(
-                interaction,
-                post.post_id,
-                source_mode=self.source_mode,
-                channel_id=self.channel_id,
-                role_id=self.role_id,
-            )
-            return
-
-        await self.cog._show_previous_news_by_selected_post(
-            interaction,
-            post.post_id,
-            source_mode=self.source_mode,
-            language=self.language,
-            private=self.private,
-            attach_photos=self.attach_photos,
-        )
-
-
-class HampangNewsSelect(discord.ui.Select):
-    def __init__(self, parent: "HampangNewsSelectView") -> None:
-        options = parent.current_options()
-        super().__init__(
-            placeholder="햄햄팡팡 소식을 선택해주세요.",
-            min_values=1,
-            max_values=1,
-            options=options,
-            disabled=not options,
-            custom_id="limpi:hampang:select",
-        )
-        self.parent_view = parent
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent_view.handle_select(interaction, self.values[0])
-
-
-class HampangNewsSelectView(discord.ui.View):
-    def __init__(
-        self,
-        cog: "NewsCog",
-        author_id: int,
-        items: list[tuple[str, TwitterPost | YoutubeUpload]],
-        *,
-        mode: str,
-        private: bool = True,
-        channel_id: int | None = None,
-        role_id: int | None = None,
-    ) -> None:
-        super().__init__(timeout=900)
-        self.cog = cog
-        self.author_id = author_id
-        self.items = items
-        self.mode = mode
-        self.private = private
-        self.channel_id = channel_id
-        self.role_id = role_id
-        self.page = 0
-        self.refresh_items()
-
-    @property
-    def max_page(self) -> int:
-        if not self.items:
-            return 0
-        return (len(self.items) - 1) // NEWS_SELECT_PAGE_SIZE
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-        await interaction.response.send_message(
-            "이 선택 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
-            ephemeral=True,
-        )
-        return False
-
-    def current_options(self) -> list[discord.SelectOption]:
-        start = self.page * NEWS_SELECT_PAGE_SIZE
-        page_items = self.items[start:start + NEWS_SELECT_PAGE_SIZE]
-        options: list[discord.SelectOption] = []
-        for source, item in page_items:
-            index = start + len(options)
-            options.append(
-                discord.SelectOption(
-                    label=_hampang_choice_name(source, item)[:100],
-                    value=str(index),
-                    description=_hampang_choice_description(source, item)[:100],
-                )
-            )
-        return options
-
-    def refresh_items(self) -> None:
-        self.clear_items()
-        self.add_item(HampangNewsSelect(self))
-        prev_button = discord.ui.Button(
-            label="이전",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page <= 0,
-            custom_id="limpi:hampang:previous",
-        )
-        next_button = discord.ui.Button(
-            label="다음",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page >= self.max_page,
-            custom_id="limpi:hampang:next",
-        )
-        prev_button.callback = self.previous_page
-        next_button.callback = self.next_page
-        self.add_item(prev_button)
-        self.add_item(next_button)
-
-    async def previous_page(self, interaction: discord.Interaction) -> None:
-        if self.page > 0:
-            self.page -= 1
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def next_page(self, interaction: discord.Interaction) -> None:
-        if self.page < self.max_page:
-            self.page += 1
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def update_message(self, interaction: discord.Interaction) -> None:
-        await interaction.response.edit_message(
-            embed=self.build_embed(),
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    def build_embed(self) -> discord.Embed:
-        title = (
-            "보낼 햄햄팡팡 소식을 선택해주세요"
-            if self.mode == "send"
-            else "확인할 햄햄팡팡 이전 소식을 선택해주세요"
-        )
-        x_count = sum(1 for source, _ in self.items if source == HAMPANG_SOURCE_X)
-        youtube_count = len(self.items) - x_count
-        description = (
-            f"{self.page + 1} / {self.max_page + 1} 페이지"
-            f"\nX(트위터) {x_count}개 · YouTube {youtube_count}개"
-        )
-        return discord.Embed(
-            title=title,
-            description=description,
-            color=discord.Color.from_rgb(179, 28, 28),
-        )
-
-    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
-        try:
-            source, item = self.items[int(value)]
-        except (IndexError, ValueError):
-            await interaction.response.send_message(
-                "선택한 햄햄팡팡 소식을 찾지 못했어요.",
-                ephemeral=True,
-            )
-            return
-        for child in self.children:
-            child.disabled = True
-        await interaction.response.edit_message(
-            content="선택한 햄햄팡팡 소식을 처리하고 있어요.",
-            embed=None,
-            view=self,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        if self.mode == "send":
-            await self.cog._send_selected_hampang_news(
-                interaction,
-                source,
-                item,
-                channel_id=self.channel_id,
-                role_id=self.role_id,
-            )
-            return
-        await self.cog._show_selected_hampang_news(
-            interaction,
-            source,
-            item,
-            private=self.private,
-        )
-
-
-class EgoGiftSearchModal(discord.ui.Modal, title="에고 기프트 검색"):
-    query = discord.ui.TextInput(
-        label="검색어",
-        placeholder="예: 재에서 재로, 화상, 배터리",
-        required=False,
-        max_length=100,
-    )
-
-    def __init__(self, parent: "EgoGiftSelectView") -> None:
-        super().__init__()
-        self.parent_view = parent
-        self.query.default = parent.query
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        self.parent_view.query = str(self.query.value).strip()
-        self.parent_view.keyword = None
-        self.parent_view.page = 0
-        self.parent_view.selected_gift = None
-        self.parent_view.refresh_items()
-        await self.parent_view.update_message(interaction)
-
-
-class EgoGiftKeywordSelect(discord.ui.Select):
-    def __init__(self, parent: "EgoGiftSelectView") -> None:
-        options = parent.keyword_options()
-        super().__init__(
-            placeholder="키워드별로 보기",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="limpi:ego-gift:keyword",
-        )
-        self.parent_view = parent
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        value = self.values[0]
-        self.parent_view.keyword = None if value == "__all__" else value
-        self.parent_view.page = 0
-        self.parent_view.selected_gift = None
-        self.parent_view.refresh_items()
-        await self.parent_view.update_message(interaction)
-
-
-class EgoGiftSelect(discord.ui.Select):
-    def __init__(self, parent: "EgoGiftSelectView") -> None:
-        options = parent.current_options()
-        super().__init__(
-            placeholder="에고 기프트를 선택해주세요.",
-            min_values=1,
-            max_values=1,
-            options=options,
-            disabled=not parent.has_active_filter or not parent.filtered_gifts,
-            custom_id="limpi:ego-gift:select",
-        )
-        self.parent_view = parent
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent_view.handle_select(interaction, self.values[0])
-
-
-class EgoGiftSelectView(discord.ui.LayoutView):
-    def __init__(
-        self,
-        cog: "NewsCog",
-        author_id: int,
-        *,
-        query: str = "",
-        private: bool = True,
-    ) -> None:
-        super().__init__(timeout=900)
-        self.cog = cog
-        self.author_id = author_id
-        self.query = query.strip()
-        self.private = private
-        self.keyword: str | None = None
-        self.page = 0
-        self.selected_gift: EgoGift | None = None
-        self._update_lock = asyncio.Lock()
-        self.refresh_items()
-
-    @property
-    def filtered_gifts(self) -> list["EgoGift"]:
-        return _filter_ego_gifts(self.query, keyword=self.keyword)
-
-    @property
-    def has_active_filter(self) -> bool:
-        return bool(self.query) or self.keyword is not None
-
-    @property
-    def max_page(self) -> int:
-        gifts = self.filtered_gifts
-        if not gifts:
-            return 0
-        return (len(gifts) - 1) // EGO_GIFT_SELECT_PAGE_SIZE
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-
-        await interaction.response.send_message(
-            "이 검색 메뉴는 명령어를 실행한 사람만 사용할 수 있어요.",
-            ephemeral=True,
-        )
-        return False
-
-    def keyword_options(self) -> list[discord.SelectOption]:
-        options = [
-            discord.SelectOption(
-                label="전체 키워드",
-                value="__all__",
-                default=self.keyword is None,
-            )
-        ]
-        for keyword, count in _ego_gift_keyword_counts():
-            options.append(
-                discord.SelectOption(
-                    label=keyword[:100],
-                    value=keyword[:100],
-                    description=f"{count}개",
-                    default=self.keyword == keyword,
-                )
-            )
-        return options[:25]
-
-    def current_options(self) -> list[discord.SelectOption]:
-        if not self.has_active_filter:
-            return [
-                discord.SelectOption(
-                    label="검색 또는 키워드를 선택해주세요",
-                    value="__idle__",
-                    description="아래 검색 버튼이나 키워드 메뉴를 이용해주세요.",
-                )
-            ]
-
-        gifts = self.filtered_gifts
-        if not gifts:
-            return [
-                discord.SelectOption(
-                    label="검색 결과 없음",
-                    value="__none__",
-                    description="검색어 또는 키워드를 바꿔주세요.",
-                )
-            ]
-
-        start = self.page * EGO_GIFT_SELECT_PAGE_SIZE
-        page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
-        options: list[discord.SelectOption] = []
-        for index, gift in enumerate(page_gifts, start=start):
-            description = (
-                f"{_ego_gift_keyword(gift) or '키워드 없음'} · "
-                f"{_ego_gift_grade_label(gift.grade)}"
-            )
-            if gift.category:
-                description += f" · {gift.category}"
-            options.append(
-                discord.SelectOption(
-                    label=gift.name[:100],
-                    value=str(index),
-                    description=description[:100],
-                    default=self.selected_gift == gift,
-                )
-            )
-        return options
-
-    def refresh_items(self, *, image_filename: str | None = None) -> None:
-        self.clear_items()
-        if self.page > self.max_page:
-            self.page = self.max_page
-
-        container = discord.ui.Container(accent_color=discord.Color.from_rgb(179, 28, 28))
-        if self.selected_gift is not None:
-            if image_filename:
-                gallery = discord.ui.MediaGallery()
-                gallery.add_item(media=f"attachment://{image_filename}")
-                container.add_item(gallery)
-                container.add_item(discord.ui.Separator())
-            container.add_item(
-                discord.ui.TextDisplay(
-                    _truncate_component_text(
-                        _ego_gift_component_markdown(
-                            self.selected_gift,
-                            status_text=self.status_text(),
-                        ),
-                        4000,
-                    )
-                )
-            )
-        elif not self.has_active_filter:
-            container.add_item(
-                discord.ui.TextDisplay(
-                    "## **에고 기프트 검색**\n"
-                    "에고 기프트 검색을 위해 밑에서 선택해주세요!\n\n"
-                    f"-# {self.status_text()}"
-                )
-            )
-        else:
-            container.add_item(
-                discord.ui.TextDisplay(
-                    _truncate_component_text(
-                        self._gift_list_markdown(),
-                        4000,
-                    )
-                )
-            )
-
-        container.add_item(discord.ui.Separator())
-
-        keyword_row = discord.ui.ActionRow()
-        keyword_row.add_item(EgoGiftKeywordSelect(self))
-        container.add_item(keyword_row)
-
-        gift_row = discord.ui.ActionRow()
-        gift_row.add_item(EgoGiftSelect(self))
-        container.add_item(gift_row)
-
-        search_button = discord.ui.Button(
-            label="검색",
-            style=discord.ButtonStyle.primary,
-            custom_id="limpi:ego-gift:search",
-        )
-        reset_button = discord.ui.Button(
-            label="초기화",
-            style=discord.ButtonStyle.secondary,
-            disabled=not self.query and self.keyword is None,
-            custom_id="limpi:ego-gift:reset",
-        )
-        prev_button = discord.ui.Button(
-            label="이전",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page <= 0,
-            custom_id="limpi:ego-gift:previous",
-        )
-        next_button = discord.ui.Button(
-            label="다음",
-            style=discord.ButtonStyle.secondary,
-            disabled=self.page >= self.max_page,
-            custom_id="limpi:ego-gift:next",
-        )
-        search_button.callback = self.open_search
-        reset_button.callback = self.reset_filters
-        prev_button.callback = self.previous_page
-        next_button.callback = self.next_page
-        action_row = discord.ui.ActionRow()
-        action_row.add_item(search_button)
-        action_row.add_item(reset_button)
-        action_row.add_item(prev_button)
-        action_row.add_item(next_button)
-        container.add_item(action_row)
-
-        self.add_item(container)
-
-    async def open_search(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(EgoGiftSearchModal(self))
-
-    async def reset_filters(self, interaction: discord.Interaction) -> None:
-        self.query = ""
-        self.keyword = None
-        self.page = 0
-        self.selected_gift = None
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def previous_page(self, interaction: discord.Interaction) -> None:
-        if self.page > 0:
-            self.page -= 1
-        self.selected_gift = None
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def next_page(self, interaction: discord.Interaction) -> None:
-        if self.page < self.max_page:
-            self.page += 1
-        self.selected_gift = None
-        self.refresh_items()
-        await self.update_message(interaction)
-
-    async def update_message(self, interaction: discord.Interaction) -> None:
-        # build_response가 namu.wiki 이미지를 다운로드할 수 있어 3초를 넘길 수 있다.
-        # 먼저 defer로 인터랙션을 ack해 토큰 만료(10062 Unknown interaction)를 막고,
-        # 이후 15분 창을 가진 webhook(edit_original_response)으로 편집한다.
-        if not interaction.response.is_done():
-            await interaction.response.defer()
-        async with self._update_lock:
-            attachments = await self.build_response()
-            await interaction.edit_original_response(
-                attachments=attachments,
-                view=self,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-
-    async def build_response(self) -> list[discord.File]:
-        file = None
-        if self.selected_gift is not None:
-            file = await self.cog._ego_gift_image_file(self.selected_gift)
-        self.refresh_items(image_filename=file.filename if file is not None else None)
-        return [file] if file is not None else []
-
-    def _gift_list_markdown(self) -> str:
-        gifts = self.filtered_gifts
-        start = self.page * EGO_GIFT_SELECT_PAGE_SIZE
-        page_gifts = gifts[start:start + EGO_GIFT_SELECT_PAGE_SIZE]
-        if page_gifts:
-            lines = [
-                f"`{index + 1}.` **{gift.name}** · {_ego_gift_keyword(gift) or '-'} · "
-                f"{_ego_gift_grade_label(gift.grade)}"
-                for index, gift in enumerate(page_gifts, start=start)
-            ]
-            body = "\n".join(lines)
-        else:
-            body = "검색 결과가 없어요. 검색어를 바꾸거나 키워드를 전체로 돌려보세요."
-
-        return (
-            "## **에고 기프트 검색**\n"
-            f"{body}\n\n"
-            f"-# {self.status_text()}"
-        )
-
-    def status_text(self) -> str:
-        gifts = self.filtered_gifts
-        keyword = self.keyword or "전체"
-        query = self.query or "없음"
-        return (
-            f"검색어: {query} · 키워드: {keyword} · "
-            f"{self.page + 1}/{self.max_page + 1} 페이지 · 결과 {len(gifts)}개 · "
-            "출처: 나무위키 참고"
-        )
-
-    async def handle_select(self, interaction: discord.Interaction, value: str) -> None:
-        if value in {"__idle__", "__none__"}:
-            await interaction.response.send_message(
-                "선택할 에고 기프트가 없어요.",
-                ephemeral=True,
-            )
-            return
-        try:
-            self.selected_gift = self.filtered_gifts[int(value)]
-        except (IndexError, ValueError):
-            await interaction.response.send_message(
-                "선택한 에고 기프트를 찾지 못했어요.",
-                ephemeral=True,
-            )
-            return
-        self.refresh_items()
-        await self.update_message(interaction)
-
-
-class ExternalNewsSendConfirmView(discord.ui.View):
-    def __init__(self, author_id: int) -> None:
-        super().__init__(timeout=30)
-        self.author_id = author_id
-        self.confirmed: bool | None = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.author_id:
-            return True
-
-        await interaction.response.send_message(
-            "이 확인 버튼은 명령어를 실행한 사람만 누를 수 있어요.",
-            ephemeral=True,
-        )
-        return False
-
-    @discord.ui.button(label="네!", style=discord.ButtonStyle.danger)
-    async def confirm(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.confirmed = True
-        await interaction.response.defer()
-        self.stop()
-
-    @discord.ui.button(label="아니요...생각해볼깨요", style=discord.ButtonStyle.secondary)
-    async def cancel(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.confirmed = False
-        await interaction.response.defer()
-        self.stop()
 
 
 class NewsCog(commands.Cog):
@@ -1464,9 +328,11 @@ class NewsCog(commands.Cog):
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._twitter_steam_defer_logged_post_ids: set[str] = set()
-        self._zip_cache: dict[str, tuple[bytes, int]] = {}
+        self._zip_cache: dict[str, tuple[list[bytes], int, int, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
+        self._image_download_tasks: dict[str, asyncio.Task[tuple[bytes, str | None] | None]] = {}
+        self._image_process_semaphore = asyncio.Semaphore(IMAGE_PROCESS_CONCURRENCY)
         self._failed_image_urls: dict[str, None] = {}
         self._brighten_cache: dict[str, bytes] = {}
         self._brighten_cache_bytes: int = 0
@@ -1480,6 +346,7 @@ class NewsCog(commands.Cog):
         self._ego_gift_image_cache_bytes: int = 0
         # 동일 기프트를 동시에 조회할 때 빌드를 한 번만 수행하도록 in-flight 태스크 공유.
         self._ego_gift_image_tasks: dict[str, asyncio.Task[bytes | None]] = {}
+        self._ego_gift_image_semaphore = asyncio.Semaphore(EGO_GIFT_IMAGE_PROCESS_CONCURRENCY)
         self._last_poll_at: datetime | None = None
         self._last_twitter_poll_at: datetime | None = None
         self._startup_synced = False
@@ -2802,7 +1669,7 @@ class NewsCog(commands.Cog):
                 lambda _t, key=cache_key: self._ego_gift_image_tasks.pop(key, None)
             )
 
-        data = await task
+        data = await asyncio.shield(task)
         if data is not None:
             self._cache_ego_gift_image(cache_key, data)
         return data
@@ -2832,9 +1699,10 @@ class NewsCog(commands.Cog):
 
         data, content_type = downloaded
         # PIL 디코드/리사이즈는 CPU 작업이라 스레드로 빼서 이벤트 루프를 막지 않는다.
-        return await asyncio.to_thread(
-            _process_ego_gift_image_bytes, data, content_type
-        )
+        async with self._ego_gift_image_semaphore:
+            return await asyncio.to_thread(
+                _process_ego_gift_image_bytes, data, content_type
+            )
 
     def _cache_ego_gift_image(self, cache_key: str, data: bytes) -> None:
         prev = self._ego_gift_image_cache.pop(cache_key, None)
@@ -2849,6 +1717,37 @@ class NewsCog(commands.Cog):
             oldest_key, oldest_data = next(iter(self._ego_gift_image_cache.items()))
             self._ego_gift_image_cache.pop(oldest_key, None)
             self._ego_gift_image_cache_bytes -= len(oldest_data)
+
+    def _schedule_ego_gift_image_warmup(self, gifts: list[EgoGift]) -> None:
+        warm_gifts: list[EgoGift] = []
+        seen_names: set[str] = set()
+        for gift in gifts:
+            if len(warm_gifts) >= EGO_GIFT_IMAGE_WARMUP_LIMIT:
+                break
+            if not gift.image_url or gift.name in seen_names:
+                continue
+            seen_names.add(gift.name)
+            if (
+                gift.name in self._ego_gift_image_cache
+                or gift.name in self._ego_gift_image_tasks
+            ):
+                continue
+            warm_gifts.append(gift)
+
+        if not warm_gifts:
+            return
+
+        task = asyncio.create_task(self._warm_ego_gift_images(warm_gifts))
+        task.add_done_callback(self._log_background_task_result)
+
+    async def _warm_ego_gift_images(self, gifts: list[EgoGift]) -> None:
+        semaphore = asyncio.Semaphore(EGO_GIFT_IMAGE_WARMUP_CONCURRENCY)
+
+        async def warm_one(gift: EgoGift) -> None:
+            async with semaphore:
+                await self._get_ego_gift_image_bytes(gift)
+
+        await asyncio.gather(*(warm_one(gift) for gift in gifts))
 
     async def _ego_gift_fallback_image_url(self, name: str) -> str | None:
         if self._ego_gift_image_fallbacks is None:
@@ -3968,14 +2867,24 @@ class NewsCog(commands.Cog):
             return
 
         try:
+            upload_limit = self._zip_upload_limit_bytes(interaction)
             cached = self._zip_cache.get(post.post_id)
-            if cached is None:
-                buffer, count = await self._build_image_zip(post)
-                if buffer is not None and count > 0:
-                    self._cache_zip(post.post_id, buffer.getvalue(), count)
+            if cached is None or cached[3] != upload_limit:
+                buffers, count, skipped = await self._build_image_zip_parts(
+                    post,
+                    max_part_bytes=upload_limit,
+                )
+                if buffers and count > 0:
+                    self._cache_zip(
+                        post.post_id,
+                        [buffer.getvalue() for buffer in buffers],
+                        count,
+                        skipped,
+                        upload_limit,
+                    )
             else:
-                zip_bytes, count = cached
-                buffer = io.BytesIO(zip_bytes)
+                zip_part_bytes, count, skipped, _ = cached
+                buffers = [io.BytesIO(part) for part in zip_part_bytes]
         except Exception:
             LOGGER.exception("게시물 %s의 이미지 ZIP 생성 실패.", post_id)
             await interaction.followup.send(
@@ -3984,19 +2893,67 @@ class NewsCog(commands.Cog):
             )
             return
 
-        if buffer is None or count == 0:
+        if not buffers or count == 0:
+            message = (
+                _news_ui_text(language, "zip_upload_too_large")
+                if skipped
+                else _news_ui_text(language, "zip_empty")
+            )
             await interaction.followup.send(
-                _news_ui_text(language, "zip_empty"), ephemeral=True
+                message,
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
             )
             return
 
         filename = _safe_zip_filename(post)
-        file = discord.File(buffer, filename=filename)
-        await interaction.followup.send(
-            _news_ui_text(language, "zip_ready").format(count=count),
-            file=file,
-            ephemeral=True,
+        total_parts = len(buffers)
+        message = (
+            _news_ui_text(language, "zip_ready_split").format(
+                count=count,
+                parts=total_parts,
+            )
+            if total_parts > 1
+            else _news_ui_text(language, "zip_ready").format(count=count)
         )
+        if skipped:
+            message = (
+                f"{message}\n"
+                f"{_news_ui_text(language, 'zip_oversized_skipped').format(skipped=skipped)}"
+            )
+
+        try:
+            for index, buffer in enumerate(buffers, start=1):
+                buffer.seek(0)
+                part_filename = self._zip_part_filename(filename, index, total_parts)
+                content = message if index == 1 else f"{index}/{total_parts}"
+                await interaction.followup.send(
+                    content,
+                    file=discord.File(buffer, filename=part_filename),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005:
+                LOGGER.warning(
+                    "게시물 %s의 이미지 ZIP 업로드가 Discord 한도를 초과했습니다 "
+                    "(parts=%s, limit=%s).",
+                    post_id,
+                    total_parts,
+                    upload_limit,
+                )
+                await interaction.followup.send(
+                    _news_ui_text(language, "zip_upload_too_large"),
+                    ephemeral=True,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                return
+            LOGGER.exception("게시물 %s의 이미지 ZIP 업로드 실패.", post_id)
+            await interaction.followup.send(
+                _news_ui_text(language, "zip_fetch_failed"),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
 
     async def handle_brighten_spoiler_request(
         self,
@@ -4157,33 +3114,90 @@ class NewsCog(commands.Cog):
 
         return None
 
-    async def _build_image_zip(self, post: NewsPost) -> tuple[io.BytesIO | None, int]:
-        buffer = io.BytesIO()
-        count = 0
+    def _zip_upload_limit_bytes(self, interaction: discord.Interaction) -> int:
+        guild = getattr(interaction, "guild", None)
+        guild_limit = getattr(guild, "filesize_limit", None)
+        if not isinstance(guild_limit, int) or guild_limit <= 0:
+            return ZIP_UPLOAD_SAFE_BYTES
+        return max(
+            1024 * 1024,
+            min(ZIP_UPLOAD_SAFE_BYTES, guild_limit - ZIP_UPLOAD_HEADROOM_BYTES),
+        )
+
+    @staticmethod
+    def _zip_part_filename(filename: str, index: int, total_parts: int) -> str:
+        if total_parts <= 1:
+            return filename
+        stem = filename[:-4] if filename.lower().endswith(".zip") else filename
+        return f"{stem}_part{index:02d}-of-{total_parts:02d}.zip"
+
+    async def _build_image_zip_parts(
+        self,
+        post: NewsPost,
+        *,
+        max_part_bytes: int,
+    ) -> tuple[list[io.BytesIO], int, int]:
         used_names: set[str] = set()
         urls = _downloadable_image_urls(post)
         semaphore = asyncio.Semaphore(ZIP_IMAGE_CONCURRENCY)
 
         tasks = [
-            asyncio.create_task(self._prepare_zip_image(semaphore, index, url))
+            asyncio.create_task(
+                self._prepare_zip_image(semaphore, index, url, convert_png=False)
+            )
             for index, url in enumerate(urls)
         ]
         images = await asyncio.gather(*tasks)
 
+        zip_items: list[tuple[str, bytes]] = []
+        for item in images:
+            if item is None:
+                continue
+            index, url, content_type, image_bytes = item
+            name = _unique_zip_name(used_names, index, url, content_type, native=True)
+            zip_items.append((name, image_bytes))
+
+        buffers: list[io.BytesIO] = []
+        current_items: list[tuple[str, bytes]] = []
+        current_buffer: io.BytesIO | None = None
+        count = 0
+        skipped = 0
+
+        for item in zip_items:
+            candidate_items = [*current_items, item]
+            candidate_buffer = self._zip_buffer_for_items(candidate_items)
+            if candidate_buffer.getbuffer().nbytes <= max_part_bytes:
+                current_items = candidate_items
+                current_buffer = candidate_buffer
+                continue
+
+            if current_buffer is not None:
+                buffers.append(current_buffer)
+                count += len(current_items)
+
+            single_buffer = self._zip_buffer_for_items([item])
+            if single_buffer.getbuffer().nbytes <= max_part_bytes:
+                current_items = [item]
+                current_buffer = single_buffer
+            else:
+                current_items = []
+                current_buffer = None
+                skipped += 1
+
+        if current_buffer is not None:
+            buffers.append(current_buffer)
+            count += len(current_items)
+
+        return buffers, count, skipped
+
+    @staticmethod
+    def _zip_buffer_for_items(items: list[tuple[str, bytes]]) -> io.BytesIO:
+        buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as archive:
-            for item in images:
-                if item is None:
-                    continue
-                index, url, content_type, image_bytes = item
-                name = _unique_zip_name(used_names, index, url, content_type)
+            for name, image_bytes in items:
                 archive.writestr(name, image_bytes)
-                count += 1
-
-        if count == 0:
-            return None, 0
-
         buffer.seek(0)
-        return buffer, count
+        return buffer
 
     async def _prepare_zip_image(
         self, semaphore: asyncio.Semaphore, index: int, url: str, *, convert_png: bool = True
@@ -4200,11 +3214,12 @@ class NewsCog(commands.Cog):
 
             data, content_type = downloaded
             if convert_png:
-                data, content_type = await asyncio.to_thread(
-                    _image_bytes_as_png,
-                    data,
-                    content_type,
-                )
+                async with self._image_process_semaphore:
+                    data, content_type = await asyncio.to_thread(
+                        _image_bytes_as_png,
+                        data,
+                        content_type,
+                    )
                 if content_type != "image/png":
                     return None
             return index, download_urls[0], content_type, data
@@ -4549,11 +3564,17 @@ class NewsCog(commands.Cog):
         urls: list[str] = []
         seen_urls: set[str] = set()
         for post in posts[: IMAGE_CACHE_WARM_POST_LIMIT * len(SYNC_LANGUAGES)]:
-            for url in _content_image_urls(post):
-                if url in seen_urls or url in self._image_cache:
-                    continue
-                seen_urls.add(url)
-                urls.append(url)
+            for url in _downloadable_image_urls(post):
+                for candidate in _original_image_download_candidates(url):
+                    if (
+                        candidate in seen_urls
+                        or candidate in self._image_cache
+                        or candidate in self._image_download_tasks
+                        or candidate in self._failed_image_urls
+                    ):
+                        continue
+                    seen_urls.add(candidate)
+                    urls.append(candidate)
 
         if not urls:
             return
@@ -4580,6 +3601,26 @@ class NewsCog(commands.Cog):
         return [files for files in await asyncio.gather(*batch_tasks) if files]
 
     async def _download_image(self, url: str) -> tuple[bytes, str | None] | None:
+        cached = self._image_cache.get(url)
+        if cached is not None:
+            self._image_cache[url] = self._image_cache.pop(url)
+            return cached
+        if url in self._failed_image_urls:
+            self._failed_image_urls[url] = self._failed_image_urls.pop(url)
+            return None
+
+        task = self._image_download_tasks.get(url)
+        if task is None:
+            task = asyncio.create_task(self._fetch_image(url))
+            self._image_download_tasks[url] = task
+
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                self._image_download_tasks.pop(url, None)
+
+    async def _fetch_image(self, url: str) -> tuple[bytes, str | None] | None:
         cached = self._image_cache.get(url)
         if cached is not None:
             self._image_cache[url] = self._image_cache.pop(url)
@@ -4742,8 +3783,15 @@ class NewsCog(commands.Cog):
             self._brighten_cache.pop(oldest_url, None)
             self._brighten_cache_bytes -= len(oldest_data)
 
-    def _cache_zip(self, post_id: str, zip_bytes: bytes, count: int) -> None:
-        self._zip_cache[post_id] = (zip_bytes, count)
+    def _cache_zip(
+        self,
+        post_id: str,
+        zip_part_bytes: list[bytes],
+        count: int,
+        skipped: int,
+        upload_limit: int,
+    ) -> None:
+        self._zip_cache[post_id] = (zip_part_bytes, count, skipped, upload_limit)
         while len(self._zip_cache) > ZIP_CACHE_MAX_ITEMS:
             oldest_post_id = next(iter(self._zip_cache))
             self._zip_cache.pop(oldest_post_id, None)
@@ -5022,13 +4070,28 @@ class NewsCog(commands.Cog):
             )
             return 0
 
-        await self._refresh_steam_cache_for_twitter_links(posts)
-        steam_posts_by_twitter_id = self._steam_posts_by_twitter_post_id(posts)
+        settings_by_guild_id = {
+            target.guild_id: self.storage.get_settings(target.guild_id)
+            for target in targets
+        }
+        targets_using_steam_preference = [
+            target
+            for target in targets
+            if target.enabled
+            and settings_by_guild_id[target.guild_id].news_source_mode != NEWS_SOURCE_TWITTER
+        ]
+        if targets_using_steam_preference:
+            await self._refresh_steam_cache_for_twitter_links(posts)
+            steam_posts_by_twitter_id = self._steam_posts_by_twitter_post_id(posts)
+        else:
+            steam_posts_by_twitter_id = {}
         send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
 
         async def process_target(target: GuildTwitterTarget) -> int:
             if not target.enabled:
                 return 0
+            settings = settings_by_guild_id[target.guild_id]
+            prefer_steam_duplicates = settings.news_source_mode != NEWS_SOURCE_TWITTER
             async with send_semaphore:
                 channel = await self._resolve_twitter_target_channel(target)
                 if channel is None:
@@ -5052,7 +4115,11 @@ class NewsCog(commands.Cog):
                 announced = 0
                 image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
                 for post in new_posts:
-                    matching_steam_posts = steam_posts_by_twitter_id.get(post.post_id, [])
+                    matching_steam_posts = (
+                        steam_posts_by_twitter_id.get(post.post_id, [])
+                        if prefer_steam_duplicates
+                        else []
+                    )
                     if matching_steam_posts:
                         self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
                         LOGGER.info(
@@ -8333,2512 +7400,6 @@ class NewsCog(commands.Cog):
         )
 
 
-@dataclass(frozen=True)
-class EgoGift:
-    name: str
-    grade: str
-    keyword: str
-    category: str
-    related: str
-    first_seen: str
-    upgradeable: str
-    sale_price: str
-    purchasable: str
-    synthesis: str
-    hard_only: str
-    extreme_only: str
-    theme_pack_only: str
-    recipe: str
-    effect: str
-    image_url: str
-
-
-def _normalize_search_text(value: str) -> str:
-    return re.sub(r"\s+", "", value).casefold()
-
-
-@lru_cache(maxsize=1)
-def _load_ego_gifts() -> tuple[EgoGift, ...]:
-    path = _resource_path(EGO_GIFT_CSV_PATH)
-    if not path.exists():
-        LOGGER.warning("에고 기프트 CSV 파일을 찾지 못했습니다: %s", path)
-        return ()
-
-    gifts: list[EgoGift] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            name, grade = _split_ego_gift_name_and_grade(
-                (row.get("이름") or "").strip(),
-                (row.get("등급") or "").strip(),
-            )
-            if not name:
-                continue
-            gifts.append(
-                EgoGift(
-                    name=name,
-                    grade=grade,
-                    keyword=(row.get("키워드") or "").strip(),
-                    category=(row.get("카테고리") or "").strip(),
-                    related=(row.get("연관") or "").strip(),
-                    first_seen=(row.get("첫_등장") or "").strip(),
-                    upgradeable=(row.get("강화_가능") or "").strip(),
-                    sale_price=(row.get("판매_가격") or "").strip(),
-                    purchasable=(row.get("구매_가능") or "").strip(),
-                    synthesis=(row.get("합성_기프트") or "").strip(),
-                    hard_only=(row.get("하드_한정") or "").strip(),
-                    extreme_only=(row.get("익스트림_한정") or "").strip(),
-                    theme_pack_only=(row.get("테마팩_한정") or "").strip(),
-                    recipe=(row.get("조합식") or "").strip(),
-                    effect=(row.get("효과") or "").strip(),
-                    image_url=(row.get("이미지_URL") or "").strip(),
-                )
-            )
-    return tuple(sorted(gifts, key=_ego_gift_sort_key))
-
-
-def _find_ego_gifts(query: str) -> list[EgoGift]:
-    return _filter_ego_gifts(query)
-
-
-def _split_ego_gift_name_and_grade(name: str, grade: str) -> tuple[str, str]:
-    if grade:
-        return name, grade
-
-    match = re.match(r"^EX\s+(.+)$", name, flags=re.IGNORECASE)
-    if match is None:
-        return name, grade
-    return match.group(1).strip(), "EX"
-
-
-def _ego_gift_sort_key(gift: EgoGift) -> tuple[int, str, str]:
-    return _ego_gift_grade_value(gift.grade), _ego_gift_keyword(gift), gift.name
-
-
-def _ego_gift_keyword(gift: EgoGift) -> str:
-    if gift.grade.strip().upper() == "EX":
-        return "EX"
-    return gift.keyword
-
-
-def _ego_gift_grade_value(grade: str) -> int:
-    normalized = grade.strip().upper()
-    roman_grades = {
-        "Ⅰ": 1,
-        "I": 1,
-        "Ⅱ": 2,
-        "II": 2,
-        "Ⅲ": 3,
-        "III": 3,
-        "Ⅳ": 4,
-        "IV": 4,
-        "Ⅴ": 5,
-        "V": 5,
-        "EX": 6,
-    }
-    if normalized in roman_grades:
-        return roman_grades[normalized]
-    try:
-        return int(normalized)
-    except ValueError:
-        return 999
-
-
-def _filter_ego_gifts(query: str, *, keyword: str | None = None) -> list[EgoGift]:
-    normalized_query = _normalize_search_text(query)
-    gifts = [
-        gift
-        for gift in _load_ego_gifts()
-        if keyword is None or _ego_gift_keyword(gift) == keyword
-    ]
-    if not normalized_query:
-        return gifts
-
-    grade_matches = [
-        gift
-        for gift in gifts
-        if _normalize_search_text(gift.grade) == normalized_query
-    ]
-    if grade_matches:
-        return grade_matches
-
-    exact = [
-        gift
-        for gift in gifts
-        if normalized_query in _ego_gift_search_values(gift)
-    ]
-    if exact:
-        return exact
-
-    startswith = [
-        gift
-        for gift in gifts
-        if any(value.startswith(normalized_query) for value in _ego_gift_search_values(gift))
-    ]
-    contains = [
-        gift
-        for gift in gifts
-        if any(normalized_query in value for value in _ego_gift_search_values(gift))
-        and gift not in startswith
-    ]
-    return [*startswith, *contains]
-
-
-def _ego_gift_search_values(gift: EgoGift) -> tuple[str, ...]:
-    name = _normalize_search_text(gift.name)
-    grade_and_name = _normalize_search_text(f"{gift.grade} {gift.name}")
-    return name, grade_and_name
-
-
-@lru_cache(maxsize=1)
-def _ego_gift_keyword_counts() -> tuple[tuple[str, int], ...]:
-    counts: dict[str, int] = {}
-    for gift in _load_ego_gifts():
-        keyword = _ego_gift_keyword(gift)
-        if not keyword:
-            continue
-        counts[keyword] = counts.get(keyword, 0) + 1
-    return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
-
-
-def _ego_gift_component_markdown(gift: EgoGift, *, status_text: str) -> str:
-    detail_lines = [
-        ("등급", _ego_gift_grade_label(gift.grade), False),
-        ("강화 여부", gift.upgradeable, False),
-        ("판매 가격", gift.sale_price, False),
-        ("구매 가능", _format_ego_gift_flag(gift.purchasable), False),
-        ("합성 기프트", _format_ego_gift_flag(gift.synthesis), False),
-        ("하드 한정", _format_ego_gift_flag(gift.hard_only), False),
-        ("익스트림 한정", _format_ego_gift_flag(gift.extreme_only), True),
-        ("테마팩 한정", gift.theme_pack_only, True),
-    ]
-    if gift.recipe:
-        detail_lines.append(("조합식", gift.recipe, True))
-
-    quoted_details = "\n".join(
-        f"> {'-# ' if muted else ''}{label}: **{value or '-'}**"
-        for label, value, muted in detail_lines
-    )
-    return (
-        f"## **{gift.name}**\n"
-        f"-# 분류: **{_ego_gift_keyword(gift) or '-'}**\n\n"
-        "## **기프트 상세 정보**\n"
-        f"{quoted_details}\n\n"
-        "## **효과**\n"
-        f"{_format_ego_gift_effect_markdown(gift.effect)}\n\n"
-        f"-# {status_text}"
-    )
-
-
-def _format_ego_gift_flag(value: str) -> str:
-    return value.strip() or "-"
-
-
-def _ego_gift_grade_label(grade: str) -> str:
-    value = grade.strip()
-    if value.upper() == "EX":
-        return "EX"
-    return f"{value}등급" if value else "-"
-
-
-def _format_ego_gift_effect_markdown(effect: str) -> str:
-    normalized_effect = effect.replace("\r\n", "\n").replace("\r", "\n")
-    if "|" in normalized_effect:
-        raw_parts = normalized_effect.split("|")
-    else:
-        raw_parts = normalized_effect.split("\n")
-    parts = [part.strip() for part in raw_parts if part.strip()]
-    if not parts:
-        return "-"
-
-    heading_labels = {
-        "기본 효과": "기본 효과",
-        "+": "+ (1강)",
-        "++": "++ (2강)",
-    }
-    lines: list[str] = []
-    for part in parts:
-        heading = heading_labels.get(part)
-        if heading is not None:
-            lines.append(f"### **• {heading}**")
-        else:
-            lines.append(part)
-    return "\n".join(lines)
-
-
-def _filter_image_urls(urls: list[str]) -> list[str]:
-    return [
-        url
-        for url in urls
-        if url and YOUTUBE_PLACEHOLDER_IMAGE_FRAGMENT not in url
-    ]
-
-
-def _normalize_image_url(url: str) -> str:
-    value = url.strip()
-    if value.startswith("//"):
-        return f"https:{value}"
-    return value
-
-
-def _image_request_headers(url: str) -> dict[str, str]:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/125.0 Safari/537.36 LimpiBot/1.0"
-        )
-    }
-    hostname = urlparse(url).hostname or ""
-    if hostname.endswith("namu.wiki"):
-        headers["Referer"] = "https://namu.wiki/"
-    return headers
-
-
-def _is_namu_wiki_image_url(url: str) -> bool:
-    hostname = (urlparse(url).hostname or "").casefold()
-    return hostname == "namu.wiki" or hostname.endswith(".namu.wiki")
-
-
-def _resource_path(relative_path: Path) -> Path:
-    base_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
-    return base_path / relative_path
-
-
-def _banner_files() -> list[Path]:
-    directory = _resource_path(NEWS_BANNER_DIR)
-    if not directory.exists():
-        return []
-    return sorted(
-        (
-            path
-            for path in directory.iterdir()
-            if (
-                path.is_file()
-                and path.suffix.lower() in NEWS_BANNER_EXTENSIONS
-                and "배너" in path.stem
-            )
-        ),
-        key=lambda path: path.stem.casefold(),
-    )
-
-
-def _resolve_banner_filename(value: str | None) -> str | None:
-    if value is None:
-        return None
-    selected = value.strip()
-    if not selected:
-        return None
-    if selected.casefold() in {
-        DISABLED_NOTIFICATION_BANNER.casefold(),
-        NEWS_BANNER_DISABLED_LABEL.casefold(),
-        "없음",
-        "off",
-        "disable",
-        "disabled",
-    }:
-        return DISABLED_NOTIFICATION_BANNER
-    for path in _banner_files():
-        if selected.casefold() in {path.name.casefold(), path.stem.casefold()}:
-            return path.name
-    return None
-
-
-def _banner_display_name(filename: str | None) -> str:
-    resolved = _resolve_banner_filename(filename or DEFAULT_NOTIFICATION_BANNER)
-    if resolved == DISABLED_NOTIFICATION_BANNER:
-        return NEWS_BANNER_DISABLED_LABEL
-    if resolved is None:
-        return "없음"
-    return Path(resolved).stem
-
-
-def _banner_autocomplete_choices(current: str) -> list[app_commands.Choice[str]]:
-    query = current.strip().casefold()
-    choices: list[app_commands.Choice[str]] = []
-    disabled_aliases = (
-        NEWS_BANNER_DISABLED_LABEL.casefold(),
-        DISABLED_NOTIFICATION_BANNER.casefold(),
-        "없음",
-    )
-    if not query or any(query in alias for alias in disabled_aliases):
-        choices.append(
-            app_commands.Choice(
-                name=NEWS_BANNER_DISABLED_LABEL,
-                value=DISABLED_NOTIFICATION_BANNER,
-            )
-        )
-    for path in _banner_files():
-        if query and query not in path.stem.casefold() and query not in path.name.casefold():
-            continue
-        choices.append(app_commands.Choice(name=path.stem[:100], value=path.name[:100]))
-        if len(choices) >= 25:
-            break
-    return choices
-
-
-def _news_banner_file(filename: str | None) -> discord.File | None:
-    resolved = _resolve_banner_filename(filename or DEFAULT_NOTIFICATION_BANNER)
-    if resolved == DISABLED_NOTIFICATION_BANNER:
-        return None
-    if resolved is None:
-        return None
-    path = _resource_path(NEWS_BANNER_DIR / resolved)
-    if not path.exists():
-        return None
-    return discord.File(path, filename=NEWS_BANNER_ATTACHMENT_NAME)
-
-
-def _content_image_urls(post: NewsPost) -> list[str]:
-    thumbnail_url = _thumbnail_url_for_post(post)
-    return [
-        url
-        for url in _filter_image_urls(post.image_urls)
-        if not thumbnail_url or url != thumbnail_url
-    ]
-
-
-def _downloadable_image_urls(post: NewsPost) -> list[str]:
-    if _is_twitter_news_post(post):
-        return _filter_image_urls(post.image_urls)
-    return _content_image_urls(post)
-
-
-def _brightenable_image_urls(post: NewsPost) -> list[str]:
-    if not _is_twitter_news_post(post):
-        return []
-    return _filter_image_urls(post.image_urls)
-
-
-def _thumbnail_url_for_post(post: NewsPost) -> str | None:
-    raw_thumbnail = post.raw.get("thumbnail_url")
-    if isinstance(raw_thumbnail, str) and raw_thumbnail:
-        return raw_thumbnail
-
-    image_urls = _filter_image_urls(post.image_urls)
-    if _is_twitter_news_post(post) and len(image_urls) == 1:
-        return image_urls[0]
-
-    for url in image_urls:
-        if _is_steam_card_thumbnail_url(url):
-            return url
-    return None
-
-
-def _is_steam_card_thumbnail_url(url: str) -> bool:
-    parsed = urlparse(url)
-    if parsed.netloc not in {"clan.fastly.steamstatic.com", "cdn.fastly.steamstatic.com"}:
-        return False
-    if any(fragment in url for fragment in LEGACY_STEAM_CARD_THUMBNAIL_FRAGMENTS):
-        return True
-    return bool(re.search(r"_(?:400x225|600x338)\.[A-Za-z0-9]+$", parsed.path))
-
-
-def _standalone_image_urls(post: NewsPost, *, attach_images: bool) -> list[str]:
-    urls = _content_image_urls(post)
-    if not attach_images or not urls:
-        return []
-    return list(urls)
-
-
-def _image_embed_batches_from_urls(
-    image_urls: list[str], post: NewsPost
-) -> list[list[discord.Embed]]:
-    embeds: list[discord.Embed] = []
-    for image_url in image_urls:
-        embed = discord.Embed(url=post.url, color=_post_embed_color(post))
-        embed.set_image(url=image_url)
-        embeds.append(embed)
-
-    return [
-        embeds[index : index + IMAGE_ONLY_EMBEDS_PER_MESSAGE]
-        for index in range(0, len(embeds), IMAGE_ONLY_EMBEDS_PER_MESSAGE)
-    ]
-
-
-def _split_message_content(text: str, limit: int) -> list[str]:
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines():
-        candidate = f"{current}\n{line}" if current else line
-        if len(candidate) <= limit:
-            current = candidate
-            continue
-
-        if current:
-            chunks.append(current)
-            current = ""
-
-        while len(line) > limit:
-            chunks.append(line[:limit])
-            line = line[limit:]
-        current = line
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-def _description_for_post(post: NewsPost) -> str:
-    body_text, tag_block = _display_body_and_trailing_tags(post)
-    chunks = _split_message_content(
-        body_text,
-        EMBED_DESCRIPTION_LIMIT,
-    )
-    description = chunks[0] if chunks else post.url
-    is_twitter = _is_twitter_news_post(post)
-    date_block = (
-        f"**작성일**\n{_format_kst(post.created_at)}\n\n"
-        if post.created_at and not is_twitter
-        else ""
-    )
-    if date_block and len(date_block) + len(description) <= EMBED_DESCRIPTION_LIMIT:
-        description = f"{date_block}{description}"
-    if is_twitter and tag_block:
-        tag_block = f"{tag_block}\n\n"
-        if len(tag_block) + len(description) <= EMBED_DESCRIPTION_LIMIT:
-            description = f"{tag_block}{description}"
-    source_block = "" if is_twitter else f"\n\n**출처**\n{_post_source_label(post)}"
-    if len(description) + len(source_block) <= EMBED_DESCRIPTION_LIMIT:
-        description = f"{description}{source_block}"
-    return description
-
-
-def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
-    fallback = discord.Embed(
-        title=_display_title_for_post(post)[:256],
-        description=_description_for_post(post),
-        url=post.url,
-        color=_post_embed_color(post),
-    )
-    if _is_twitter_news_post(post):
-        footer = "출처: X(트위터)"
-        if post.created_at is not None:
-            footer = f"{footer} · 작성일: {_format_kst(post.created_at)}"
-        fallback.set_footer(text=footer)
-    return [[fallback]]
-
-
-def _embeds_for_post(post: NewsPost) -> list[discord.Embed]:
-    groups = _embed_groups_for_post(post)
-    return groups[0] if groups else []
-
-def _twitter_video_urls(post: TwitterPost) -> list[str]:
-    value = post.raw.get("video_urls")
-    return [str(u) for u in value] if isinstance(value, list) else []
-
-
-def _twitter_video_url_groups(post: TwitterPost) -> list[list[str]]:
-    groups = _twitter_video_url_groups_from_raw(post.raw)
-    if groups:
-        return groups
-    return [[url] for url in _twitter_video_urls(post)]
-
-
-def _twitter_video_url_groups_from_raw(raw: dict[str, object]) -> list[list[str]]:
-    value = raw.get("video_variant_groups")
-    if isinstance(value, list):
-        groups = [
-            [str(url) for url in group if url]
-            for group in value
-            if isinstance(group, list)
-        ]
-        groups = [group for group in groups if group]
-        if groups:
-            return groups
-    value = raw.get("video_urls")
-    urls = [str(u) for u in value] if isinstance(value, list) else []
-    return [[url] for url in urls]
-
-
-def _twitter_video_fallback_url(post: TwitterPost) -> str | None:
-    return _twitter_video_fallback_url_from_raw(post.raw)
-
-
-def _twitter_video_fallback_url_from_raw(raw: dict[str, object]) -> str | None:
-    value = raw.get("video_fallback_url")
-    return str(value) if value else None
-
-
-def _select_twitter_video_url(urls: list[str]) -> str | None:
-    if not urls:
-        return None
-    parsed = [(_twitter_video_resolution(url), url) for url in urls]
-    for resolution, url in parsed:
-        if resolution == (1920, 1080):
-            return url
-    with_resolution = [(resolution, url) for resolution, url in parsed if resolution is not None]
-    if with_resolution:
-        below_1080 = [
-            (resolution, url)
-            for resolution, url in with_resolution
-            if resolution[1] <= 1080
-        ]
-        candidates = below_1080 or with_resolution
-        return max(candidates, key=lambda item: item[0][0] * item[0][1])[1]
-    return urls[0]
-
-
-def _twitter_video_resolution(url: str) -> tuple[int, int] | None:
-    match = re.search(r"/(\d{3,4})x(\d{3,4})/", url)
-    if not match:
-        return None
-    return int(match.group(1)), int(match.group(2))
-
-
-def _is_payload_too_large(exc: discord.HTTPException) -> bool:
-    code = getattr(exc, "code", None)
-    status = getattr(exc, "status", None)
-    return code == 40005 or status == 413
-
-
-def _twitter_image_urls(post: TwitterPost) -> list[str]:
-    return [
-        url
-        for url in post.image_urls
-        if not _is_twitter_video_thumbnail_url(url)
-    ]
-
-
-def _twitter_original_image_url(url: str) -> str:
-    parsed = urlparse(url)
-    if not (parsed.hostname or "").endswith("twimg.com"):
-        return url
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    query["name"] = ["orig"]
-    return parsed._replace(
-        query="&".join(
-            f"{quote(key)}={quote(value)}"
-            for key, values in query.items()
-            for value in values
-        )
-    ).geturl()
-
-
-def _steam_original_image_url(url: str) -> str:
-    parsed = urlparse(url)
-    hostname = parsed.hostname or ""
-    if hostname not in {
-        "clan.fastly.steamstatic.com",
-        "cdn.fastly.steamstatic.com",
-        "steamcdn-a.akamaihd.net",
-    }:
-        return url
-
-    path = re.sub(
-        r"_(?:\d{2,5})x(?:\d{2,5})(?=\.[A-Za-z0-9]+$)",
-        "",
-        parsed.path,
-    )
-    query = parse_qs(parsed.query, keep_blank_values=True)
-    for key in ("imw", "imh", "impolicy", "letterbox", "crop"):
-        query.pop(key, None)
-    return parsed._replace(
-        path=path,
-        query="&".join(
-            f"{quote(key)}={quote(value)}"
-            for key, values in query.items()
-            for value in values
-        ),
-    ).geturl()
-
-
-def _original_image_download_candidates(url: str) -> list[str]:
-    if (urlparse(url).hostname or "").endswith("twimg.com"):
-        original = _twitter_original_image_url(url)
-    else:
-        original = _steam_original_image_url(url)
-    return list(dict.fromkeys([original, url]))
-
-
-def _is_twitter_video_thumbnail_url(url: str) -> bool:
-    lowered = url.lower()
-    return any(
-        fragment in lowered
-        for fragment in (
-            "/ext_tw_video_thumb/",
-            "/amplify_video_thumb/",
-            "/tweet_video_thumb/",
-        )
-    )
-
-
-def _twitter_youtube_urls(post: TwitterPost) -> list[str]:
-    value = post.raw.get("youtube_urls")
-    return [str(u) for u in value] if isinstance(value, list) else []
-
-
-def _twitter_link_urls(post: TwitterPost) -> list[str]:
-    value = post.raw.get("link_urls")
-    urls = [str(u) for u in value] if isinstance(value, list) else []
-    urls = [url for url in urls if not _is_steam_news_url(url)]
-    if not urls:
-        urls = _twitter_youtube_urls(post)
-    return list(dict.fromkeys(urls))
-
-
-def _twitter_post_needs_refresh(post: TwitterPost) -> bool:
-    if _looks_truncated_post_text(post.text) or _looks_truncated_post_text(post.title):
-        return True
-    if re.match(r"^RT @[^:\s]+:", post.text or "") and not post.raw.get("retweeted_tweet_id"):
-        return True
-    return False
-
-
-def _looks_truncated_post_text(text: str) -> bool:
-    cleaned = (text or "").rstrip()
-    return cleaned.endswith("+...") or cleaned.endswith("…") or cleaned.endswith("...")
-
-
-def _is_steam_news_url(url: str) -> bool:
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    if host != "store.steampowered.com":
-        return False
-    return parsed.path.lower().startswith("/news/app/")
-
-
-def _steam_news_url_key(url: str) -> str | None:
-    if not _is_steam_news_url(url):
-        return None
-    post_id = _steam_news_post_id_from_url(url)
-    if post_id is not None:
-        return f"steam-news:{post_id}"
-    return urlparse(url).path.lower().rstrip("/")
-
-
-def _embed_for_twitter_post(
-    post: TwitterPost,
-    *,
-    image_url: str | None = None,
-) -> discord.Embed:
-    description, tag_block = _split_trailing_hashtag_block((post.text or post.url).strip())
-    description = _strip_twitter_post_context_prefix(post, description)
-    context_line = _twitter_post_context_line(post)
-    if context_line:
-        description = f"{context_line}\n\n{description or post.url}"
-    description = _link_twitter_hashtags(description)
-    tag_block = _link_twitter_hashtags(tag_block)
-    meta_lines: list[str] = []
-    if post.created_at is not None:
-        meta_lines.append(f"**작성일**\n{_format_kst(post.created_at)}")
-    if tag_block:
-        meta_lines.append(tag_block)
-    if meta_lines:
-        meta_block = "\n".join(meta_lines)
-        description = f"{meta_block}\n\n{description or post.url}"
-    embed = discord.Embed(
-        title=_display_title_for_twitter_post(post)[:256],
-        description=_truncate_component_text(description or post.url, EMBED_DESCRIPTION_LIMIT),
-        url=post.url,
-        color=discord.Color.from_rgb(29, 155, 240),
-    )
-    if post.created_at is not None:
-        embed.timestamp = post.created_at
-        embed.set_footer(text="출처: X(트위터)")
-    else:
-        embed.set_footer(text="출처: X(트위터)")
-    embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
-    if image_url:
-        embed.set_image(url=image_url)
-    embed.add_field(name="원문", value=f"[X에서 보기]({post.url})", inline=False)
-    return embed
-
-
-def _embeds_for_twitter_post(
-    post: TwitterPost,
-    *,
-    image_urls: list[str],
-) -> list[discord.Embed]:
-    inline_image_urls = image_urls[:MAX_TWITTER_EMBED_IMAGES]
-    embeds = [
-        _embed_for_twitter_post(
-            post,
-            image_url=inline_image_urls[0] if inline_image_urls else None,
-        )
-    ]
-    for image_url in inline_image_urls[1:]:
-        embed = discord.Embed(url=post.url, color=discord.Color.from_rgb(29, 155, 240))
-        embed.set_image(url=image_url)
-        embeds.append(embed)
-    return embeds
-
-
-def _display_title_for_twitter_post(post: TwitterPost) -> str:
-    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        return f"RT @{retweeted_username}"
-    match = re.match(r"^RT @([^:\s]+):", post.title or post.text or "")
-    if match:
-        return f"RT @{match.group(1)}"
-    return post.title.strip() or post.post_id
-
-
-def _twitter_post_context_line(post: TwitterPost) -> str:
-    language = str(post.raw.get("language") or "koreana")
-    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        return _news_ui_text(language, "retweet_context").format(username=retweeted_username)
-    reply_username = str(post.raw.get("in_reply_to_screen_name") or "").strip()
-    if reply_username:
-        return _news_ui_text(language, "reply_context").format(username=reply_username)
-    return ""
-
-
-def _strip_twitter_post_context_prefix(post: TwitterPost, text: str) -> str:
-    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        pattern = rf"^\s*RT @{re.escape(retweeted_username)}:\s*"
-        return re.sub(pattern, "", text, count=1).strip()
-    return text
-
-
-def _embed_for_chzzk_live(live: ChzzkLive) -> discord.Embed:
-    embed = discord.Embed(
-        title=live.title[:256],
-        description=(
-            f"{live.channel_name} 방송이 시작되었습니다.\n"
-            "유튜브에서도 볼수 있어요!"
-        ),
-        url=PROJECT_MOON_CHZZK_LIVE_URL,
-        color=discord.Color.from_rgb(0, 232, 149),
-    )
-    if live.category:
-        embed.add_field(name="카테고리", value=live.category[:1024], inline=True)
-    if live.image_url:
-        embed.set_image(url=live.image_url)
-    if live.open_date is not None:
-        embed.timestamp = live.open_date.replace(tzinfo=KST)
-        embed.set_footer(text=f"출처: CHZZK · 시작: {_format_kst(embed.timestamp)}")
-    else:
-        embed.set_footer(text="출처: CHZZK")
-    embed.set_author(
-        name=live.channel_name,
-        url=PROJECT_MOON_CHZZK_LIVE_URL,
-        icon_url=live.channel_image_url,
-    )
-    return embed
-
-
-def _embed_for_chzzk_live_end() -> discord.Embed:
-    embed = discord.Embed(
-        title="ProjectMoon Official 방송이 종료되었습니다.",
-        description="치지직 라이브가 종료되었습니다.\n다음 방송이 시작되면 다시 알려드릴게요.",
-        url=PROJECT_MOON_CHZZK_LIVE_URL,
-        color=discord.Color.dark_gray(),
-    )
-    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_CHZZK_LIVE_URL)
-    embed.set_footer(text="출처: CHZZK")
-    return embed
-
-
-def _embed_for_chzzk_offline(previous: ChzzkBroadcast | None = None) -> discord.Embed:
-    embed = discord.Embed(
-        title="ProjectMoon Official은 현재 오프라인 상태입니다.",
-        description="현재 치지직 채널에 진행 중인 방송이 없어요.",
-        url=PROJECT_MOON_CHZZK_LIVE_URL,
-        color=discord.Color.dark_gray(),
-    )
-    if previous is not None:
-        lines = [f"[{previous.title}]({PROJECT_MOON_CHZZK_LIVE_URL})"]
-        if previous.open_date is not None:
-            lines.append(f"시작: {_format_kst(previous.open_date.replace(tzinfo=KST))}")
-        if previous.close_date is not None:
-            lines.append(f"종료: {_format_kst(previous.close_date.replace(tzinfo=KST))}")
-        embed.add_field(
-            name="전에 하였던 방송",
-            value="\n".join(lines)[:1024],
-            inline=False,
-        )
-        if previous.image_url:
-            embed.set_image(url=previous.image_url)
-    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_CHZZK_LIVE_URL)
-    embed.set_footer(text="출처: CHZZK")
-    return embed
-
-
-def _embed_for_youtube_live(live: YoutubeLive) -> discord.Embed:
-    embed = discord.Embed(
-        title=live.title[:256],
-        description="ProjectMoon Official 유튜브 라이브가 시작되었습니다.",
-        url=live.url,
-        color=discord.Color.from_rgb(255, 0, 0),
-    )
-    if live.thumbnail_url:
-        embed.set_image(url=live.thumbnail_url)
-    if live.start_time is not None:
-        embed.timestamp = live.start_time
-        embed.set_footer(text=f"출처: YouTube · 시작: {_format_kst(live.start_time)}")
-    else:
-        embed.set_footer(text="출처: YouTube")
-    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_STREAMS_URL)
-    return embed
-
-
-def _embed_for_youtube_upload(upload: YoutubeUpload) -> discord.Embed:
-    embed = discord.Embed(
-        title=upload.title[:256],
-        description="ProjectMoon Official 유튜브 채널에 새 영상이 업로드되었습니다.",
-        url=upload.url,
-        color=discord.Color.from_rgb(255, 0, 0),
-    )
-    if upload.thumbnail_url:
-        embed.set_image(url=upload.thumbnail_url)
-    if upload.published_at is not None:
-        embed.timestamp = upload.published_at
-        embed.set_footer(text=f"출처: YouTube · 업로드: {_format_kst(upload.published_at)}")
-    else:
-        embed.set_footer(text="출처: YouTube")
-    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_VIDEOS_URL)
-    return embed
-
-
-def _embed_for_hampang_youtube_upload(upload: YoutubeUpload) -> discord.Embed:
-    embed = _embed_for_youtube_upload(upload)
-    embed.description = "ProjectMoon Official YouTube 채널에 햄햄팡팡 관련 영상이 업로드되었습니다."
-    return embed
-
-
-def _embed_for_youtube_offline(previous: YoutubeStream | None = None) -> discord.Embed:
-    embed = discord.Embed(
-        title="ProjectMoon Official 유튜브는 현재 오프라인 상태입니다.",
-        description="현재 유튜브 채널에 진행 중인 라이브가 없어요.",
-        url=PROJECT_MOON_YOUTUBE_STREAMS_URL,
-        color=discord.Color.dark_gray(),
-    )
-    if previous is not None:
-        embed.add_field(
-            name="전에 하였던 방송",
-            value=f"[{previous.title}]({previous.url})"[:1024],
-            inline=False,
-        )
-        if previous.thumbnail_url:
-            embed.set_image(url=previous.thumbnail_url)
-    embed.set_author(name="ProjectMoon Official", url=PROJECT_MOON_YOUTUBE_STREAMS_URL)
-    embed.set_footer(text="출처: YouTube")
-    return embed
-
-
-def _chzzk_live_view(
-    youtube_url: str | None = None,
-    *,
-    include_youtube: bool = True,
-) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="CHZZK 바로가기",
-            style=discord.ButtonStyle.link,
-            url=PROJECT_MOON_CHZZK_LIVE_URL,
-        )
-    )
-    if include_youtube and youtube_url:
-        view.add_item(
-            discord.ui.Button(
-                label="YouTube 바로가기",
-                style=discord.ButtonStyle.link,
-                url=youtube_url,
-            )
-        )
-    return view
-
-
-def _youtube_live_view(
-    youtube_url: str,
-    *,
-    include_chzzk: bool = False,
-) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="YouTube 바로가기",
-            style=discord.ButtonStyle.link,
-            url=youtube_url,
-        )
-    )
-    if include_chzzk:
-        view.add_item(
-            discord.ui.Button(
-                label="CHZZK 바로가기",
-                style=discord.ButtonStyle.link,
-                url=PROJECT_MOON_CHZZK_LIVE_URL,
-            )
-        )
-    return view
-
-
-def _youtube_upload_view(youtube_url: str) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="영상 보러가기",
-            style=discord.ButtonStyle.link,
-            url=youtube_url,
-        )
-    )
-    return view
-
-
-def _build_layout_view_for_post(
-    post: NewsPost,
-    *,
-    include_zip_button: bool,
-    include_banner: bool,
-    leading_text: str | None = None,
-    is_update: bool = False,
-    include_content_images: bool = True,
-) -> discord.ui.LayoutView:
-    view = discord.ui.LayoutView(timeout=None)
-    container = discord.ui.Container(accent_color=_post_embed_color(post))
-    language = _post_language(post)
-
-    if is_update:
-        container.add_item(discord.ui.TextDisplay(_news_ui_text(language, "updated")))
-    if leading_text:
-        container.add_item(discord.ui.TextDisplay(leading_text))
-
-    if include_banner:
-        banner_gallery = discord.ui.MediaGallery()
-        banner_gallery.add_item(media=f"attachment://{NEWS_BANNER_ATTACHMENT_NAME}")
-        container.add_item(banner_gallery)
-
-    update_badge = _news_ui_text(language, "updated")
-    overhead = (
-        (len(update_badge) if is_update else 0)
-        + (len(leading_text) if leading_text else 0)
-    )
-    body_limit = max(100, 4000 - overhead)
-
-    body_text, tag_block = _display_body_and_trailing_tags(post)
-    meta_block = _post_meta_block(post, tag_block=tag_block)
-    container.add_item(
-        discord.ui.TextDisplay(
-            _truncate_component_text(
-                f"## {_display_title_for_post(post).strip() or post.url}\n{meta_block}\n\n{body_text}",
-                body_limit,
-            )
-        )
-    )
-
-    thumbnail_url = _thumbnail_url_for_post(post)
-    if thumbnail_url:
-        container.add_item(discord.ui.Separator())
-        thumbnail_gallery = discord.ui.MediaGallery()
-        thumbnail_gallery.add_item(media=thumbnail_url)
-        container.add_item(thumbnail_gallery)
-
-    if include_content_images:
-        content_image_urls = _content_image_urls(post)[:MAX_INLINE_GALLERY_IMAGES]
-        if content_image_urls:
-            container.add_item(discord.ui.Separator())
-            content_gallery = discord.ui.MediaGallery()
-            for image_url in content_image_urls:
-                content_gallery.add_item(media=image_url)
-            container.add_item(content_gallery)
-
-    container.add_item(discord.ui.Separator())
-    container.add_item(discord.ui.TextDisplay(f"**출처**\n{_post_source_label(post)}"))
-
-    action_row = discord.ui.ActionRow()
-    if post.url:
-        action_row.add_item(
-            discord.ui.Button(
-                label=_news_ui_text(language, "original"),
-                style=discord.ButtonStyle.link,
-                url=post.url,
-            )
-        )
-    if include_zip_button and _downloadable_image_urls(post):
-        action_row.add_item(ZipDownloadButton(post.post_id, language=language))
-    if _brightenable_image_urls(post):
-        action_row.add_item(
-            BrightenSpoilerButton(post.post_id, image_index=0, language=language)
-        )
-    if action_row.children:
-        container.add_item(discord.ui.Separator())
-        container.add_item(action_row)
-
-    view.add_item(container)
-    return view
-
-
-def _post_embed_color(post: NewsPost) -> discord.Color:
-    if _is_twitter_news_post(post):
-        return discord.Color.from_rgb(29, 155, 240)
-    return discord.Color.from_rgb(179, 28, 28)
-
-
-def _success_embed_color() -> discord.Color:
-    return discord.Color.green()
-
-
-def _news_update_notice_embed() -> discord.Embed:
-    return discord.Embed(
-        title="소식이 수정되었습니다!",
-        description="소식 내용이 수정되었으니 다시 한번 내용을 확인해보세요!",
-        color=discord.Color.orange(),
-    )
-
-
-def _truncate_component_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    if limit <= 1:
-        return text[:limit]
-    return f"{text[: limit - 1]}…"
-
-
-def _build_view_for_post(
-    post: NewsPost,
-    *,
-    include_zip_button: bool,
-) -> discord.ui.View | None:
-    view = discord.ui.View(timeout=None)
-    language = _post_language(post)
-    if post.url:
-        view.add_item(
-            discord.ui.Button(
-                label=_news_ui_text(language, "original"),
-                style=discord.ButtonStyle.link,
-                url=post.url,
-            )
-        )
-    if include_zip_button and _downloadable_image_urls(post):
-        view.add_item(ZipDownloadButton(post.post_id, language=language))
-    if _brightenable_image_urls(post):
-        view.add_item(
-            BrightenSpoilerButton(post.post_id, image_index=0, language=language)
-        )
-    return view if view.children else None
-
-
-def _current_maintenance_notice() -> tuple[str | None, str | None]:
-    local_now = datetime.now(KST)
-    if local_now.weekday() != MAINTENANCE_WEEKDAY:
-        return None, None
-
-    if local_now.hour == MAINTENANCE_START_HOUR:
-        return "start", local_now.strftime("%Y-%m-%d:start")
-    if local_now.hour == MAINTENANCE_UPDATE_HOUR:
-        return "update", local_now.strftime("%Y-%m-%d:update")
-    return None, None
-
-
-def _maintenance_embed(
-    title: str,
-    description: str,
-    *,
-    color: discord.Color,
-) -> discord.Embed:
-    return discord.Embed(
-        title=title,
-        description=description,
-        color=color,
-        timestamp=datetime.now(timezone.utc),
-    )
-
-
-def _language_label(language: str) -> str:
-    return LANGUAGE_LABELS.get(language, language)
-
-
-def _news_ui_text(language: str, key: str) -> str:
-    language_text = (language or "koreana").strip()
-    texts = NEWS_UI_TEXT.get(language_text) or NEWS_UI_TEXT["koreana"]
-    return texts.get(key) or NEWS_UI_TEXT["koreana"][key]
-
-
-def _format_news_targets(targets: list[GuildNewsTarget]) -> str:
-    if not targets:
-        return "미설정"
-
-    lines: list[str] = []
-    for language in SYNC_LANGUAGES:
-        channels = [
-            f"<#{target.channel_id}>"
-            for target in targets
-            if target.language == language
-        ]
-        if channels:
-            lines.append(f"{_language_label(language)}: {', '.join(channels)}")
-
-    extra_languages = sorted(
-        {
-            target.language
-            for target in targets
-            if target.language not in SYNC_LANGUAGES
-        }
-    )
-    for language in extra_languages:
-        channels = [
-            f"<#{target.channel_id}>"
-            for target in targets
-            if target.language == language
-        ]
-        lines.append(f"{_language_label(language)}: {', '.join(channels)}")
-
-    return "\n".join(lines) if lines else "미설정"
-
-
-def _format_chzzk_target(target: GuildChzzkTarget | None, role_id: int | None) -> str:
-    role_text = f"<@&{role_id}>" if role_id else "없음"
-    if target is None:
-        return (
-            "상태: 미설정\n"
-            "채널: 미설정\n"
-            f"역할 핑: 시작 알림만 {role_text}\n"
-            "최근 라이브 기준선: 없음"
-        )
-
-    return (
-        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
-        f"채널: <#{target.channel_id}>\n"
-        f"역할 핑: 시작 알림만 {role_text}\n"
-        f"현재 방송 상태: {'방송중' if target.is_live else '방송 없음 / 오프라인'}\n"
-        f"최근 라이브 기준선: {target.last_live_id or '없음'}"
-    )
-
-
-def _format_youtube_target(target: GuildYoutubeTarget | None, role_id: int | None) -> str:
-    role_text = f"<@&{role_id}>" if role_id else "없음"
-    if target is None:
-        return (
-            "상태: 미설정\n"
-            "채널: 미설정\n"
-            f"역할 핑: 시작 알림만 {role_text}\n"
-            "최근 라이브 기준선: 없음"
-        )
-
-    return (
-        f"상태: {'켜짐' if target.enabled else '꺼짐'}\n"
-        f"채널: <#{target.channel_id}>\n"
-        f"역할 핑: 시작 알림만 {role_text}\n"
-        f"현재 방송 상태: {'방송중' if target.is_live else '방송 없음 / 오프라인'}\n"
-        f"최근 라이브 기준선: {target.last_live_id or '없음'}"
-    )
-
-
-def _format_youtube_upload_target(
-    target: GuildYoutubeUploadTarget | None,
-    role_id: int | None,
-) -> str:
-    role_text = f"<@&{role_id}>" if role_id else "없음"
-    if target is None:
-        return (
-            "업로드 알림 상태: 미설정\n"
-            "채널: 미설정\n"
-            f"역할 핑: {role_text}\n"
-            "최근 일반 영상 기준선: 없음"
-        )
-
-    return (
-        f"업로드 알림 상태: {'켜짐' if target.enabled else '꺼짐'}\n"
-        f"채널: <#{target.channel_id}>\n"
-        f"역할 핑: {role_text}\n"
-        f"최근 일반 영상 기준선: {target.last_video_id or '없음'}"
-    )
-
-
-def _is_hampang_youtube_upload(upload: YoutubeUpload) -> bool:
-    normalized_title = re.sub(r"[^a-z0-9]+", "", upload.title.casefold())
-    return HAMPANG_YOUTUBE_TITLE_MARKER in normalized_title
-
-
-def _regular_youtube_uploads(uploads: list[YoutubeUpload]) -> list[YoutubeUpload]:
-    return [upload for upload in uploads if not _is_hampang_youtube_upload(upload)]
-
-
-def _sort_twitter_posts_newest_first(posts: list[TwitterPost]) -> list[TwitterPost]:
-    minimum = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(
-        posts,
-        key=lambda post: _as_utc_datetime(post.created_at) or minimum,
-        reverse=True,
-    )
-
-
-def _sort_youtube_uploads_newest_first(
-    uploads: list[YoutubeUpload],
-) -> list[YoutubeUpload]:
-    minimum = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(
-        uploads,
-        key=lambda upload: _as_utc_datetime(upload.published_at) or minimum,
-        reverse=True,
-    )
-
-
-def _hampang_news_items(
-    x_posts: list[TwitterPost],
-    youtube_uploads: list[YoutubeUpload],
-    *,
-    newest_first: bool = True,
-) -> list[tuple[str, TwitterPost | YoutubeUpload]]:
-    items: list[tuple[str, TwitterPost | YoutubeUpload]] = [
-        *(("x", post) for post in x_posts),
-        *(("youtube", upload) for upload in youtube_uploads),
-    ]
-    minimum = datetime.min.replace(tzinfo=timezone.utc)
-
-    def item_time(item: tuple[str, TwitterPost | YoutubeUpload]) -> datetime:
-        source, value = item
-        moment = value.created_at if source == "x" else value.published_at
-        return _as_utc_datetime(moment) or minimum
-
-    return sorted(items, key=item_time, reverse=newest_first)
-
-
-def _hampang_news_items_for_source(
-    x_posts: list[TwitterPost],
-    youtube_uploads: list[YoutubeUpload],
-    source: str,
-) -> list[tuple[str, TwitterPost | YoutubeUpload]]:
-    selected_x_posts = x_posts if source in {HAMPANG_SOURCE_BOTH, HAMPANG_SOURCE_X} else []
-    selected_youtube_uploads = (
-        youtube_uploads
-        if source in {HAMPANG_SOURCE_BOTH, HAMPANG_SOURCE_YOUTUBE}
-        else []
-    )
-    return _hampang_news_items(selected_x_posts, selected_youtube_uploads)
-
-
-def _hampang_choice_name(
-    source: str,
-    item: TwitterPost | YoutubeUpload,
-) -> str:
-    source_label = "X" if source == HAMPANG_SOURCE_X else "YouTube"
-    title = item.title.strip() or (
-        item.post_id if isinstance(item, TwitterPost) else item.video_id
-    )
-    prefix = f"[{source_label}] "
-    max_title_length = max(1, 100 - len(prefix))
-    if len(title) <= max_title_length:
-        return f"{prefix}{title}"
-    if max_title_length <= 3:
-        return f"{prefix}{title[:max_title_length]}"
-    return f"{prefix}{title[: max_title_length - 3]}..."
-
-
-def _hampang_choice_description(
-    source: str,
-    item: TwitterPost | YoutubeUpload,
-) -> str:
-    moment = item.created_at if source == HAMPANG_SOURCE_X else item.published_at
-    if moment is None:
-        return "작성 시간을 확인할 수 없어요."
-    return _format_kst(moment)
-
-
-
-
-def _choice_bool(choice: app_commands.Choice[str] | None, default: bool | None = None) -> bool | None:
-    if choice is None:
-        return default
-    return choice.value == BOOLEAN_TRUE
-
-
-def _broadcast_source_value(choice: app_commands.Choice[str] | None) -> str:
-    return choice.value if choice is not None else BROADCAST_SOURCE_BOTH
-
-
-def _broadcast_source_allows_chzzk(value: str) -> bool:
-    return value in {BROADCAST_SOURCE_BOTH, BROADCAST_SOURCE_CHZZK}
-
-
-def _broadcast_source_allows_youtube(value: str) -> bool:
-    return value in {BROADCAST_SOURCE_BOTH, BROADCAST_SOURCE_YOUTUBE}
-
-
-def _broadcast_source_label(value: str) -> str:
-    if value == BROADCAST_SOURCE_CHZZK:
-        return "치지직"
-    if value == BROADCAST_SOURCE_YOUTUBE:
-        return "유튜브"
-    return "치지직 & 유튜브"
-
-
-def _news_target_choice_value(channel_id: int, language: str) -> str:
-    return f"{channel_id}:{language}"
-
-
-def _parse_news_target_choice(value: str) -> tuple[int, str] | None:
-    channel_id_text, separator, language = value.partition(":")
-    if not separator or not channel_id_text.isdigit() or not language:
-        return None
-    return int(channel_id_text), language
-
-
-def _broadcast_target_choice_name(
-    label: str,
-    channel_id: int,
-    enabled: bool,
-    interaction: discord.Interaction,
-) -> str:
-    channel = interaction.guild.get_channel(channel_id) if interaction.guild else None
-    channel_name = f"#{channel.name}" if isinstance(channel, discord.TextChannel) else f"채널 {channel_id}"
-    enabled_text = "켜짐" if enabled else "꺼짐"
-    return f"{label} · {channel_name} · {enabled_text}"[:100]
-
-
-def _bool_label(value: bool) -> str:
-    return "허용" if value else "비허용"
-
-
-def _image_delivery_label(value: str | None) -> str:
-    if value == IMAGE_DELIVERY_FILES:
-        return "첨부파일로 따로 전송"
-    return "임베드에 이미지 표시"
-
-
-def _youtube_links_content(post: NewsPost) -> str | None:
-    links = _youtube_urls_for_post(post)
-    raw_links = post.raw.get("link_urls")
-    if isinstance(raw_links, list):
-        links.extend(str(url) for url in raw_links if url and not _is_steam_news_url(str(url)))
-    links = list(dict.fromkeys(links))[:3]
-    return "\n".join(links) if links else None
-
-
-def _youtube_urls_for_post(post: NewsPost) -> list[str]:
-    value = post.raw.get("youtube_urls")
-    if not isinstance(value, list):
-        return []
-
-    return [str(url) for url in value if url]
-
-
-def _is_twitter_news_post(post: NewsPost) -> bool:
-    return str(post.raw.get("source_type") or "").lower() == NEWS_SOURCE_TWITTER
-
-
-def _post_source_label(post: NewsPost) -> str:
-    return "X(트위터)" if _is_twitter_news_post(post) else "Steam"
-
-
-def _display_title_for_post(post: NewsPost) -> str:
-    title = post.title.strip() or post.post_id
-    if _is_twitter_news_post(post):
-        retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-        if retweeted_username:
-            title = f"RT @{retweeted_username}"
-        else:
-            match = re.match(r"^RT @([^:\s]+):", title or post.text)
-            if match:
-                title = f"RT @{match.group(1)}"
-    return f"[{_post_source_label(post)}] {title}"
-
-
-def _display_body_and_trailing_tags(post: NewsPost) -> tuple[str, str]:
-    body = (post.text or post.url).strip()
-    if not _is_twitter_news_post(post):
-        return body, ""
-    body, tag_block = _split_trailing_hashtag_block(body)
-    body = _strip_twitter_context_prefix(post, body)
-    context_line = _twitter_context_line(post)
-    if context_line:
-        body = f"{context_line}\n\n{body or post.url}"
-    return _link_twitter_hashtags(body or post.url), _link_twitter_hashtags(tag_block)
-
-
-def _twitter_context_line(post: NewsPost) -> str:
-    language = _post_language(post) or "koreana"
-    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        return _news_ui_text(language, "retweet_context").format(username=retweeted_username)
-    reply_username = str(post.raw.get("in_reply_to_screen_name") or "").strip()
-    if reply_username:
-        return _news_ui_text(language, "reply_context").format(username=reply_username)
-    return ""
-
-
-def _strip_twitter_context_prefix(post: NewsPost, text: str) -> str:
-    retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        pattern = rf"^\s*RT @{re.escape(retweeted_username)}:\s*"
-        return re.sub(pattern, "", text, count=1).strip()
-    return text
-
-
-def _post_date_line(post: NewsPost) -> str:
-    if post.created_at is None:
-        return ""
-    return f"-# 작성일: {_format_kst(post.created_at)}"
-
-
-def _post_meta_block(post: NewsPost, *, tag_block: str = "") -> str:
-    lines = []
-    date_line = _post_date_line(post)
-    if date_line:
-        lines.append(date_line)
-    if tag_block:
-        lines.append(tag_block)
-    return "\n".join(lines)
-
-
-def _split_trailing_hashtag_block(text: str) -> tuple[str, str]:
-    lines = text.rstrip().splitlines()
-    tag_lines: list[str] = []
-    while lines:
-        line = lines[-1].strip()
-        if not line:
-            if tag_lines:
-                lines.pop()
-                continue
-            break
-        if not _is_hashtag_only_line(line):
-            break
-        tag_lines.append(line)
-        lines.pop()
-    if not tag_lines:
-        return text.strip(), ""
-    tag_lines.reverse()
-    return "\n".join(lines).strip(), "\n".join(tag_lines).strip()
-
-
-def _is_hashtag_only_line(line: str) -> bool:
-    tokens = line.split()
-    return bool(tokens) and all(re.fullmatch(r"#[^\s#]+", token) for token in tokens)
-
-
-def _link_twitter_hashtags(text: str) -> str:
-    if not text:
-        return text
-
-    def replace(match: re.Match[str]) -> str:
-        tag = match.group(1)
-        encoded = quote(tag, safe="")
-        return f"[#{tag}](https://x.com/hashtag/{encoded})"
-
-    return re.sub(r"(?<![\w/\]])#([^\s#]+)", replace, text)
-
-
-def _news_source_mode_label(mode: str | None) -> str:
-    if mode == NEWS_SOURCE_STEAM:
-        return "Steam"
-    if mode == NEWS_SOURCE_TWITTER:
-        return "X(트위터)"
-    return "둘 다"
-
-
-def _selected_source_mode(interaction: discord.Interaction) -> str:
-    source = getattr(interaction.namespace, "source", None)
-    if isinstance(source, app_commands.Choice):
-        return str(source.value)
-    if source in {NEWS_SOURCE_STEAM, NEWS_SOURCE_TWITTER}:
-        return str(source)
-    data_source = _selected_source_mode_from_options(
-        (interaction.data or {}).get("options") if isinstance(interaction.data, dict) else None
-    )
-    if data_source is not None:
-        return data_source
-    return NEWS_SOURCE_STEAM
-
-
-def _selected_source_mode_from_options(options: object) -> str | None:
-    if not isinstance(options, list):
-        return None
-    for option in options:
-        if not isinstance(option, dict):
-            continue
-        name = str(option.get("name") or "")
-        value = option.get("value")
-        if name in {"source", "소스"} and value in {NEWS_SOURCE_STEAM, NEWS_SOURCE_TWITTER}:
-            return str(value)
-        nested = _selected_source_mode_from_options(option.get("options"))
-        if nested is not None:
-            return nested
-    return None
-
-
-def _sort_posts_newest_first(posts: list[NewsPost]) -> list[NewsPost]:
-    return sorted(
-        posts,
-        key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
-        reverse=True,
-    )
-
-
-def _dedupe_posts_by_id(posts: list[NewsPost]) -> list[NewsPost]:
-    deduped: list[NewsPost] = []
-    seen: set[str] = set()
-    for post in posts:
-        if post.post_id in seen:
-            continue
-        seen.add(post.post_id)
-        deduped.append(post)
-    return deduped
-
-
-def _recent_auto_posts(posts: list[NewsPost]) -> list[NewsPost]:
-    return [post for post in posts if post.created_at is not None]
-
-
-def _is_news_update_recent(post: NewsPost) -> bool:
-    moment = _as_utc_datetime(post.created_at)
-    if moment is None:
-        return False
-    age = (datetime.now(timezone.utc) - moment).total_seconds()
-    return age <= NEWS_UPDATE_MAX_AGE_SECONDS
-
-
-def _delay_seconds(value: datetime | None) -> int | str:
-    if value is None:
-        return "unknown"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return max(0, int((datetime.now(timezone.utc) - value.astimezone(timezone.utc)).total_seconds()))
-
-
-def _post_delay_seconds(post: NewsPost) -> int | str:
-    return _delay_seconds(post.created_at)
-
-
-def _minute_in_window(minute: int, start: int, end: int) -> bool:
-    if start == end:
-        return False
-    if start < end:
-        return start <= minute < end
-    return minute >= start or minute < end
-
-
-def _format_windows_label(windows: tuple[tuple[int, int], ...]) -> str:
-    def hhmm(m: int) -> str:
-        return f"{m // 60:02d}:{m % 60:02d}"
-
-    return ", ".join(f"{hhmm(s)}-{hhmm(e)}" for s, e in windows) or "(없음)"
-
-
-def _is_twitter_post_recent(post: TwitterPost, max_age_seconds: int) -> bool:
-    if max_age_seconds <= 0:
-        return True
-    created = post.created_at
-    if created is None:
-        return False
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    age = (datetime.now(timezone.utc) - created).total_seconds()
-    return age <= max_age_seconds
-
-
-def _is_twitter_news_post_recent(post: NewsPost, max_age_seconds: int) -> bool:
-    if max_age_seconds <= 0:
-        return True
-    created = _as_utc_datetime(post.created_at)
-    if created is None:
-        return False
-    age = (datetime.now(timezone.utc) - created).total_seconds()
-    return age <= max_age_seconds
-
-
-def _twitter_post_delay_seconds(post: TwitterPost) -> int | str:
-    return _delay_seconds(post.created_at)
-
-
-def _as_utc_datetime(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
-def _matching_steam_posts_for_twitter(
-    post: TwitterPost,
-    steam_posts: list[NewsPost],
-) -> list[NewsPost]:
-    link_urls = _raw_link_urls(post.raw)
-    link_keys = _steam_news_link_keys_for_twitter(post)
-    twitter_candidates = _news_body_match_candidates(post.text)
-    matched: list[NewsPost] = []
-    seen: set[str] = set()
-    for steam_post in steam_posts:
-        if not _twitter_matches_steam_news(
-            steam_post,
-            link_urls,
-            link_keys,
-            twitter_candidates,
-        ):
-            continue
-        if steam_post.post_id in seen:
-            continue
-        seen.add(steam_post.post_id)
-        matched.append(steam_post)
-    return matched
-
-
-def _twitter_matches_steam_news(
-    steam_post: NewsPost,
-    link_urls: list[str],
-    link_keys: set[str],
-    twitter_candidates: set[str],
-) -> bool:
-    steam_key = _steam_news_url_key(steam_post.url)
-    link_matches = steam_post.url in link_urls or (
-        steam_key is not None and steam_key in link_keys
-    )
-    if steam_key is not None and steam_key in link_keys:
-        return True
-    if steam_post.url in link_urls:
-        return True
-    content_matches = _news_match_candidates_overlap(
-        twitter_candidates,
-        {
-            *_news_body_match_candidates(steam_post.title),
-            *_news_body_match_candidates(steam_post.text),
-        },
-    )
-    return link_matches and content_matches
-
-
-def _raw_link_urls(raw: dict) -> list[str]:
-    link_urls = raw.get("link_urls")
-    if not isinstance(link_urls, list):
-        return []
-    return [str(url) for url in link_urls if url]
-
-
-def _news_body_match_candidates(text: str) -> set[str]:
-    values: list[str] = []
-    line_count = 0
-    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        cleaned = line.strip()
-        lowered = cleaned.lower()
-        if (
-            not cleaned
-            or cleaned.startswith("#")
-            or lowered.startswith("http://")
-            or lowered.startswith("https://")
-        ):
-            continue
-        values.append(cleaned)
-        values.extend(
-            bracketed.strip()
-            for bracketed in re.findall(r"[\[【「『](.*?)[\]】」』]", cleaned)
-            if bracketed.strip()
-        )
-        line_count += 1
-        if line_count >= 4:
-            break
-
-    candidates: set[str] = set()
-    for value in values:
-        normalized = _normalize_news_match_text(value)
-        if len(normalized.replace(" ", "")) >= 10:
-            candidates.add(normalized)
-    return candidates
-
-
-def _normalize_news_match_text(value: str) -> str:
-    value = re.sub(r"https?://\S+", " ", value)
-    value = re.sub(r"#\S+", " ", value)
-    value = re.sub(r"[\[【「『](.*?)[\]】」』]", r" \1 ", value)
-    value = "".join(
-        character if character.isalnum() or character == "_" else " "
-        for character in value.casefold()
-    )
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def _news_match_candidates_overlap(left: set[str], right: set[str]) -> bool:
-    if not left or not right:
-        return False
-    if left & right:
-        return True
-
-    left_compact = {value.replace(" ", "") for value in left}
-    right_compact = {value.replace(" ", "") for value in right}
-    for left_value in left_compact:
-        for right_value in right_compact:
-            shorter, longer = sorted((left_value, right_value), key=len)
-            if len(shorter) >= 14 and shorter in longer:
-                return True
-    return False
-
-
-def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
-    return {
-        key
-        for key in (_steam_news_url_key(url) for url in _raw_link_urls(post.raw))
-        if key is not None
-    }
-
-
-def _steam_news_post_id_from_url(url: str) -> str | None:
-    if not _is_steam_news_url(url):
-        return None
-    parsed = urlparse(url)
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) >= 5 and parts[0].lower() == "news" and parts[1].lower() == "app":
-        if parts[3].lower() == "view" and parts[4]:
-            return parts[4]
-    emgid = parse_qs(parsed.query).get("emgid")
-    if emgid:
-        return emgid[0]
-    return None
-
-
-def _steam_news_post_ids_for_twitter_posts(posts: list[TwitterPost]) -> list[str]:
-    post_ids: list[str] = []
-    seen: set[str] = set()
-    for post in posts:
-        raw_links = post.raw.get("link_urls")
-        if not isinstance(raw_links, list):
-            continue
-        for url in raw_links:
-            post_id = _steam_news_post_id_from_url(str(url))
-            if post_id is None or post_id in seen:
-                continue
-            seen.add(post_id)
-            post_ids.append(post_id)
-    return post_ids
-
-
-def _steam_posts_without_fast_twitter_duplicates(
-    steam_posts: list[NewsPost],
-    twitter_news: list[NewsPost],
-) -> list[NewsPost]:
-    skip_ids: set[str] = set()
-    skip_keys: set[str] = set()
-    for post in twitter_news:
-        prefer_ids = _raw_string_set(post.raw.get("prefer_steam_post_ids"))
-        prefer_keys = _raw_string_set(post.raw.get("prefer_steam_post_keys"))
-        raw_ids = post.raw.get("overlap_steam_post_ids")
-        if isinstance(raw_ids, list):
-            skip_ids.update(
-                str(post_id)
-                for post_id in raw_ids
-                if post_id and str(post_id) not in prefer_ids
-            )
-        raw_keys = post.raw.get("overlap_steam_post_keys")
-        if isinstance(raw_keys, list):
-            skip_keys.update(
-                str(post_key)
-                for post_key in raw_keys
-                if post_key and str(post_key) not in prefer_keys
-            )
-    if not skip_ids and not skip_keys:
-        return steam_posts
-    return [
-        post
-        for post in steam_posts
-        if post.post_id not in skip_ids
-        and ((_post_language_independent_id(post) or "") not in skip_keys)
-    ]
-
-
-def _twitter_posts_as_news_posts(
-    posts: list[TwitterPost],
-    steam_posts: list[NewsPost],
-) -> list[NewsPost]:
-    converted: list[NewsPost] = []
-    for post in posts:
-        raw = dict(post.raw)
-        matching_steam_posts = _matching_steam_posts_for_twitter(post, steam_posts)
-        if matching_steam_posts:
-            raw["overlap_steam_post_ids"] = [
-                steam_post.post_id for steam_post in matching_steam_posts
-            ]
-            raw["overlap_steam_post_keys"] = [
-                post_key
-                for post_key in (
-                    _post_language_independent_id(steam_post)
-                    for steam_post in matching_steam_posts
-                )
-                if post_key is not None
-            ]
-            raw["prefer_steam_post_ids"] = [
-                steam_post.post_id for steam_post in matching_steam_posts
-            ]
-            raw["prefer_steam_post_keys"] = [
-                post_key
-                for post_key in (
-                    _post_language_independent_id(steam_post)
-                    for steam_post in matching_steam_posts
-                )
-                if post_key is not None
-            ]
-        raw["source_type"] = NEWS_SOURCE_TWITTER
-        raw["language"] = "koreana"
-        converted.append(
-            NewsPost(
-                post_id=f"twitter:{post.post_id}",
-                source_user=post.author_username,
-                url=post.url,
-                text=post.text,
-                title=post.title,
-                created_at=post.created_at,
-                image_urls=_twitter_image_urls(post),
-                raw=raw,
-            )
-        )
-    return converted
-
-
-def _twitter_news_without_duplicate_steam_links(posts: list[NewsPost]) -> list[NewsPost]:
-    selected_by_key: dict[str, NewsPost] = {}
-    for post in posts:
-        link_keys = _steam_news_link_keys_for_news_post(post)
-        if not link_keys:
-            continue
-        for link_key in link_keys:
-            selected = selected_by_key.get(link_key)
-            if selected is None or _news_post_is_earlier(post, selected):
-                selected_by_key[link_key] = post
-
-    if not selected_by_key:
-        return posts
-
-    selected_ids = {post.post_id for post in selected_by_key.values()}
-    deduped: list[NewsPost] = []
-    seen_ids: set[str] = set()
-    for post in posts:
-        link_keys = _steam_news_link_keys_for_news_post(post)
-        if not link_keys:
-            deduped.append(post)
-            continue
-        if post.post_id not in selected_ids or post.post_id in seen_ids:
-            continue
-        seen_ids.add(post.post_id)
-        deduped.append(post)
-    return deduped
-
-
-def _steam_news_link_keys_for_news_post(post: NewsPost) -> set[str]:
-    raw_links = post.raw.get("link_urls")
-    if not isinstance(raw_links, list):
-        return set()
-    return {
-        key
-        for key in (_steam_news_url_key(str(url)) for url in raw_links if url)
-        if key is not None
-    }
-
-
-def _news_post_is_earlier(left: NewsPost, right: NewsPost) -> bool:
-    left_at = _as_utc_datetime(left.created_at)
-    right_at = _as_utc_datetime(right.created_at)
-    if left_at is not None and right_at is not None and left_at != right_at:
-        return left_at < right_at
-    if left_at is not None and right_at is None:
-        return True
-    if left_at is None and right_at is not None:
-        return False
-    return left.post_id < right.post_id
-
-
-def _raw_string_set(value: object) -> set[str]:
-    if not isinstance(value, list):
-        return set()
-    return {str(item) for item in value if item}
-
-
-def _twitter_news_prefers_available_steam(
-    post: NewsPost,
-    available_posts: list[NewsPost],
-) -> bool:
-    if not _is_twitter_news_post(post):
-        return False
-    prefer_ids = _raw_string_set(post.raw.get("prefer_steam_post_ids"))
-    prefer_keys = _raw_string_set(post.raw.get("prefer_steam_post_keys"))
-    if not prefer_ids and not prefer_keys:
-        return False
-    for available_post in available_posts:
-        if _is_twitter_news_post(available_post):
-            continue
-        if available_post.post_id in prefer_ids:
-            return True
-        post_key = _post_language_independent_id(available_post)
-        if post_key is not None and post_key in prefer_keys:
-            return True
-    return False
-
-
-def _schedule_text_for_post(post: NewsPost) -> str | None:
-    start = _datetime_from_raw_timestamp(post.raw.get("starts_at"))
-    end = _datetime_from_raw_timestamp(post.raw.get("ends_at"))
-    if start is None:
-        return None
-
-    text = _format_kst(start)
-    if end is not None and end > start:
-        text = f"{text} - {_format_kst(end)}"
-    return text
-
-
-def _datetime_from_raw_timestamp(value: object) -> datetime | None:
-    try:
-        timestamp = int(value)
-    except (TypeError, ValueError):
-        return None
-
-    if timestamp <= 0:
-        return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-
-def _format_kst(value: datetime) -> str:
-    dt = value.astimezone(KST)
-    ampm = "오전" if dt.hour < 12 else "오후"
-    hour = dt.hour % 12 or 12
-    return f"{dt.year}년 {dt.month}월 {dt.day}일 {ampm} {hour}시 {dt.minute:02d}분"
-
-def _is_chzzk_live_too_old(live: ChzzkLive) -> bool:
-    if live.open_date is None:
-        return False
-    opened_at = live.open_date
-    if opened_at.tzinfo is None:
-        opened_at = opened_at.replace(tzinfo=KST)
-    return datetime.now(KST) - opened_at.astimezone(KST) >= CHZZK_LIVE_ANNOUNCE_MAX_AGE
-
-
-def _is_youtube_live_too_old(live: YoutubeLive) -> bool:
-    if live.start_time is None:
-        return False
-    return datetime.now(KST) - live.start_time.astimezone(KST) >= YOUTUBE_LIVE_ANNOUNCE_MAX_AGE
-
-
-def _is_chzzk_live_recently_closed(
-    live_detail: dict[str, object] | None,
-    last_live_id: str | None,
-) -> bool:
-    if not isinstance(live_detail, dict):
-        return False
-    live_id = live_detail.get("liveId")
-    if live_id is None or str(live_id) != str(last_live_id):
-        return False
-    status = str(live_detail.get("status") or "").upper()
-    if status and status not in {"CLOSE", "ENDED"}:
-        return False
-    close_date = _parse_chzzk_datetime(live_detail.get("closeDate"))
-    if close_date is None:
-        return False
-    return datetime.now(KST) - close_date.astimezone(KST) < CHZZK_LIVE_END_ANNOUNCE_MAX_AGE
-
-
-def _parse_chzzk_datetime(value: object) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=KST)
-
-
-def _choice_name(
-    post: NewsPost,
-    *,
-    include_language: bool = False,
-    include_source: bool = True,
-) -> str:
-    title = _display_title_for_post(post) if include_source else (post.title.strip() or post.post_id)
-    prefix = ""
-    if post.created_at:
-        prefix = f"[{_format_kst(post.created_at)}] "
-    if include_language:
-        language = _post_language(post)
-        if language:
-            prefix = f"{prefix}[{_language_label(language)}] "
-
-    max_title_length = max(1, 100 - len(prefix))
-    if len(title) <= max_title_length:
-        return f"{prefix}{title}"
-
-    if max_title_length <= 3:
-        return f"{prefix}{title[:max_title_length]}"
-    return f"{prefix}{title[: max_title_length - 3]}..."
-
-
-def _twitter_choice_name(post: TwitterPost) -> str:
-    title = post.title.strip() or post.post_id
-    if post.created_at:
-        prefix = f"[{_format_kst(post.created_at)}] "
-    else:
-        prefix = ""
-    max_title_length = max(1, 100 - len(prefix))
-    if len(title) <= max_title_length:
-        return f"{prefix}{title}"
-    if max_title_length <= 3:
-        return f"{prefix}{title[:max_title_length]}"
-    return f"{prefix}{title[: max_title_length - 3]}..."
-
-
-def _post_language(post: NewsPost) -> str:
-    raw_language = post.raw.get("language")
-    if raw_language:
-        return str(raw_language)
-
-    parts = post.post_id.split(":", 2)
-    if len(parts) == 3 and parts[0] == "steam":
-        return parts[1]
-
-    return ""
-
-
-def _post_language_independent_id(post: NewsPost) -> str | None:
-    parts = post.post_id.split(":", 2)
-    if len(parts) == 3 and parts[0] == "steam":
-        return parts[2]
-
-    raw_id = post.raw.get("event_gid")
-    if raw_id:
-        return str(raw_id)
-
-    return None
-
-
-_UNSAFE_FILENAME_RE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
-
-
-def _unique_zip_name(
-    used_names: set[str], index: int, url: str, content_type: str | None, *, native: bool = False
-) -> str:
-    extension = _image_file_extension(url, content_type, native=native)
-    candidate = f"소식_이미지_({index + 1}){extension}"
-    counter = 2
-    while candidate in used_names:
-        candidate = f"소식_이미지_({index + 1}_{counter}){extension}"
-        counter += 1
-    used_names.add(candidate)
-    return candidate
-
-
-def _image_file_extension(url: str, content_type: str | None, *, native: bool = False) -> str:
-    if content_type:
-        normalized = content_type.split(";", 1)[0].strip().lower()
-        _NATIVE_EXT = {
-            "image/jpeg": ".jpg",
-            "image/png": ".png",
-            "image/gif": ".gif",
-            "image/webp": ".webp",
-        }
-        if native:
-            if normalized in _NATIVE_EXT:
-                return _NATIVE_EXT[normalized]
-        else:
-            if normalized in _NATIVE_EXT or normalized == "image/bmp":
-                return ".png"
-
-    suffix = urlparse(url).path.rsplit("/", 1)[-1].lower().rsplit(".", 1)
-    if len(suffix) == 2:
-        extension = f".{suffix[1]}"
-        if native:
-            if extension in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-                return ".jpg" if extension in {".jpg", ".jpeg"} else extension
-        else:
-            if extension in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
-                return ".png"
-
-    return ".img"
-
-
-def _image_bytes_as_png(
-    data: bytes, content_type: str | None
-) -> tuple[bytes, str | None]:
-    normalized = (content_type or "").split(";", 1)[0].strip().lower()
-    if normalized == "image/png":
-        return data, "image/png"
-
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
-            output = io.BytesIO()
-            image.save(output, format="PNG", optimize=True)
-            return output.getvalue(), "image/png"
-    except (UnidentifiedImageError, OSError):
-        LOGGER.warning("이미지를 PNG로 변환하지 못해 원본으로 보냅니다.")
-        return data, content_type
-
-
-EGO_GIFT_IMAGE_MAX_SIZE = 150
-
-
-def _resize_image_to_fit(data: bytes, max_size: int) -> bytes:
-    """비율을 유지한 채 긴 변이 max_size가 되도록 리사이즈한다.
-
-    가로/세로 비율이 달라도 왜곡되지 않으며, max_size x max_size 박스 안에 들어간다.
-    """
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA" if "A" in image.getbands() else "RGB")
-            width, height = image.size
-            longest = max(width, height)
-            if longest == 0:
-                return data
-            scale = max_size / longest
-            new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-            resized = image.resize(new_size, Image.LANCZOS)
-            output = io.BytesIO()
-            resized.save(output, format="PNG", optimize=True)
-            return output.getvalue()
-    except (UnidentifiedImageError, OSError):
-        LOGGER.warning("에고 기프트 이미지 크기 조정에 실패해 원본 크기로 보냅니다.")
-        return data
-
-
-def _process_ego_gift_image_bytes(data: bytes, content_type: str | None) -> bytes:
-    """에고 기프트 첨부 이미지를 PNG로 변환하고 150px 박스에 맞춰 리사이즈한다.
-
-    CPU 바운드 작업이므로 asyncio.to_thread로 호출한다.
-    """
-    data, content_type = _image_bytes_as_png(data, content_type)
-    return _resize_image_to_fit(data, EGO_GIFT_IMAGE_MAX_SIZE)
-
-
-@dataclass(frozen=True)
-class _DcRecoverParams:
-    gamma: float
-    red_gain: float
-    green_gain: float
-    blue_gain: float
-    saturation: float
-    contrast: float
-    brightness: float
-    highlight_strength: float
-    red_shadow_boost: float
-    clahe_clip: float
-    sharpen: float
-    shadow_deblock: float
-    shadow_detail: float
-    shadow_sharpen: float
-
-
-_DC_RECOVER_PARAMS = _DcRecoverParams(
-    gamma=0.48,
-    red_gain=1.22,
-    green_gain=1.15,
-    blue_gain=1.10,
-    saturation=1.10,
-    contrast=1.00,
-    brightness=0.0,
-    highlight_strength=0.18,
-    red_shadow_boost=0.020,
-    clahe_clip=0.22,
-    sharpen=0.00,
-    shadow_deblock=0.66,
-    shadow_detail=0.34,
-    shadow_sharpen=0.24,
-)
-_DC_CLAHE_TILE_GRID = (8, 8)
-_DC_SHADOW_MASK_LOW = 0.08
-_DC_SHADOW_MASK_HIGH = 0.58
-_DC_EDGE_PROTECT_LOW = 3.0
-_DC_EDGE_PROTECT_HIGH = 18.0
-
-
-def _smoothstep(edge0: float, edge1: float, value: "np.ndarray") -> "np.ndarray":
-    x = np.clip((value - edge0) / (edge1 - edge0), 0.0, 1.0)
-    return x * x * (3.0 - (2.0 * x))
-
-
-def _dc_luminance(rgb: "np.ndarray") -> "np.ndarray":
-    image = rgb.astype(np.float32) / 255.0
-    return (
-        0.2126 * image[..., 0]
-        + 0.7152 * image[..., 1]
-        + 0.0722 * image[..., 2]
-    )
-
-
-def _dc_shadow_weight(rgb: "np.ndarray") -> "np.ndarray":
-    luminance = _dc_luminance(rgb)
-    weight = 1.0 - _smoothstep(_DC_SHADOW_MASK_LOW, _DC_SHADOW_MASK_HIGH, luminance)
-    return np.clip(weight, 0.0, 1.0) ** 1.35
-
-
-def _dc_edge_weight(rgb: "np.ndarray") -> "np.ndarray":
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    edges = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
-    return _smoothstep(_DC_EDGE_PROTECT_LOW, _DC_EDGE_PROTECT_HIGH, edges)
-
-
-def _apply_dc_gamma_and_gain(
-    rgb: "np.ndarray",
-    params: _DcRecoverParams,
-) -> "np.ndarray":
-    image = rgb.astype(np.float32) / 255.0
-    image = np.power(np.clip(image, 0.0, 1.0), params.gamma)
-
-    gains = np.array(
-        [params.red_gain, params.green_gain, params.blue_gain],
-        dtype=np.float32,
-    ).reshape(1, 1, 3)
-    image = image * 255.0 * gains
-    image = (image - 127.5) * params.contrast + 127.5 + params.brightness
-    return np.clip(image, 0.0, 255.0).astype(np.uint8)
-
-
-def _boost_dc_red_in_shadows(
-    rgb: "np.ndarray",
-    strength: float,
-) -> "np.ndarray":
-    if strength <= 0.0:
-        return rgb
-
-    image = rgb.astype(np.float32) / 255.0
-    red = image[..., 0]
-    green = image[..., 1]
-    blue = image[..., 2]
-    luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-
-    shadow_weight = np.clip(1.0 - luminance, 0.0, 1.0) ** 2
-    image[..., 0] += shadow_weight * strength
-    return np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
-
-
-def _boost_dc_highlights(
-    rgb: "np.ndarray",
-    strength: float,
-) -> "np.ndarray":
-    if strength <= 0.0:
-        return rgb
-
-    image = rgb.astype(np.float32) / 255.0
-    value = np.max(image, axis=2)
-    highlight_weight = np.clip((value - 0.65) / 0.35, 0.0, 1.0)[..., None]
-    image = image + (1.0 - image) * highlight_weight * strength
-    return np.clip(image * 255.0, 0.0, 255.0).astype(np.uint8)
-
-
-def _deblock_dc_shadows(
-    original_rgb: "np.ndarray",
-    lifted_rgb: "np.ndarray",
-    strength: float,
-) -> "np.ndarray":
-    if strength <= 0.0:
-        return lifted_rgb
-
-    shadow_weight = _dc_shadow_weight(original_rgb)
-    edge_weight = _dc_edge_weight(original_rgb)
-    blend_weight = shadow_weight * (1.0 - (edge_weight * 0.72)) * strength
-
-    denoised = cv2.fastNlMeansDenoisingColored(
-        lifted_rgb,
-        None,
-        4.2,
-        4.2,
-        7,
-        21,
-    )
-    smoothed = cv2.bilateralFilter(
-        denoised,
-        d=5,
-        sigmaColor=34,
-        sigmaSpace=32,
-    )
-    mixed = (
-        lifted_rgb.astype(np.float32) * (1.0 - blend_weight[..., np.newaxis])
-        + smoothed.astype(np.float32) * blend_weight[..., np.newaxis]
-    )
-    return np.clip(mixed, 0.0, 255.0).astype(np.uint8)
-
-
-def _change_dc_saturation(
-    rgb: "np.ndarray",
-    saturation: float,
-) -> "np.ndarray":
-    if abs(saturation - 1.0) < 1e-6:
-        return rgb
-
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
-    hsv[..., 1] = np.clip(hsv[..., 1] * saturation, 0.0, 255.0)
-    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
-
-
-def _apply_dc_clahe(
-    rgb: "np.ndarray",
-    clip_limit: float,
-) -> "np.ndarray":
-    if clip_limit <= 0.0:
-        return rgb
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    lightness, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(
-        clipLimit=float(clip_limit),
-        tileGridSize=_DC_CLAHE_TILE_GRID,
-    )
-    lightness = clahe.apply(lightness)
-    return cv2.cvtColor(cv2.merge([lightness, a_channel, b_channel]), cv2.COLOR_LAB2RGB)
-
-
-def _enhance_dc_shadow_detail(
-    original_rgb: "np.ndarray",
-    rgb: "np.ndarray",
-    strength: float,
-) -> "np.ndarray":
-    if strength <= 0.0:
-        return rgb
-
-    shadow_weight = _dc_shadow_weight(original_rgb)
-    edge_weight = _dc_edge_weight(original_rgb)
-    detail_weight = shadow_weight * (0.35 + (0.65 * edge_weight)) * strength
-
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    lightness = lab[..., 0].astype(np.float32)
-    base = cv2.bilateralFilter(
-        np.clip(lightness, 0, 255).astype(np.uint8),
-        d=7,
-        sigmaColor=46,
-        sigmaSpace=44,
-    ).astype(np.float32)
-    detail = lightness - base
-
-    lightness = lightness + detail * detail_weight * 1.55
-    midtone_lift = (255.0 - lightness) * shadow_weight * strength * 0.035
-    lab[..., 0] = np.clip(lightness + midtone_lift, 0, 255).astype(np.uint8)
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-
-
-def _sharpen_dc_image(
-    rgb: "np.ndarray",
-    amount: float,
-) -> "np.ndarray":
-    if amount <= 0.0:
-        return rgb
-
-    blurred = cv2.GaussianBlur(rgb, (0, 0), sigmaX=1.0)
-    return cv2.addWeighted(rgb, 1.0 + amount, blurred, -amount, 0.0)
-
-
-def _recover_shadow_detail(rgb: "np.ndarray") -> "np.ndarray":
-    params = _DC_RECOVER_PARAMS
-    result = _apply_dc_gamma_and_gain(rgb, params)
-    result = _deblock_dc_shadows(rgb, result, params.shadow_deblock)
-    result = _boost_dc_red_in_shadows(result, params.red_shadow_boost)
-    result = _boost_dc_highlights(result, params.highlight_strength)
-    result = _change_dc_saturation(result, params.saturation)
-    result = _apply_dc_clahe(result, params.clahe_clip)
-    result = _enhance_dc_shadow_detail(rgb, result, params.shadow_detail)
-    result = _sharpen_dc_image(result, params.shadow_sharpen)
-    result = _sharpen_dc_image(result, params.sharpen)
-    return result
-
-
-def _brighten_image_bytes(data: bytes, content_type: str | None) -> bytes | None:
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            image.load()
-            has_alpha = "A" in image.getbands()
-            if image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA" if has_alpha else "RGB")
-
-            alpha = (
-                np.asarray(image.getchannel("A"), dtype=np.uint8)
-                if image.mode == "RGBA"
-                else None
-            )
-            rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
-
-        recovered = _recover_shadow_detail(rgb)
-
-        out = Image.fromarray(recovered, mode="RGB")
-        if alpha is not None:
-            out.putalpha(Image.fromarray(alpha, mode="L"))
-
-        buffer = io.BytesIO()
-        out.save(buffer, format="PNG", optimize=True)
-        return buffer.getvalue()
-    except (UnidentifiedImageError, OSError, cv2.error):
-        LOGGER.warning(
-            "스포일러 이미지 밝기 보정 실패 (content_type=%s).",
-            content_type,
-        )
-        return None
-
-
-def _safe_zip_filename(post: NewsPost) -> str:
-    title = (post.title or "").strip()
-    cleaned = _UNSAFE_FILENAME_RE.sub(" ", title).strip()
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    if not cleaned:
-        cleaned = post.post_id
-    if len(cleaned) > 80:
-        cleaned = cleaned[:80].rstrip()
-    return f"림버스_소식_({cleaned}).zip"
-
-
-def _log_level_from_env() -> int:
-    raw = os.getenv("LIMPI_LOG_LEVEL", "INFO").strip().upper()
-    if not raw:
-        return logging.INFO
-    if raw.isdigit():
-        return int(raw)
-    level = logging.getLevelName(raw)
-    return level if isinstance(level, int) else logging.INFO
-
-
-def _keepalive_socket_factory(addr_info: tuple) -> socket.socket:
-    family, type_, proto, _, _ = addr_info
-    sock = socket.socket(family, type_, proto)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    if hasattr(socket, "SIO_KEEPALIVE_VALS"):
-        try:
-            sock.ioctl(
-                socket.SIO_KEEPALIVE_VALS,
-                (1, WINDOWS_KEEPALIVE_TIME_MS, WINDOWS_KEEPALIVE_INTERVAL_MS),
-            )
-        except OSError:
-            pass
-    for option_name, value in (
-        ("TCP_KEEPIDLE", TCP_KEEPALIVE_IDLE_SECONDS),
-        ("TCP_KEEPALIVE", TCP_KEEPALIVE_IDLE_SECONDS),
-        ("TCP_KEEPINTVL", TCP_KEEPALIVE_INTERVAL_SECONDS),
-        ("TCP_KEEPCNT", TCP_KEEPALIVE_PROBES),
-    ):
-        option = getattr(socket, option_name, None)
-        if option is None:
-            continue
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, option, value)
-        except OSError:
-            pass
-    return sock
-
-
-def _prevent_windows_sleep() -> bool:
-    if os.name != "nt":
-        return False
-    try:
-        result = ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
-        )
-    except Exception:
-        LOGGER.exception("Windows 절전 방지 설정 실패.")
-        return False
-    if not result:
-        LOGGER.warning("Windows 절전 방지 설정이 적용되지 않았습니다.")
-        return False
-    LOGGER.info("봇 실행 중 Windows 시스템 절전을 방지합니다.")
-    return True
-
-
-def _restore_windows_sleep() -> None:
-    if os.name != "nt":
-        return
-    try:
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-    except Exception:
-        LOGGER.exception("Windows 절전 방지 해제 실패.")
-
-
-def _build_aiohttp_connector() -> aiohttp.TCPConnector:
-    options = {
-        "keepalive_timeout": AIOHTTP_KEEPALIVE_TIMEOUT_SECONDS,
-        "ttl_dns_cache": 300,
-        "enable_cleanup_closed": True,
-    }
-    try:
-        return aiohttp.TCPConnector(
-            **options,
-            socket_factory=_keepalive_socket_factory,
-        )
-    except TypeError:
-        LOGGER.warning("aiohttp 버전이 TCP socket_factory를 지원하지 않아 기본 keepalive로 실행합니다.")
-        return aiohttp.TCPConnector(**options)
 
 
 async def main() -> None:
@@ -11055,7 +7616,3 @@ async def main() -> None:
 if __name__ == "__main__":
     _install_windows_selector_event_loop_policy()
     asyncio.run(main())
-
-
-
-

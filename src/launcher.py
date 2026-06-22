@@ -18,6 +18,14 @@ if _WORKER_FLAG in sys.argv:
     except KeyboardInterrupt:
         sys.exit(0)
 
+_SMOKE_TEST_FLAG = "--smoke-test"
+if _SMOKE_TEST_FLAG in sys.argv:
+    from types import SimpleNamespace
+    from src import bot
+
+    bot.LimpiBot(SimpleNamespace(command_guild_id=None))
+    sys.exit(0)
+
 import datetime
 import os
 import subprocess
@@ -69,15 +77,20 @@ class BotProcess:
         self.proc: subprocess.Popen | None = None
         self.start_time: datetime.datetime | None = None
         self.on_log = on_log
+        self.test_mode = False
         self._lock = threading.Lock()
         self._psutil: psutil.Process | None = None
 
-    def start(self) -> None:
+    def start(self, *, test_mode: bool = False) -> None:
         with self._lock:
             if self.proc and self.proc.poll() is None:
                 return
+            self.test_mode = test_mode
             self.start_time = datetime.datetime.now()
-            self.on_log(f"[시스템] 봇 시작 중… ({_fmt_dt(self.start_time)})")
+            mode_text = "테스트 모드" if self.test_mode else "일반 모드"
+            self.on_log(
+                f"[시스템] 봇 시작 중… ({mode_text}, {_fmt_dt(self.start_time)})"
+            )
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
@@ -87,6 +100,8 @@ class BotProcess:
             else:
                 cmd = [PYTHON, "-m", "src.bot"]
                 cwd = _BASE
+            if self.test_mode:
+                cmd.append("--test")
             self.proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -139,10 +154,12 @@ class BotProcess:
             self.proc.kill()
         self._psutil = None
 
-    def restart(self) -> None:
+    def restart(self, *, test_mode: bool | None = None) -> None:
+        if test_mode is None:
+            test_mode = self.test_mode
         self.stop()
         time.sleep(1)
-        self.start()
+        self.start(test_mode=test_mode)
 
     def is_running(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
@@ -225,6 +242,7 @@ class LimpiLauncher:
 
         for label, color, cmd in [
             ("시작",   C_GREEN,  self._on_start),
+            ("Test 실행", C_BLUE, self._on_start_test),
             ("재시작", C_PEACH,  self._on_restart),
             ("중지",   C_RED,    self._on_stop),
         ]:
@@ -316,7 +334,8 @@ class LimpiLauncher:
         running = self.bot.is_running()
         if running:
             self._dot.config(fg=C_GREEN)
-            self._status_label.config(text=" 실행 중", fg=C_GREEN)
+            status_text = " Test 실행 중" if self.bot.test_mode else " 실행 중"
+            self._status_label.config(text=status_text, fg=C_GREEN)
             self._uptime_label.config(text=f"  가동 시간: {self.bot.uptime_str()}")
             self._start_time_label.config(text=f"시작: {self.bot.start_time_str()}")
             cpu, ram = self.bot.metrics()
@@ -344,7 +363,19 @@ class LimpiLauncher:
 
     def _on_start(self) -> None:
         self._clear_log()
-        threading.Thread(target=self.bot.start, daemon=True).start()
+        threading.Thread(
+            target=self.bot.start,
+            kwargs={"test_mode": False},
+            daemon=True,
+        ).start()
+
+    def _on_start_test(self) -> None:
+        self._clear_log()
+        threading.Thread(
+            target=self.bot.restart,
+            kwargs={"test_mode": True},
+            daemon=True,
+        ).start()
 
     def _on_stop(self) -> None:
         threading.Thread(target=self.bot.stop, daemon=True).start()
