@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import csv
@@ -328,6 +328,7 @@ class NewsCog(commands.Cog):
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._twitter_steam_defer_logged_post_ids: set[str] = set()
+        self._twitter_steam_retry_count: dict[str, int] = {}
         self._zip_cache: dict[str, tuple[list[bytes], int, int, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
@@ -1147,6 +1148,7 @@ class NewsCog(commands.Cog):
             if _twitter_news_prefers_available_steam(post, posts):
                 self._twitter_steam_grace_started_at.pop(post.post_id, None)
                 self._twitter_steam_defer_logged_post_ids.discard(post.post_id)
+                self._twitter_steam_retry_count.pop(post.post_id, None)
                 continue
             if defer_linked_twitter and self._defer_linked_twitter_for_steam(post):
                 continue
@@ -1157,13 +1159,17 @@ class NewsCog(commands.Cog):
         if not _is_twitter_news_post(post) or not _steam_news_link_keys_for_news_post(post):
             return False
 
+        if self._twitter_steam_retry_count.get(post.post_id, 0) >= 2:
+            return False
+
         now = perf_counter()
         started_at = self._twitter_steam_grace_started_at.setdefault(post.post_id, now)
         elapsed = now - started_at
         if elapsed >= TWITTER_STEAM_PREFERENCE_GRACE_SECONDS:
-            self._twitter_steam_grace_started_at.pop(post.post_id, None)
-            self._twitter_steam_defer_logged_post_ids.discard(post.post_id)
-            return False
+            self._twitter_steam_retry_count[post.post_id] = self._twitter_steam_retry_count.get(post.post_id, 0) + 1
+            self._twitter_steam_grace_started_at[post.post_id] = now
+            if post.post_id not in self._twitter_steam_defer_logged_post_ids:
+                self._twitter_steam_defer_logged_post_ids.add(post.post_id)
         if post.post_id not in self._twitter_steam_defer_logged_post_ids:
             self._twitter_steam_defer_logged_post_ids.add(post.post_id)
             LOGGER.info(
