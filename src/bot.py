@@ -1006,6 +1006,11 @@ class NewsCog(commands.Cog):
             )
             return False
 
+        guild_log, channel_log = self._destination_logs(
+            settings.guild_id,
+            channel,
+            settings.channel_id,
+        )
         try:
             role = discord.Object(id=settings.role_id) if settings.role_id else None
             await channel.send(
@@ -1039,9 +1044,9 @@ class NewsCog(commands.Cog):
             return False
 
         LOGGER.info(
-            "점검 알림 전송 완료 (guild_id=%s, channel_id=%s, notice_type=%s).",
-            settings.guild_id,
-            settings.channel_id,
+            "점검 알림 전송 완료 | %s | %s | notice_type=%s.",
+            guild_log,
+            channel_log,
             notice_type,
         )
         return True
@@ -2044,6 +2049,76 @@ class NewsCog(commands.Cog):
             for start, end in self.config.twitter_tracking_windows_kst
         )
 
+    def _current_twitter_tracking_window_started_at(self, now: datetime) -> datetime | None:
+        local_now = now.astimezone(KST)
+        current_minute = local_now.hour * 60 + local_now.minute
+        starts: list[datetime] = []
+        for start, end in self.config.twitter_tracking_windows_kst:
+            if not _minute_in_window(current_minute, start, end):
+                continue
+            start_day = local_now
+            if start > end and current_minute < end:
+                start_day = local_now - timedelta(days=1)
+            start_local = start_day.replace(hour=0, minute=0, second=0, microsecond=0)
+            starts.append(start_local + timedelta(minutes=start))
+        if not starts:
+            return None
+        return max(starts).astimezone(timezone.utc)
+
+    def _hampang_auto_created_after(
+        self,
+        target: GuildHampangTarget,
+        window_started_at: datetime | None,
+    ) -> datetime | None:
+        moments = [
+            moment
+            for moment in (
+                _as_utc_datetime(target.created_at),
+                _as_utc_datetime(window_started_at),
+            )
+            if moment is not None
+        ]
+        return max(moments) if moments else None
+
+    def _auto_sendable_hampang_x_posts(
+        self,
+        posts: list[TwitterPost],
+        *,
+        target: GuildHampangTarget,
+        window_started_at: datetime | None,
+        max_age_seconds: int,
+    ) -> list[TwitterPost]:
+        created_after = self._hampang_auto_created_after(target, window_started_at)
+        filtered: list[TwitterPost] = []
+        for post in posts:
+            created = _as_utc_datetime(post.created_at)
+            if created is None:
+                continue
+            if created_after is not None and created <= created_after:
+                continue
+            if max_age_seconds > 0 and not _is_twitter_post_recent(post, max_age_seconds):
+                continue
+            filtered.append(post)
+        return filtered
+
+    def _auto_sendable_hampang_youtube_uploads(
+        self,
+        uploads: list[YoutubeUpload],
+        *,
+        target: GuildHampangTarget,
+        window_started_at: datetime | None,
+    ) -> list[YoutubeUpload]:
+        created_after = self._hampang_auto_created_after(target, window_started_at)
+        filtered: list[YoutubeUpload] = []
+        for upload in uploads:
+            published_at = _as_utc_datetime(upload.published_at)
+            if published_at is None:
+                continue
+            if created_after is not None and published_at <= created_after:
+                continue
+            filtered.append(upload)
+        return filtered
+
     def _current_poll_interval_seconds(self, now: datetime) -> int:
         if self._is_high_frequency_window(now):
             return self.config.high_frequency_poll_interval_seconds
@@ -2099,6 +2174,11 @@ class NewsCog(commands.Cog):
             self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
             return 0
 
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
         announced = 0
         failed_post_ids: set[str] = set()
         for post in new_posts:
@@ -2128,9 +2208,9 @@ class NewsCog(commands.Cog):
             )
             self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
             LOGGER.info(
-                "새 뉴스 공지 (guild %s, channel %s, language %s, delay=%s초): %s",
-                target.guild_id,
-                target.channel_id,
+                "새 뉴스 공지 | %s | %s | language=%s | delay=%s초 | 제목=%s",
+                guild_log,
+                channel_log,
                 target.language,
                 _post_delay_seconds(post),
                 post.title,
@@ -2301,6 +2381,11 @@ class NewsCog(commands.Cog):
             self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
             return 0
 
+        guild_log, channel_log = self._destination_logs(
+            settings.guild_id,
+            channel,
+            settings.channel_id,
+        )
         announced = 0
         failed_post_ids: set[str] = set()
         for post in new_posts:
@@ -2323,8 +2408,9 @@ class NewsCog(commands.Cog):
                 continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
             LOGGER.info(
-                "새 뉴스 공지 (guild %s, delay=%s초): %s",
-                settings.guild_id,
+                "새 뉴스 공지 | %s | %s | delay=%s초 | 제목=%s",
+                guild_log,
+                channel_log,
                 _post_delay_seconds(post),
                 post.title,
             )
@@ -4141,6 +4227,20 @@ class NewsCog(commands.Cog):
             return
         self.storage.add_tracked_message(guild_id, channel_id, message.id)
 
+    def _destination_logs(
+        self,
+        guild_id: int | None,
+        channel: object | None,
+        channel_id: int | None,
+    ) -> tuple[str, str]:
+        guild = getattr(channel, "guild", None)
+        if guild is None and guild_id is not None:
+            guild = self.bot.get_guild(guild_id)
+        return (
+            _format_guild_for_log(guild, guild_id),
+            _format_channel_for_log(channel, channel_id),
+        )
+
     async def _x_news_probe_observe(self, targets: list[GuildTwitterTarget]) -> None:
         observed_at = datetime.now(timezone.utc)
         run_kst = observed_at.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S KST")
@@ -4287,6 +4387,11 @@ class NewsCog(commands.Cog):
                 channel = await self._resolve_twitter_target_channel(target)
                 if channel is None:
                     return 0
+                guild_log, channel_log = self._destination_logs(
+                    target.guild_id,
+                    channel,
+                    target.channel_id,
+                )
                 new_posts = self._new_twitter_posts_for_target(target, posts)
                 if not new_posts:
                     self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
@@ -4338,9 +4443,9 @@ class NewsCog(commands.Cog):
                         continue
                     self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
                     LOGGER.info(
-                        "새 X 게시물 공지 (guild %s, channel %s, delay=%s초): %s",
-                        target.guild_id,
-                        target.channel_id,
+                        "새 X 게시물 공지 | %s | %s | delay=%s초 | 제목=%s",
+                        guild_log,
+                        channel_log,
                         _twitter_post_delay_seconds(post),
                         post.title,
                     )
@@ -4367,6 +4472,8 @@ class NewsCog(commands.Cog):
         if not targets:
             return 0
 
+        poll_started_at = datetime.now(timezone.utc)
+        window_started_at = self._current_twitter_tracking_window_started_at(poll_started_at)
         (
             x_posts,
             youtube_uploads,
@@ -4417,12 +4524,30 @@ class NewsCog(commands.Cog):
                     )
                 else:
                     last_seen_index = x_ids.index(target.last_x_post_id)
-                    new_x_posts = list(reversed(x_posts[:last_seen_index]))
-                    if max_age > 0:
-                        new_x_posts = [
-                            post for post in new_x_posts
-                            if _is_twitter_post_recent(post, max_age)
-                        ]
+                    candidate_x_posts = list(reversed(x_posts[:last_seen_index]))
+                    new_x_posts = self._auto_sendable_hampang_x_posts(
+                        candidate_x_posts,
+                        target=target,
+                        window_started_at=window_started_at,
+                        max_age_seconds=max_age,
+                    )
+                    if candidate_x_posts and not new_x_posts:
+                        baseline_x_id = latest_x_post_id
+                        LOGGER.info(
+                            "햄햄팡팡 X 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
+                            "(guild_id=%s, channel_id=%s, candidates=%s, latest_post_id=%s, "
+                            "window_started_at=%s, target_created_at=%s).",
+                            target.guild_id,
+                            target.channel_id,
+                            len(candidate_x_posts),
+                            latest_x_post_id,
+                            window_started_at.isoformat() if window_started_at else "none",
+                            (
+                                _as_utc_datetime(target.created_at).isoformat()
+                                if target.created_at
+                                else "none"
+                            ),
+                        )
 
             if youtube_uploads and latest_youtube_video_id is not None:
                 if youtube_baseline_only:
@@ -4440,7 +4565,29 @@ class NewsCog(commands.Cog):
                     )
                 else:
                     last_seen_index = youtube_ids.index(target.last_youtube_video_id)
-                    new_youtube_uploads = list(reversed(youtube_uploads[:last_seen_index]))
+                    candidate_youtube_uploads = list(reversed(youtube_uploads[:last_seen_index]))
+                    new_youtube_uploads = self._auto_sendable_hampang_youtube_uploads(
+                        candidate_youtube_uploads,
+                        target=target,
+                        window_started_at=window_started_at,
+                    )
+                    if candidate_youtube_uploads and not new_youtube_uploads:
+                        baseline_youtube_id = latest_youtube_video_id
+                        LOGGER.info(
+                            "햄햄팡팡 YouTube 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
+                            "(guild_id=%s, channel_id=%s, candidates=%s, latest_video_id=%s, "
+                            "window_started_at=%s, target_created_at=%s).",
+                            target.guild_id,
+                            target.channel_id,
+                            len(candidate_youtube_uploads),
+                            latest_youtube_video_id,
+                            window_started_at.isoformat() if window_started_at else "none",
+                            (
+                                _as_utc_datetime(target.created_at).isoformat()
+                                if target.created_at
+                                else "none"
+                            ),
+                        )
 
             if baseline_x_id is not None or baseline_youtube_id is not None:
                 self.storage.mark_hampang_target_seen(
@@ -4461,6 +4608,11 @@ class NewsCog(commands.Cog):
                 channel = await self._resolve_hampang_target_channel(target)
                 if channel is None:
                     return 0
+                guild_log, channel_log = self._destination_logs(
+                    target.guild_id,
+                    channel,
+                    target.channel_id,
+                )
 
                 settings = self.storage.get_settings(target.guild_id)
                 announced = 0
@@ -4482,9 +4634,9 @@ class NewsCog(commands.Cog):
                                 x_post_id=item.post_id,
                             )
                             LOGGER.info(
-                                "새 햄햄팡팡 X 소식 공지 (guild %s, channel %s): %s",
-                                target.guild_id,
-                                target.channel_id,
+                                "새 햄햄팡팡 X 소식 공지 | %s | %s | 제목=%s",
+                                guild_log,
+                                channel_log,
                                 item.title,
                             )
                         elif source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
@@ -4498,9 +4650,9 @@ class NewsCog(commands.Cog):
                                 youtube_video_id=item.video_id,
                             )
                             LOGGER.info(
-                                "새 햄햄팡팡 YouTube 소식 공지 (guild %s, channel %s): %s",
-                                target.guild_id,
-                                target.channel_id,
+                                "새 햄햄팡팡 YouTube 소식 공지 | %s | %s | 제목=%s",
+                                guild_log,
+                                channel_log,
                                 item.title,
                             )
                         else:
@@ -4641,6 +4793,11 @@ class NewsCog(commands.Cog):
                 channel = await self._resolve_chzzk_target_channel(target)
                 if channel is None:
                     continue
+                guild_log, channel_log = self._destination_logs(
+                    target.guild_id,
+                    channel,
+                    target.channel_id,
+                )
                 try:
                     message = await self._send_chzzk_live_end_to_channel(channel)
                 except discord.HTTPException:
@@ -4654,9 +4811,9 @@ class NewsCog(commands.Cog):
                 self.storage.mark_chzzk_target_offline(target.guild_id)
                 await self._track_manual_message(target.guild_id, target.channel_id, message)
                 LOGGER.info(
-                    "치지직 라이브 종료 공지 (guild %s, channel %s, live_id=%s).",
-                    target.guild_id,
-                    target.channel_id,
+                    "치지직 라이브 종료 공지 | %s | %s | live_id=%s.",
+                    guild_log,
+                    channel_log,
                     target.last_live_id,
                 )
                 ended += 1
@@ -4699,6 +4856,11 @@ class NewsCog(commands.Cog):
             channel = await self._resolve_chzzk_target_channel(target)
             if channel is None:
                 continue
+            guild_log, channel_log = self._destination_logs(
+                target.guild_id,
+                channel,
+                target.channel_id,
+            )
             try:
                 settings = self.storage.get_settings(target.guild_id)
                 youtube_target = self.storage.get_youtube_target(target.guild_id)
@@ -4720,9 +4882,9 @@ class NewsCog(commands.Cog):
             self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
             await self._track_manual_message(target.guild_id, target.channel_id, message)
             LOGGER.info(
-                "새 치지직 라이브 공지 (guild %s, channel %s): %s",
-                target.guild_id,
-                target.channel_id,
+                "새 치지직 라이브 공지 | %s | %s | 제목=%s",
+                guild_log,
+                channel_log,
                 live.title,
             )
             announced += 1
@@ -4777,6 +4939,11 @@ class NewsCog(commands.Cog):
             channel = await self._resolve_youtube_target_channel(target)
             if channel is None:
                 continue
+            guild_log, channel_log = self._destination_logs(
+                target.guild_id,
+                channel,
+                target.channel_id,
+            )
             try:
                 settings = self.storage.get_settings(target.guild_id)
                 chzzk_target = self.storage.get_chzzk_target(target.guild_id)
@@ -4798,9 +4965,9 @@ class NewsCog(commands.Cog):
             self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
             await self._track_manual_message(target.guild_id, target.channel_id, message)
             LOGGER.info(
-                "새 유튜브 라이브 공지 (guild %s, channel %s): %s",
-                target.guild_id,
-                target.channel_id,
+                "새 유튜브 라이브 공지 | %s | %s | 제목=%s",
+                guild_log,
+                channel_log,
                 live.title,
             )
             announced += 1
@@ -4851,6 +5018,11 @@ class NewsCog(commands.Cog):
             channel = await self._resolve_youtube_upload_target_channel(target)
             if channel is None:
                 continue
+            guild_log, channel_log = self._destination_logs(
+                target.guild_id,
+                channel,
+                target.channel_id,
+            )
             settings = self.storage.get_settings(target.guild_id)
             target_announced = 0
             for upload in new_uploads:
@@ -4873,9 +5045,9 @@ class NewsCog(commands.Cog):
                 self.storage.mark_youtube_upload_target_seen(target.guild_id, upload.video_id)
                 await self._track_manual_message(target.guild_id, target.channel_id, message)
                 LOGGER.info(
-                    "새 유튜브 업로드 공지 (guild %s, channel %s): %s",
-                    target.guild_id,
-                    target.channel_id,
+                    "새 유튜브 업로드 공지 | %s | %s | 제목=%s",
+                    guild_log,
+                    channel_log,
                     upload.title,
                 )
                 target_announced += 1
