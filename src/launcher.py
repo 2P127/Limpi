@@ -56,15 +56,19 @@ else:
     ICON_PATH = os.path.join(_BASE, "logo.ico")
 MAX_LOG_LINES = 2000
 
-C_BG       = "#1e1e2e"
-C_SURFACE  = "#11111b"
-C_TEXT     = "#cdd6f4"
-C_SUBTEXT  = "#6c7086"
-C_GREEN    = "#a6e3a1"
-C_RED      = "#f38ba8"
-C_YELLOW   = "#f9e2af"
-C_BLUE     = "#89b4fa"
-C_PEACH    = "#fab387"
+C_BG       = "#0b0d12"
+C_PANEL    = "#181b22"
+C_SURFACE  = "#111318"
+C_BORDER   = "#252a33"
+C_TEXT     = "#f2f3f5"
+C_SUBTEXT  = "#949ba4"
+C_MUTED    = "#6d737d"
+C_GREEN    = "#23a559"
+C_RED      = "#f23f43"
+C_YELLOW   = "#f0b232"
+C_BLUE     = "#5865f2"
+C_PEACH    = "#eb9f3a"
+C_IDLE     = "#80848e"
 
 
 _BELOW_NORMAL_PRIORITY = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
@@ -192,9 +196,9 @@ class BotProcess:
 class LimpiLauncher:
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title("림피 봇 터미널")
-        self.root.geometry("860x520")
-        self.root.minsize(600, 360)
+        self.root.title("Limpi Console")
+        self.root.geometry("980x640")
+        self.root.minsize(780, 500)
         self.root.configure(bg=C_BG)
 
         self.bot = BotProcess(on_log=self._queue_log)
@@ -205,80 +209,169 @@ class LimpiLauncher:
             self.root.iconbitmap(ICON_PATH)
         self.root.protocol("WM_DELETE_WINDOW", self._confirm_close)
         self._update_status()
-        self.bot.start()
+        self._queue_log("[시스템] 대기 중입니다. 시작 또는 Test 실행을 눌러 봇을 시작하세요.")
 
     def _build_ui(self) -> None:
-        top = tk.Frame(self.root, bg=C_BG, pady=10, padx=14)
-        top.pack(fill=tk.X)
+        header = tk.Frame(self.root, bg=C_BG, padx=16, pady=14)
+        header.pack(fill=tk.X)
+        header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=0)
 
-        dot = tk.Label(top, text="●", fg=C_GREEN, bg=C_BG, font=("Segoe UI", 13))
+        title_frame = tk.Frame(header, bg=C_BG)
+        title_frame.grid(row=0, column=0, sticky="w")
+
+        tk.Label(
+            title_frame,
+            text="림피봇 터미널",
+            fg=C_TEXT,
+            bg=C_BG,
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            title_frame,
+            text="Discord bot console",
+            fg=C_SUBTEXT,
+            bg=C_BG,
+            font=("Segoe UI", 9),
+        ).pack(anchor="w", pady=(1, 0))
+
+        status_frame = tk.Frame(header, bg=C_BG)
+        status_frame.grid(row=0, column=1, sticky="e")
+
+        dot = tk.Label(status_frame, text="●", fg=C_IDLE, bg=C_BG, font=("Segoe UI", 14))
         dot.pack(side=tk.LEFT)
         self._dot = dot
 
         self._status_label = tk.Label(
-            top, text=" 실행 중", fg=C_GREEN, bg=C_BG,
-            font=("Segoe UI", 11, "bold"),
+            status_frame,
+            text=" 대기 중",
+            fg=C_SUBTEXT,
+            bg=C_BG,
+            font=("Segoe UI", 12, "bold"),
         )
         self._status_label.pack(side=tk.LEFT)
 
+        stats = tk.Frame(header, bg=C_BG)
+        stats.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        stats.grid_columnconfigure(0, weight=1)
+        stats.grid_columnconfigure(1, weight=1)
+        stats.grid_columnconfigure(2, weight=1)
+
         self._uptime_label = tk.Label(
-            top, text="  가동 시간: 00:00:00", fg=C_TEXT, bg=C_BG,
+            stats,
+            text="가동 시간: -",
+            fg=C_TEXT,
+            bg=C_PANEL,
             font=("Segoe UI", 10),
+            padx=12,
+            pady=8,
+            anchor="w",
         )
-        self._uptime_label.pack(side=tk.LEFT, padx=8)
+        self._uptime_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         self._start_time_label = tk.Label(
-            top, text="", fg=C_SUBTEXT, bg=C_BG, font=("Segoe UI", 9),
+            stats,
+            text="시작: -",
+            fg=C_SUBTEXT,
+            bg=C_PANEL,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=8,
+            anchor="w",
         )
-        self._start_time_label.pack(side=tk.LEFT)
+        self._start_time_label.grid(row=0, column=1, sticky="ew", padx=4)
 
         self._metric_label = tk.Label(
-            top, text="", fg=C_BLUE, bg=C_BG, font=("Segoe UI", 10),
+            stats,
+            text="CPU: - / RAM: -",
+            fg=C_BLUE,
+            bg=C_PANEL,
+            font=("Segoe UI", 10),
+            padx=12,
+            pady=8,
+            anchor="w",
         )
-        self._metric_label.pack(side=tk.LEFT, padx=10)
+        self._metric_label.grid(row=0, column=2, sticky="ew", padx=(8, 0))
 
-        btn_frame = tk.Frame(top, bg=C_BG)
-        btn_frame.pack(side=tk.RIGHT)
+        btn_frame = tk.Frame(self.root, bg=C_BG, padx=16, pady=0)
+        btn_frame.pack(fill=tk.X, pady=(0, 12))
+        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid_columnconfigure(1, weight=1)
+        btn_frame.grid_columnconfigure(2, weight=1)
+        btn_frame.grid_columnconfigure(3, weight=1)
 
-        for label, color, cmd in [
+        for index, (label, color, cmd) in enumerate([
             ("시작",   C_GREEN,  self._on_start),
             ("Test 실행", C_BLUE, self._on_start_test),
             ("재시작", C_PEACH,  self._on_restart),
             ("중지",   C_RED,    self._on_stop),
-        ]:
-            tk.Button(
-                btn_frame, text=label, command=cmd,
-                bg=color, fg=C_BG, font=("Segoe UI", 10, "bold"),
-                relief=tk.FLAT, padx=14, pady=5, cursor="hand2",
-                activebackground=color, activeforeground=C_BG,
-            ).pack(side=tk.LEFT, padx=3)
+        ]):
+            self._make_button(btn_frame, label, color, cmd).grid(
+                row=0,
+                column=index,
+                sticky="ew",
+                padx=(0 if index == 0 else 6, 0 if index == 3 else 6),
+            )
 
-        tk.Frame(self.root, bg=C_SUBTEXT, height=1).pack(fill=tk.X)
+        tk.Frame(self.root, bg=C_BORDER, height=1).pack(fill=tk.X)
 
         tk.Label(
-            self.root, text="로그", fg=C_SUBTEXT, bg=C_BG,
-            font=("Segoe UI", 8), anchor="w", padx=14,
-        ).pack(fill=tk.X)
+            self.root,
+            text="터미널",
+            fg=C_SUBTEXT,
+            bg=C_BG,
+            font=("Segoe UI", 9, "bold"),
+            anchor="w",
+            padx=16,
+            pady=0,
+        ).pack(fill=tk.X, pady=(10, 6))
 
-        log_frame = tk.Frame(self.root, bg=C_SURFACE)
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        log_frame = tk.Frame(self.root, bg=C_BORDER)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
 
         self._log = scrolledtext.ScrolledText(
             log_frame,
             bg=C_SURFACE, fg=C_TEXT,
-            font=("Consolas", 9),
+            font=("Cascadia Mono", 9),
             insertbackground=C_TEXT,
             state=tk.DISABLED,
             wrap=tk.WORD,
             relief=tk.FLAT, borderwidth=0,
-            selectbackground="#313244",
+            padx=10,
+            pady=10,
+            selectbackground="#2b2d31",
         )
-        self._log.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self._log.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
 
         self._log.tag_config("error",   foreground=C_RED)
         self._log.tag_config("warning", foreground=C_YELLOW)
         self._log.tag_config("info",    foreground=C_BLUE)
-        self._log.tag_config("system",  foreground=C_SUBTEXT, font=("Consolas", 9, "italic"))
+        self._log.tag_config("success", foreground=C_GREEN)
+        self._log.tag_config("system",  foreground=C_SUBTEXT, font=("Cascadia Mono", 9, "italic"))
+
+    def _make_button(
+        self,
+        parent: tk.Misc,
+        label: str,
+        color: str,
+        command: callable,
+    ) -> tk.Button:
+        return tk.Button(
+            parent,
+            text=label,
+            command=command,
+            bg=color,
+            fg="#ffffff",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT,
+            padx=14,
+            pady=9,
+            cursor="hand2",
+            activebackground=color,
+            activeforeground="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+        )
 
     def _build_tray(self) -> None:
         icon_img = Image.open(ICON_PATH).convert("RGBA") if os.path.exists(ICON_PATH) else self._make_fallback_icon()
@@ -295,9 +388,9 @@ class LimpiLauncher:
         size = 64
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
-        draw.ellipse([2, 2, size - 2, size - 2], fill="#89b4fa")
-        draw.rectangle([18, 16, 28, 48], fill="#1e1e2e")
-        draw.rectangle([18, 40, 46, 48], fill="#1e1e2e")
+        draw.ellipse([2, 2, size - 2, size - 2], fill=C_BLUE)
+        draw.rectangle([18, 16, 28, 48], fill=C_BG)
+        draw.rectangle([18, 40, 46, 48], fill=C_BG)
         return img
 
     def _tray_show(self, _icon=None, _item=None) -> None:
@@ -314,6 +407,8 @@ class LimpiLauncher:
             tag = "error"
         elif "warning" in lo or "warn" in lo:
             tag = "warning"
+        elif "ready" in lo or "완료" in lo or "로그인" in lo:
+            tag = "success"
         elif " info " in line or line.startswith("INFO"):
             tag = "info"
         elif line.startswith("[시스템]"):
@@ -350,10 +445,11 @@ class LimpiLauncher:
                     fg=color,
                 )
         else:
-            self._dot.config(fg=C_RED)
-            self._status_label.config(text=" 중지됨", fg=C_RED)
-            self._uptime_label.config(text="  가동 시간: –")
-            self._metric_label.config(text="", fg=C_SUBTEXT)
+            self._dot.config(fg=C_IDLE)
+            self._status_label.config(text=" 대기 중", fg=C_SUBTEXT)
+            self._uptime_label.config(text="가동 시간: -")
+            self._start_time_label.config(text="시작: -")
+            self._metric_label.config(text="CPU: - / RAM: -", fg=C_SUBTEXT)
         self.root.after(1000, self._update_status)
 
     def _clear_log(self) -> None:
@@ -362,27 +458,33 @@ class LimpiLauncher:
         self._log.config(state=tk.DISABLED)
 
     def _on_start(self) -> None:
-        self._clear_log()
-        threading.Thread(
-            target=self.bot.start,
-            kwargs={"test_mode": False},
-            daemon=True,
-        ).start()
+        self._run_requested_mode(test_mode=False)
 
     def _on_start_test(self) -> None:
-        self._clear_log()
-        threading.Thread(
-            target=self.bot.restart,
-            kwargs={"test_mode": True},
-            daemon=True,
-        ).start()
+        self._run_requested_mode(test_mode=True)
 
     def _on_stop(self) -> None:
         threading.Thread(target=self.bot.stop, daemon=True).start()
 
     def _on_restart(self) -> None:
+        if not self.bot.is_running():
+            self._queue_log("[시스템] 재시작은 봇이 실행 중일 때만 사용할 수 있습니다.")
+            return
         self._clear_log()
         threading.Thread(target=self.bot.restart, daemon=True).start()
+
+    def _run_requested_mode(self, *, test_mode: bool) -> None:
+        if self.bot.is_running() and self.bot.test_mode == test_mode:
+            mode_text = "테스트 모드" if test_mode else "일반 모드"
+            self._queue_log(f"[시스템] 이미 {mode_text}로 실행 중입니다.")
+            return
+        self._clear_log()
+        target = self.bot.restart if self.bot.is_running() else self.bot.start
+        threading.Thread(
+            target=target,
+            kwargs={"test_mode": test_mode},
+            daemon=True,
+        ).start()
 
     def _hide_window(self) -> None:
         self.root.withdraw()

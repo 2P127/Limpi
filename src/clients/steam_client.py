@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from email.utils import parsedate_to_datetime
+import hashlib
 import html
 import json
 import logging
 import re
 from datetime import datetime, timezone
 from typing import Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+import xml.etree.ElementTree as ET
 
 import aiohttp
 
@@ -17,6 +20,7 @@ from ..core.models import NewsPost
 
 LOGGER = logging.getLogger(__name__)
 STEAM_NEWS_BASE_URL = "https://store.steampowered.com/news/app"
+STEAM_NEWS_FEED_BASE_URL = "https://store.steampowered.com/feeds/news/app"
 STEAM_REQUEST_TIMEOUT_SECONDS = 20
 STEAM_EVENT_MAX_ATTEMPTS = 3
 STEAM_EVENT_RETRY_BACKOFF_SECONDS = 2.0
@@ -76,7 +80,24 @@ class SteamNewsSource:
     ) -> list[NewsPost]:
         language = language or self.config.steam_language
         limit = limit or self.config.max_posts_per_poll
-        posts = await self._fetch_event_posts_with_retry(language)
+        try:
+            posts = await self._fetch_event_posts_with_retry(language)
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            TimeoutError,
+            RuntimeError,
+        ) as exc:
+            posts = await self._fetch_rss_posts(language, limit)
+            if posts:
+                LOGGER.info(
+                    "Steam event data unavailable; using RSS fallback "
+                    "(language=%s, reason=%s).",
+                    language,
+                    _short_exception(exc),
+                )
+            else:
+                raise RuntimeError("Steam RSS feed returned no usable posts.") from exc
         posts = _dedupe_posts_by_id(posts)
         return _sort_newest_first(posts)[:limit]
 
@@ -92,19 +113,19 @@ class SteamNewsSource:
                 RuntimeError,
             ) as exc:
                 last_error = exc
-                LOGGER.warning(
-                    "Steam 이벤트 데이터 요청 실패 (시도 %s/%s, language=%s): %s",
+                LOGGER.debug(
+                    "Steam event data request failed (attempt %s/%s, language=%s): %s",
                     attempt,
                     STEAM_EVENT_MAX_ATTEMPTS,
                     language,
-                    exc,
+                    _short_exception(exc),
                 )
             else:
                 if posts:
                     return posts
                 last_error = RuntimeError("Steam 이벤트 데이터가 비어 있습니다.")
-                LOGGER.warning(
-                    "Steam 이벤트 데이터가 비어 있습니다 (시도 %s/%s, language=%s).",
+                LOGGER.debug(
+                    "Steam event data was empty (attempt %s/%s, language=%s).",
                     attempt,
                     STEAM_EVENT_MAX_ATTEMPTS,
                     language,
@@ -130,7 +151,7 @@ class SteamNewsSource:
         ) as response:
             if response.status >= 400:
                 body = await response.text()
-                raise RuntimeError(f"Steam news hub request failed ({response.status}): {body[:500]}")
+                _raise_response_error(response, body)
             body = await response.text()
 
         data = _extract_initial_events(body)
@@ -148,6 +169,88 @@ class SteamNewsSource:
                 posts.append(post)
 
         return posts
+
+    async def _fetch_rss_posts(self, language: str, limit: int) -> list[NewsPost]:
+        url = self._rss_feed_url(language)
+        headers = {
+            "Accept": "application/rss+xml,application/xml;q=0.9,text/xml;q=0.8",
+            "Accept-Language": _accept_language_header(language),
+            "User-Agent": "Limpi Discord Bot (Steam news RSS fallback)",
+        }
+        async with self.session.get(
+            url,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=STEAM_REQUEST_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status >= 400:
+                body = await response.text()
+                _raise_response_error(response, body)
+            body = await response.text()
+
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            raise RuntimeError(f"Steam RSS feed parse failed: {exc}") from exc
+
+        channel = root.find("channel")
+        if channel is None:
+            return []
+
+        posts: list[NewsPost] = []
+        for item in channel.findall("item"):
+            post = self._rss_item_to_post(item, language, url)
+            if post is None:
+                continue
+            posts.append(post)
+            if len(posts) >= limit:
+                break
+        return posts
+
+    def _rss_item_to_post(
+        self,
+        item: ET.Element,
+        language: str,
+        source_url: str,
+    ) -> NewsPost | None:
+        title = _xml_child_text(item, "title")
+        description = _xml_child_text(item, "description")
+        url = _xml_child_text(item, "link") or _xml_child_text(item, "guid")
+        guid = _xml_child_text(item, "guid")
+        if not url:
+            return None
+
+        post_key = _steam_news_post_id_from_url(url) or _steam_news_post_id_from_url(guid)
+        if post_key is None:
+            post_key = _stable_post_key(url or guid or title)
+
+        image_urls = _dedupe_urls([
+            *_extract_html_image_urls(description),
+            *_rss_enclosure_urls(item),
+        ])
+        youtube_urls = _extract_youtube_urls(description)
+        text = format_steam_news_for_discord(description)
+        if not text:
+            text = title or url
+
+        raw = {
+            "source": "steam_rss",
+            "source_url": source_url,
+            "language": language,
+            "guid": guid,
+            "link": url,
+            "youtube_urls": youtube_urls,
+            "thumbnail_url": image_urls[0] if image_urls else None,
+        }
+        return NewsPost(
+            post_id=_language_post_id(language, post_key),
+            source_user="Limbus Company Steam News",
+            url=url,
+            text=text,
+            title=_title_from_text(title, fallback=text or post_key),
+            created_at=_datetime_from_rfc2822(_xml_child_text(item, "pubDate")),
+            image_urls=image_urls,
+            raw=raw,
+        )
 
     def _event_to_post(self, event: dict, language: str) -> NewsPost | None:
         gid = str(event.get("gid") or "")
@@ -210,7 +313,19 @@ class SteamNewsSource:
 
     def _app_news_url(self, language: str | None = None) -> str:
         language = language or self.config.steam_language
-        return f"{STEAM_NEWS_BASE_URL}/{self.config.steam_app_id}/?l={language}"
+        if self.config.steam_news_url:
+            return _url_with_query_values(
+                self.config.steam_news_url,
+                {"l": language, "cc": self.config.steam_country},
+            )
+        return (
+            f"{STEAM_NEWS_BASE_URL}/{self.config.steam_app_id}/?"
+            f"{urlencode({'l': language, 'cc': self.config.steam_country})}"
+        )
+
+    def _rss_feed_url(self, language: str) -> str:
+        query = {"cc": self.config.steam_country, "l": language}
+        return f"{STEAM_NEWS_FEED_BASE_URL}/{self.config.steam_app_id}/?{urlencode(query)}"
 
     def _event_url(self, gid: str, clan_steam_id: str, language: str) -> str:
         query = {"l": language}
@@ -259,12 +374,97 @@ def _language_post_id(language: str, post_id: str) -> str:
     return f"steam:{language}:{post_id}"
 
 
+def _steam_news_post_id_from_url(url: str) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if (
+        len(parts) >= 5
+        and parts[0].lower() == "news"
+        and parts[1].lower() == "app"
+        and parts[3].lower() == "view"
+        and parts[4]
+    ):
+        return parts[4]
+    emgid = parse_qs(parsed.query).get("emgid")
+    if emgid:
+        return emgid[0]
+    return None
+
+
+def _stable_post_key(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return "unknown"
+    digest = hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()
+    return f"rss:{digest[:20]}"
+
+
+def _url_with_query_values(url: str, values: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    for key, value in values.items():
+        if value:
+            query[key] = value
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _short_exception(exc: BaseException) -> str:
+    if isinstance(exc, aiohttp.ClientResponseError):
+        detail = f"HTTP {exc.status}"
+        if exc.message:
+            detail = f"{detail} {exc.message}"
+        return detail.strip()
+
+    text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > 160:
+        text = f"{text[:157]}..."
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _raise_response_error(response: aiohttp.ClientResponse, body: str) -> None:
+    message = response.reason or "HTTP error"
+    title = _html_title(body)
+    if title and title.lower() not in message.lower():
+        message = f"{message}: {title}"
+    raise aiohttp.ClientResponseError(
+        response.request_info,
+        response.history,
+        status=response.status,
+        message=message,
+        headers=response.headers,
+    )
+
+
+def _html_title(value: str) -> str:
+    match = re.search(r"<title[^>]*>(.*?)</title>", value, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return ""
+    title = html.unescape(_strip_html_tags(match.group(1))).strip()
+    title = re.sub(r"\s+", " ", title)
+    return title[:120]
+
+
 def _title_from_text(text: str, fallback: str) -> str:
     for line in text.splitlines():
         line = line.strip()
         if line:
             return line[:256]
     return fallback[:256]
+
+
+def _datetime_from_rfc2822(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        moment = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
 
 
 def _datetime_from_unix(value: object) -> datetime | None:
@@ -348,6 +548,39 @@ def _html_to_discord_markdown(value: str) -> str:
 
 def _strip_html_tags(value: str) -> str:
     return re.sub(r"<[^>]+>", "", html.unescape(value))
+
+
+def _extract_html_image_urls(value: str | None) -> list[str]:
+    if not value:
+        return []
+    urls: list[str] = []
+    decoded = html.unescape(value)
+    for match in re.finditer(r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"']", decoded, re.IGNORECASE):
+        url = match.group(1).strip()
+        if not url:
+            continue
+        urls.append(_normalize_steam_image_url(url, ""))
+    return urls
+
+
+def _rss_enclosure_urls(item: ET.Element) -> list[str]:
+    urls: list[str] = []
+    for enclosure in item.findall("enclosure"):
+        url = str(enclosure.attrib.get("url") or "").strip()
+        if not url:
+            continue
+        media_type = str(enclosure.attrib.get("type") or "").lower()
+        if media_type and not media_type.startswith("image/"):
+            continue
+        urls.append(_normalize_steam_image_url(url, ""))
+    return urls
+
+
+def _xml_child_text(item: ET.Element, tag: str) -> str:
+    child = item.find(tag)
+    if child is None or child.text is None:
+        return ""
+    return child.text.strip()
 
 
 def _steam_bbcode_to_discord_markdown(value: str) -> str:

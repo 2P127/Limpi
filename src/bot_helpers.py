@@ -35,6 +35,7 @@ from .clients.youtube_client import (
 )
 from .core.models import (
     GuildChzzkTarget,
+    GuildHampangTarget,
     GuildNewsTarget,
     GuildYoutubeTarget,
     GuildYoutubeUploadTarget,
@@ -1257,6 +1258,26 @@ def _format_youtube_upload_target(
         f"채널: <#{target.channel_id}>\n"
         f"역할 핑: {role_text}\n"
         f"최근 일반 영상 기준선: {target.last_video_id or '없음'}"
+    )
+
+
+def _format_hampang_target(target: GuildHampangTarget | None, role_id: int | None) -> str:
+    role_text = f"<@&{role_id}>" if role_id else "없음"
+    if target is None:
+        return (
+            "자동 알림: 미설정\n"
+            "채널: 미설정\n"
+            f"역할 핑: {role_text}\n"
+            "최근 X 기준선: 없음\n"
+            "최근 YouTube 기준선: 없음"
+        )
+
+    return (
+        f"자동 알림: {_bool_label(target.enabled)}\n"
+        f"채널: <#{target.channel_id}>\n"
+        f"역할 핑: {role_text}\n"
+        f"최근 X 기준선: {target.last_x_post_id or '없음'}\n"
+        f"최근 YouTube 기준선: {target.last_youtube_video_id or '없음'}"
     )
 
 
@@ -2645,6 +2666,7 @@ __all__ = [
     "_format_chzzk_target",
     "_format_youtube_target",
     "_format_youtube_upload_target",
+    "_format_hampang_target",
     "_is_hampang_youtube_upload",
     "_regular_youtube_uploads",
     "_sort_twitter_posts_newest_first",

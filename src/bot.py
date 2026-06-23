@@ -39,6 +39,7 @@ from .clients.chzzk_client import (
 from .core.config import AppConfig, BOT_VERSION
 from .core.models import (
     GuildChzzkTarget,
+    GuildHampangTarget,
     GuildNewsTarget,
     GuildSettings,
     GuildYoutubeTarget,
@@ -83,6 +84,168 @@ from .bot_views import (
 LOGGER = logging.getLogger(__name__)
 
 
+def _log_text(value: object | None, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    return re.sub(r"\s+", " ", text)
+
+
+def _log_value(value: object | None, fallback: str = "-", max_length: int = 160) -> str:
+    text = _log_text(value, fallback)
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 3]}..."
+
+
+def _is_subcommand_option(option: dict[str, object]) -> bool:
+    return option.get("type") in {1, 2, "1", "2"}
+
+
+def _app_command_path(data: dict[str, object]) -> str:
+    names = [_log_value(data.get("name"), "unknown", 80)]
+    options = data.get("options")
+    while isinstance(options, list):
+        command_option = next(
+            (
+                option
+                for option in options
+                if isinstance(option, dict) and _is_subcommand_option(option)
+            ),
+            None,
+        )
+        if command_option is None:
+            break
+        names.append(_log_value(command_option.get("name"), "unknown", 80))
+        options = command_option.get("options")
+    return " ".join(name for name in names if name)
+
+
+def _format_app_command_options(data: dict[str, object]) -> str:
+    parts: list[str] = []
+
+    def walk(options: object) -> None:
+        if not isinstance(options, list):
+            return
+        for option in options:
+            if not isinstance(option, dict):
+                continue
+            nested_options = option.get("options")
+            if _is_subcommand_option(option):
+                walk(nested_options)
+                continue
+            if "value" in option:
+                name = _log_value(option.get("name"), "unknown", 80)
+                value = _log_value(option.get("value"), "none")
+                parts.append(f"{name}={value}")
+            else:
+                walk(nested_options)
+
+    walk(data.get("options"))
+    return " ".join(parts)
+
+
+def _format_command_invocation(command_name: str, data: dict[str, object]) -> str:
+    command = _log_value(command_name, "unknown", 120)
+    options = _format_app_command_options(data)
+    return f"/{command} {options}" if options else f"/{command}"
+
+
+def _format_user_for_log(user: object) -> str:
+    return (
+        f"닉네임={_log_value(getattr(user, 'nick', None))} | "
+        f"유저명={_log_value(getattr(user, 'name', None))} | "
+        f"글로벌명={_log_value(getattr(user, 'global_name', None))} | "
+        f"표시명={_log_value(getattr(user, 'display_name', None))} | "
+        f"유저태그={_log_value(user)} | "
+        f"유저ID={_log_value(getattr(user, 'id', None))}"
+    )
+
+
+def _format_guild_for_log(
+    guild: discord.Guild | discord.Object | None,
+    guild_id: int | str | None = None,
+) -> str:
+    resolved_id = guild_id or getattr(guild, "id", None)
+    if guild is None and resolved_id is None:
+        return "서버=DM (ID: DM, 멤버 수: -, 소유자 ID: -)"
+
+    guild_name = _log_value(getattr(guild, "name", None), "알 수 없음", 120)
+    member_count = _log_value(getattr(guild, "member_count", None))
+    owner_id = _log_value(getattr(guild, "owner_id", None))
+    suffix = ""
+    if bool(getattr(guild, "unavailable", False)):
+        suffix = ", 상태: unavailable"
+    return (
+        f"서버={guild_name} "
+        f"(ID: {_log_value(resolved_id, 'unknown')}, 멤버 수: {member_count}, 소유자 ID: {owner_id}{suffix})"
+    )
+
+
+def _format_channel_for_log(channel: object | None, channel_id: int | str | None) -> str:
+    resolved_id = channel_id or getattr(channel, "id", None)
+    if channel is None and resolved_id is None:
+        return "채널=DM (ID: DM)"
+    channel_name = _log_value(
+        getattr(channel, "name", None) or (str(channel) if channel is not None else None),
+        "알 수 없음",
+        120,
+    )
+    return f"채널={channel_name} (ID: {_log_value(resolved_id, 'unknown')})"
+
+
+async def _resolve_interaction_guild_for_log(
+    interaction: discord.Interaction,
+) -> discord.Guild | discord.Object | None:
+    guild = interaction.guild
+    if _log_text(getattr(guild, "name", None), ""):
+        return guild
+
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        return guild
+
+    client = getattr(interaction, "client", None)
+    get_guild = getattr(client, "get_guild", None)
+    if callable(get_guild):
+        cached_guild = get_guild(guild_id)
+        if cached_guild is not None:
+            guild = cached_guild
+            if _log_text(getattr(cached_guild, "name", None), ""):
+                return cached_guild
+
+    fetch_guild = getattr(client, "fetch_guild", None)
+    if callable(fetch_guild):
+        try:
+            fetched_guild = await fetch_guild(guild_id)
+        except Exception:
+            return guild
+        if fetched_guild is not None:
+            return fetched_guild
+    return guild
+
+
+async def _log_app_command_usage(
+    interaction: discord.Interaction,
+    data: dict[str, object],
+    command_name: str,
+    status: str,
+    elapsed: float,
+) -> None:
+    guild = await _resolve_interaction_guild_for_log(interaction)
+    LOGGER.info(
+        "명령어 사용: %s | %s | %s | %s | 결과=%s | 소요시간=%.3f초",
+        _format_command_invocation(command_name, data),
+        _format_user_for_log(interaction.user),
+        _format_guild_for_log(guild, interaction.guild_id),
+        _format_channel_for_log(interaction.channel, getattr(interaction, "channel_id", None)),
+        status,
+        elapsed,
+    )
+
+
 class LoggingCommandTree(app_commands.CommandTree):
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -95,7 +258,7 @@ class LoggingCommandTree(app_commands.CommandTree):
 
         started_at = perf_counter()
         data = interaction.data if isinstance(interaction.data, dict) else {}
-        command_name = str(data.get("name") or "unknown")
+        command_name = _app_command_path(data)
         status = "completed"
         now = perf_counter()
         user_id = interaction.user.id
@@ -108,6 +271,13 @@ class LoggingCommandTree(app_commands.CommandTree):
                     f"명령어는 3초에 한 번만 사용할 수 있어요. {remaining:.1f}초 뒤 다시 시도해주세요.",
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await _log_app_command_usage(
+                    interaction,
+                    data,
+                    command_name,
+                    status,
+                    perf_counter() - started_at,
                 )
                 return
 
@@ -125,18 +295,7 @@ class LoggingCommandTree(app_commands.CommandTree):
             raise
         finally:
             elapsed = perf_counter() - started_at
-            user = interaction.user
-            guild = interaction.guild
-            LOGGER.info(
-                "명령어 %s — 사용자: %s (%s), 서버: %s (%s), 결과: %s, 소요시간: %.3f초.",
-                command_name,
-                user,
-                user.id,
-                guild.name if guild else "DM",
-                interaction.guild_id or "DM",
-                status,
-                elapsed,
-            )
+            await _log_app_command_usage(interaction, data, command_name, status, elapsed)
 
     def _prune_user_command_cooldowns(self, now: float) -> None:
         if len(self._user_command_cooldowns) < 1000:
@@ -356,6 +515,8 @@ class NewsCog(commands.Cog):
         self._chzzk_recovery_baseline_pending = False
         self._youtube_recovery_baseline_pending = False
         self._youtube_upload_recovery_baseline_pending = False
+        self._hampang_x_recovery_baseline_pending = False
+        self._hampang_youtube_recovery_baseline_pending = False
         self._in_high_frequency_window: bool = False
         self._in_twitter_tracking_window: bool = False
         self._presence_show_servers: bool = True
@@ -416,13 +577,17 @@ class NewsCog(commands.Cog):
             self._presence_show_servers = not self._presence_show_servers
 
     def log_startup_summary(self) -> None:
-        connected_guild_ids = {guild.id for guild in self.bot.guilds}
+        connected_guilds = sorted(self.bot.guilds, key=lambda item: item.id)
+        connected_guild_ids = {guild.id for guild in connected_guilds}
+        LOGGER.info("참여 서버 수: %s", len(connected_guilds))
+        for guild in connected_guilds:
+            LOGGER.info("참여 서버: %s", _format_guild_for_log(guild, guild.id))
         LOGGER.info(
             "연결된 서버 요약: count=%s guilds=%s",
-            len(self.bot.guilds),
+            len(connected_guilds),
             ", ".join(
-                f"{guild.name} ({guild.id})"
-                for guild in sorted(self.bot.guilds, key=lambda item: item.id)
+                f"{_log_value(getattr(guild, 'name', None), '알 수 없음', 120)} ({guild.id})"
+                for guild in connected_guilds
             )
             or "none",
         )
@@ -446,13 +611,13 @@ class NewsCog(commands.Cog):
 
         for settings in notification_settings:
             guild = self.bot.get_guild(settings.guild_id)
-            guild_name = guild.name if guild else "not connected"
+            guild_name = _log_value(getattr(guild, "name", None), "연결 안 됨", 120)
             channel = self.bot.get_channel(settings.channel_id) if settings.channel_id else None
-            channel_name = getattr(channel, "name", None) or "unknown"
+            channel_name = _log_value(getattr(channel, "name", None), "알 수 없음", 120)
             role_name = "none"
             if guild is not None and settings.role_id is not None:
                 role = guild.get_role(settings.role_id)
-                role_name = role.name if role else "unknown"
+                role_name = _log_value(getattr(role, "name", None), "알 수 없음", 120)
 
             LOGGER.info(
                 "알림 대상: guild=%s (%s), connected=%s, "
@@ -479,9 +644,9 @@ class NewsCog(commands.Cog):
             channel = self.bot.get_channel(target.channel_id)
             LOGGER.info(
                 "뉴스 언어별 대상: guild=%s (%s), channel=%s (%s), language=%s",
-                guild.name if guild else "not connected",
+                _log_value(getattr(guild, "name", None), "연결 안 됨", 120),
                 target.guild_id,
-                getattr(channel, "name", None) or "unknown",
+                _log_value(getattr(channel, "name", None), "알 수 없음", 120),
                 target.channel_id,
                 target.language,
             )
@@ -555,7 +720,27 @@ class NewsCog(commands.Cog):
                 if not self._should_poll_twitter_now(now):
                     return
                 self._last_twitter_poll_at = now
-                await self._poll_twitter_once()
+                twitter_result, hampang_result = await asyncio.gather(
+                    self._poll_twitter_once(),
+                    self._poll_hampang_news_once(),
+                    return_exceptions=True,
+                )
+                if isinstance(twitter_result, Exception):
+                    raise twitter_result
+                if isinstance(hampang_result, Exception):
+                    self._hampang_x_recovery_baseline_pending = True
+                    self._hampang_youtube_recovery_baseline_pending = True
+                    if _is_internet_exception(hampang_result):
+                        _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", hampang_result)
+                    else:
+                        LOGGER.exception(
+                            "햄햄팡팡 소식 자동 확인 실패.",
+                            exc_info=(
+                                type(hampang_result),
+                                hampang_result,
+                                hampang_result.__traceback__,
+                            ),
+                        )
             except XClientError as exc:
                 self._twitter_recovery_baseline_pending = True
                 if _is_internet_exception(exc):
@@ -4177,6 +4362,195 @@ class NewsCog(commands.Cog):
             announced += result
         return announced
 
+    async def _poll_hampang_news_once(self) -> int:
+        targets = self.storage.list_hampang_targets()
+        if not targets:
+            return 0
+
+        (
+            x_posts,
+            youtube_uploads,
+            x_failed,
+            youtube_failed,
+        ) = await self._fetch_hampang_news_sources_detailed()
+        if x_failed:
+            self._hampang_x_recovery_baseline_pending = True
+        if youtube_failed:
+            self._hampang_youtube_recovery_baseline_pending = True
+        if not x_posts and not youtube_uploads:
+            return 0
+
+        latest_x_post_id = x_posts[0].post_id if x_posts else None
+        latest_youtube_video_id = youtube_uploads[0].video_id if youtube_uploads else None
+        x_ids = [post.post_id for post in x_posts]
+        youtube_ids = [upload.video_id for upload in youtube_uploads]
+        x_baseline_only = self._hampang_x_recovery_baseline_pending and latest_x_post_id is not None
+        youtube_baseline_only = (
+            self._hampang_youtube_recovery_baseline_pending
+            and latest_youtube_video_id is not None
+        )
+        max_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
+        send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
+
+        async def process_target(target: GuildHampangTarget) -> int:
+            if not target.enabled:
+                return 0
+
+            baseline_x_id: str | None = None
+            baseline_youtube_id: str | None = None
+            new_x_posts: list[TwitterPost] = []
+            new_youtube_uploads: list[YoutubeUpload] = []
+
+            if x_posts and latest_x_post_id is not None:
+                if x_baseline_only:
+                    baseline_x_id = latest_x_post_id
+                elif not target.last_x_post_id or target.last_x_post_id not in x_ids:
+                    baseline_x_id = latest_x_post_id
+                    LOGGER.info(
+                        "햄햄팡팡 X 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
+                        "(guild_id=%s, post_id=%s).",
+                        target.guild_id,
+                        latest_x_post_id,
+                    )
+                else:
+                    last_seen_index = x_ids.index(target.last_x_post_id)
+                    new_x_posts = list(reversed(x_posts[:last_seen_index]))
+                    if max_age > 0:
+                        new_x_posts = [
+                            post for post in new_x_posts
+                            if _is_twitter_post_recent(post, max_age)
+                        ]
+
+            if youtube_uploads and latest_youtube_video_id is not None:
+                if youtube_baseline_only:
+                    baseline_youtube_id = latest_youtube_video_id
+                elif (
+                    not target.last_youtube_video_id
+                    or target.last_youtube_video_id not in youtube_ids
+                ):
+                    baseline_youtube_id = latest_youtube_video_id
+                    LOGGER.info(
+                        "햄햄팡팡 YouTube 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
+                        "(guild_id=%s, video_id=%s).",
+                        target.guild_id,
+                        latest_youtube_video_id,
+                    )
+                else:
+                    last_seen_index = youtube_ids.index(target.last_youtube_video_id)
+                    new_youtube_uploads = list(reversed(youtube_uploads[:last_seen_index]))
+
+            if baseline_x_id is not None or baseline_youtube_id is not None:
+                self.storage.mark_hampang_target_seen(
+                    target.guild_id,
+                    x_post_id=baseline_x_id,
+                    youtube_video_id=baseline_youtube_id,
+                )
+
+            items = _hampang_news_items(
+                new_x_posts,
+                new_youtube_uploads,
+                newest_first=False,
+            )
+            if not items:
+                return 0
+
+            async with send_semaphore:
+                channel = await self._resolve_hampang_target_channel(target)
+                if channel is None:
+                    return 0
+
+                settings = self.storage.get_settings(target.guild_id)
+                announced = 0
+                image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(
+                    new_x_posts
+                )
+                for source, item in items:
+                    role_id = settings.role_id if announced == 0 else None
+                    try:
+                        if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
+                            message = await self._send_twitter_post_to_channel(
+                                channel,
+                                item,
+                                role_id=role_id,
+                                batch_tasks=image_batches_by_post_id.get(item.post_id),
+                            )
+                            self.storage.mark_hampang_target_seen(
+                                target.guild_id,
+                                x_post_id=item.post_id,
+                            )
+                            LOGGER.info(
+                                "새 햄햄팡팡 X 소식 공지 (guild %s, channel %s): %s",
+                                target.guild_id,
+                                target.channel_id,
+                                item.title,
+                            )
+                        elif source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
+                            message = await self._send_hampang_youtube_upload_to_channel(
+                                channel,
+                                item,
+                                role_id=role_id,
+                            )
+                            self.storage.mark_hampang_target_seen(
+                                target.guild_id,
+                                youtube_video_id=item.video_id,
+                            )
+                            LOGGER.info(
+                                "새 햄햄팡팡 YouTube 소식 공지 (guild %s, channel %s): %s",
+                                target.guild_id,
+                                target.channel_id,
+                                item.title,
+                            )
+                        else:
+                            continue
+                    except discord.HTTPException:
+                        LOGGER.exception(
+                            "햄햄팡팡 소식 자동 전송 실패 "
+                            "(guild_id=%s, channel_id=%s, source=%s).",
+                            target.guild_id,
+                            target.channel_id,
+                            source,
+                        )
+                        break
+
+                    await self._track_manual_message(target.guild_id, target.channel_id, message)
+                    announced += 1
+                return announced
+
+        announced = 0
+        results = await asyncio.gather(
+            *(asyncio.create_task(process_target(target)) for target in targets),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.error(
+                    "햄햄팡팡 소식 자동 전송 대상 처리 실패.",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                continue
+            announced += result
+
+        if x_baseline_only:
+            self._hampang_x_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 햄햄팡팡 X 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
+                "(post_id=%s, targets=%s).",
+                latest_x_post_id,
+                len(targets),
+            )
+        if youtube_baseline_only:
+            self._hampang_youtube_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 햄햄팡팡 YouTube 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
+                "(video_id=%s, targets=%s).",
+                latest_youtube_video_id,
+                len(targets),
+            )
+        return announced
+
     async def _refresh_steam_cache_for_twitter_links(
         self,
         twitter_posts: list[TwitterPost],
@@ -4511,27 +4885,36 @@ class NewsCog(commands.Cog):
     async def _fetch_hampang_news_sources(
         self,
     ) -> tuple[list[TwitterPost], list[YoutubeUpload], bool]:
+        x_posts, youtube_uploads, x_failed, youtube_failed = (
+            await self._fetch_hampang_news_sources_detailed()
+        )
+        return x_posts, youtube_uploads, x_failed or youtube_failed
+
+    async def _fetch_hampang_news_sources_detailed(
+        self,
+    ) -> tuple[list[TwitterPost], list[YoutubeUpload], bool, bool]:
         x_result, youtube_result = await asyncio.gather(
             self.hampang_x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT),
             self.youtube_client.fetch_recent_uploads(),
             return_exceptions=True,
         )
-        had_failure = False
+        x_failed = False
+        youtube_failed = False
         x_posts: list[TwitterPost] = []
         youtube_uploads: list[YoutubeUpload] = []
 
         if isinstance(x_result, Exception):
-            had_failure = True
+            x_failed = True
             if _is_internet_exception(x_result):
                 _log_internet_exception("햄햄팡팡 공식 X 확인 실패", x_result)
             else:
                 LOGGER.warning("햄햄팡팡 공식 X 확인 실패: %s", x_result)
         else:
             x_posts = _sort_twitter_posts_newest_first(x_result)
-            had_failure = self.hampang_x_source.last_fetch_had_upstream_failure
+            x_failed = self.hampang_x_source.last_fetch_had_upstream_failure
 
         if isinstance(youtube_result, Exception):
-            had_failure = True
+            youtube_failed = True
             if _is_internet_exception(youtube_result):
                 _log_internet_exception("햄햄팡팡 YouTube 영상 확인 실패", youtube_result)
             else:
@@ -4543,7 +4926,7 @@ class NewsCog(commands.Cog):
                     if _is_hampang_youtube_upload(upload)
                 ]
             )
-        return x_posts, youtube_uploads, had_failure
+        return x_posts, youtube_uploads, x_failed, youtube_failed
 
     async def _resolve_chzzk_target_channel(
         self, target: GuildChzzkTarget
@@ -4739,6 +5122,31 @@ class NewsCog(commands.Cog):
             except discord.HTTPException:
                 LOGGER.exception(
                     "X 게시물 자동 전송 채널 조회 실패 (guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+        return channel if isinstance(channel, discord.abc.Messageable) else None
+
+    async def _resolve_hampang_target_channel(
+        self, target: GuildHampangTarget
+    ) -> discord.abc.Messageable | None:
+        channel = self.bot.get_channel(target.channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(target.channel_id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning(
+                    "햄햄팡팡 소식 자동 전송 건너뜀: 채널 접근 불가 "
+                    "(guild_id=%s, channel_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                )
+                return None
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "햄햄팡팡 소식 자동 전송 채널 조회 실패 "
+                    "(guild_id=%s, channel_id=%s).",
                     target.guild_id,
                     target.channel_id,
                 )
@@ -5432,6 +5840,11 @@ class NewsCog(commands.Cog):
     ) -> discord.TextChannel | None:
         if channel is not None:
             return channel
+        current = self.storage.get_hampang_target(interaction.guild_id)
+        if current is not None:
+            resolved = await self._resolve_hampang_target_channel(current)
+            if isinstance(resolved, discord.TextChannel):
+                return resolved
         settings = self.storage.get_settings(interaction.guild_id)
         if settings.channel_id is not None:
             resolved = await self._resolve_target_channel(None, settings.channel_id)
@@ -5613,6 +6026,145 @@ class NewsCog(commands.Cog):
         channel_mention = getattr(target_channel, "mention", f"<#{channel_id}>")
         await interaction.followup.send(
             f"{channel_mention}에 선택한 햄햄팡팡 소식을 보냈어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="햄팡소식알림설정", description="햄햄팡팡 공식 X와 관련 YouTube 소식 자동 알림을 설정합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(enabled="허용", channel="채널")
+    @app_commands.describe(
+        enabled="햄햄팡팡 소식 자동 알림을 켜거나 끕니다.",
+        channel="알림 채널입니다. 비워두면 기존 햄팡 알림 채널, /서버설정 채널, 현재 채널 순서로 사용합니다.",
+    )
+    @app_commands.choices(enabled=BOOLEAN_CHOICES)
+    async def configure_hampang_news_notifications(
+        self,
+        interaction: discord.Interaction,
+        enabled: app_commands.Choice[str],
+        channel: discord.TextChannel | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_channel = await self._resolve_hampang_config_channel(interaction, channel)
+        if target_channel is None:
+            await interaction.followup.send(
+                "햄햄팡팡 소식 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+
+        enabled_value = _choice_bool(enabled, False)
+        latest_x_post: TwitterPost | None = None
+        latest_youtube_upload: YoutubeUpload | None = None
+        x_failed = False
+        youtube_failed = False
+        if enabled_value:
+            (
+                x_posts,
+                youtube_uploads,
+                x_failed,
+                youtube_failed,
+            ) = await self._fetch_hampang_news_sources_detailed()
+            latest_x_post = x_posts[0] if x_posts else None
+            latest_youtube_upload = youtube_uploads[0] if youtube_uploads else None
+            if x_failed or latest_x_post is None:
+                self._hampang_x_recovery_baseline_pending = True
+            if youtube_failed or latest_youtube_upload is None:
+                self._hampang_youtube_recovery_baseline_pending = True
+
+        target = self.storage.upsert_hampang_target(
+            interaction.guild_id,
+            channel_id=target_channel.id,
+            enabled=bool(enabled_value),
+            last_x_post_id=latest_x_post.post_id if latest_x_post is not None else None,
+            last_youtube_video_id=(
+                latest_youtube_upload.video_id if latest_youtube_upload is not None else None
+            ),
+        )
+
+        lines = [
+            f"햄햄팡팡 소식 자동 알림: {_bool_label(target.enabled)}",
+            f"채널: <#{target.channel_id}>",
+            f"추적 시간대: X 게시물 추적 시간대와 동일 (KST {_format_windows_label(self.config.twitter_tracking_windows_kst)})",
+        ]
+        if latest_x_post is not None:
+            lines.append(f"현재 X 기준선: {latest_x_post.title}")
+        elif enabled_value and x_failed:
+            lines.append("현재 X 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다.")
+        elif enabled_value:
+            lines.append("최근 X 소식을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다.")
+        if latest_youtube_upload is not None:
+            lines.append(f"현재 YouTube 기준선: {latest_youtube_upload.title}")
+        elif enabled_value and youtube_failed:
+            lines.append("현재 YouTube 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다.")
+        elif enabled_value:
+            lines.append("최근 햄햄팡팡 YouTube 영상을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다.")
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="햄햄팡팡 소식 알림 설정이 완료되었어요",
+                description="\n".join(lines),
+                color=_success_embed_color(),
+            ),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="햄팡소식알림해제", description="햄햄팡팡 소식 자동 알림 설정을 해제합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def remove_hampang_news_notifications(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 설정할 수 있어요.", ephemeral=True)
+            return
+
+        removed = self.storage.delete_hampang_target(interaction.guild_id)
+        await interaction.response.send_message(
+            "햄햄팡팡 소식 자동 알림 설정을 해제했어요."
+            if removed
+            else "이 서버에는 햄햄팡팡 소식 자동 알림 설정이 없어요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="햄팡소식알림현황보기", description="햄햄팡팡 소식 자동 알림 현황을 확인합니다.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    async def hampang_news_notification_status(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서만 사용할 수 있어요.", ephemeral=True)
+            return
+
+        target = self.storage.get_hampang_target(interaction.guild_id)
+        settings = self.storage.get_settings(interaction.guild_id)
+        embed = discord.Embed(
+            title="햄햄팡팡 소식 알림 현황",
+            description=(
+                _format_hampang_target(target, settings.role_id)
+                + "\n\n"
+                f"추적 시간대: X 게시물 추적 시간대와 동일 (KST {_format_windows_label(self.config.twitter_tracking_windows_kst)})"
+            ),
+            color=_success_embed_color(),
+        )
+        await interaction.response.send_message(
+            embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
@@ -6881,7 +7433,7 @@ class NewsCog(commands.Cog):
                 "치지직 알림: 미설정\n"
                 "유튜브 알림: 미설정\n"
                 "유튜브 일반 영상 업로드 알림: 미설정\n"
-                "햄햄팡팡 소식: 수동 조회 전용\n"
+                "햄햄팡팡 소식 알림: 미설정\n"
                 "점검 알림: 꺼짐"
             ),
             color=_success_embed_color(),
@@ -6909,6 +7461,7 @@ class NewsCog(commands.Cog):
         chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
         youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         youtube_upload_target = self.storage.get_youtube_upload_target(interaction.guild_id)
+        hampang_target = self.storage.get_hampang_target(interaction.guild_id)
         try:
             live = await self.chzzk_client.fetch_live()
         except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
@@ -6986,11 +7539,7 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="햄햄팡팡 소식",
-            value=(
-                "자동 알림: 사용 안 함\n"
-                "`/햄팡최근소식보기`로 최신 소식을 확인하고, "
-                "`/햄팡소식보내기`로 원하는 채널에 전송할 수 있어요."
-            ),
+            value=_format_hampang_target(hampang_target, settings.role_id),
             inline=False,
         )
 
@@ -7242,10 +7791,12 @@ class NewsCog(commands.Cog):
                 "> `/유튜브알림해제` — 일반 영상 업로드 알림 해제\n"
                 "> `/유튜브알림현황보기` — 최근 일반 영상과 알림 현황 보기\n"
                 "> `/유튜브알림보내기` — 최근 일반 영상을 지정 채널에 전송\n"
+                "> `/햄팡소식알림설정` — 햄햄팡팡 자동 소식 알림 설정\n"
+                "> `/햄팡소식알림해제` — 햄햄팡팡 자동 소식 알림 해제\n"
+                "> `/햄팡소식알림현황보기` — 햄햄팡팡 자동 소식 알림 현황 보기\n"
                 "> `/햄팡최근소식보기` — 최신 햄햄팡팡 소식 확인\n"
                 "> `/햄팡이전소식보기` — 최근 수집한 햄햄팡팡 소식을 골라서 확인\n"
-                "> `/햄팡소식보내기` — 햄햄팡팡 소식을 골라서 채널에 전송\n"
-                "-# 햄햄팡팡 소식은 자동 알림 없이 사용자가 원할 때만 조회합니다."
+                "> `/햄팡소식보내기` — 햄햄팡팡 소식을 골라서 채널에 전송"
             )
         )
         container.add_item(discord.ui.Separator())
