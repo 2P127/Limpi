@@ -18,6 +18,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable, Mapping
@@ -351,6 +352,80 @@ def _log_value(value: object | None, fallback: str = "-", max_length: int = 160)
     if len(text) <= max_length:
         return text
     return f"{text[: max_length - 3]}..."
+
+
+class _ScriptContentParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scripts: list[tuple[dict[str, str], str]] = []
+        self._script_attrs: dict[str, str] | None = None
+        self._script_chunks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "script":
+            return
+        self._script_attrs = {
+            name.casefold(): value or ""
+            for name, value in attrs
+        }
+        self._script_chunks = []
+
+    def handle_data(self, data: str) -> None:
+        if self._script_attrs is not None:
+            self._script_chunks.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() != "script" or self._script_attrs is None:
+            return
+        self.scripts.append((self._script_attrs, "".join(self._script_chunks)))
+        self._script_attrs = None
+        self._script_chunks = []
+
+
+def _json_object_from_text(
+    text: str,
+    *,
+    allow_prefix: bool = False,
+) -> dict[str, object] | None:
+    value = text.strip()
+    if allow_prefix:
+        start = value.find("{")
+        if start < 0:
+            return None
+        value = value[start:]
+    elif not value.startswith("{"):
+        return None
+
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _ego_gift_fallback_payload(text: str) -> dict[str, object] | None:
+    payload = _json_object_from_text(text)
+    if payload is not None and isinstance(payload.get("egoGifts"), list):
+        return payload
+
+    parser = _ScriptContentParser()
+    parser.feed(text)
+    candidate_scripts = [
+        content
+        for attrs, content in parser.scripts
+        if attrs.get("id") == "data" or "egoGifts" in content
+    ]
+    for content in candidate_scripts:
+        payload = _json_object_from_text(content, allow_prefix=True)
+        if payload is not None and isinstance(payload.get("egoGifts"), list):
+            return payload
+    return None
+
+
+def _ego_gift_fallback_key(name: str) -> str:
+    return re.sub(r"\s+", "", name).casefold()
 
 
 def _is_subcommand_option(option: dict[str, object]) -> bool:
@@ -2353,7 +2428,10 @@ class NewsCog(commands.Cog):
                 self._ego_gift_image_fallbacks = await self._ego_gift_image_fallbacks_task
             finally:
                 self._ego_gift_image_fallbacks_task = None
-        return self._ego_gift_image_fallbacks.get(name)
+        fallbacks = self._ego_gift_image_fallbacks
+        if not fallbacks:
+            return None
+        return fallbacks.get(name) or fallbacks.get(_ego_gift_fallback_key(name))
 
     async def _load_ego_gift_image_fallbacks(self) -> dict[str, str]:
         timeout = aiohttp.ClientTimeout(total=IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
@@ -2374,19 +2452,9 @@ class NewsCog(commands.Cog):
             _log_internet_exception("에고 기프트 대체 이미지 목록 요청 실패", exc)
             return {}
 
-        match = re.search(
-            r"<script[^>]*>\s*(\{\"egoGifts\":[^\}]*\})\s*</script>",
-            html,
-            flags=re.DOTALL,
-        )
-        if match is None:
+        payload = _ego_gift_fallback_payload(html)
+        if payload is None:
             LOGGER.warning("에고 기프트 대체 이미지 목록을 찾지 못했습니다.")
-            return {}
-
-        try:
-            payload = json.loads(match.group(1))
-        except json.JSONDecodeError:
-            LOGGER.warning("에고 기프트 대체 이미지 목록 파싱 실패.", exc_info=True)
             return {}
 
         fallbacks: dict[str, str] = {}
@@ -2397,7 +2465,10 @@ class NewsCog(commands.Cog):
             gift_id = item.get("ID")
             if not gift_name or gift_id is None:
                 continue
-            fallbacks[str(gift_name)] = f"{EGO_GIFT_FALLBACK_IMAGE_BASE_URL}/{gift_id}.png"
+            gift_name_text = str(gift_name)
+            fallback_url = f"{EGO_GIFT_FALLBACK_IMAGE_BASE_URL}/{gift_id}.png"
+            fallbacks[gift_name_text] = fallback_url
+            fallbacks.setdefault(_ego_gift_fallback_key(gift_name_text), fallback_url)
         return fallbacks
 
     def _post_variant_for_language(
