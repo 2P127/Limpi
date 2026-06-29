@@ -267,6 +267,7 @@ _NEWS_SEND_SENT = "sent"
 _NEWS_SEND_BASELINE = "baseline"
 _NEWS_SEND_RETRY = "retry"
 _IMAGE_DOWNLOAD_RETRY = object()
+_NEWS_AUTO_ANNOUNCE_MAX_AGE_SECONDS = 24 * 60 * 60
 
 
 def _maintenance_notice_embed(notice_type: str) -> discord.Embed:
@@ -281,6 +282,22 @@ def _maintenance_notice_embed(notice_type: str) -> discord.Embed:
         MAINTENANCE_UPDATE_DESCRIPTION,
         color=discord.Color.yellow(),
     )
+
+
+def _news_delay_label(post: NewsPost) -> str:
+    delay = _post_delay_seconds(post)
+    if not isinstance(delay, int):
+        return str(delay)
+    if delay < 60:
+        return f"{delay}초"
+    minutes, seconds = divmod(delay, 60)
+    if minutes < 60:
+        return f"{minutes}분 {seconds}초"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}시간 {minutes}분"
+    days, hours = divmod(hours, 24)
+    return f"{days}일 {hours}시간"
 
 
 @dataclass
@@ -597,6 +614,7 @@ class LimpiBot(commands.Bot):
         self._cleared_global_commands = False
         self._cleared_connected_guild_commands = False
         self._logged_startup_summary = False
+        self._pruned_disconnected_guild_data = False
 
     async def update_presence_status(self, text: str | None = None) -> None:
         if self.is_closed() or not self.is_ready():
@@ -909,6 +927,22 @@ class NewsCog(commands.Cog):
                 "봇이 연결되지 않은 서버에 저장된 설정이 있습니다: %s",
                 ", ".join(str(settings.guild_id) for settings in orphan_settings),
             )
+
+    def prune_disconnected_guild_data(self) -> int:
+        connected_guild_ids = {guild.id for guild in self.bot.guilds}
+        orphan_guild_ids = [
+            settings.guild_id
+            for settings in self.storage.list_settings()
+            if settings.guild_id not in connected_guild_ids
+        ]
+        for guild_id in orphan_guild_ids:
+            self.storage.delete_guild_data(guild_id)
+        if orphan_guild_ids:
+            LOGGER.info(
+                "봇이 더 이상 연결되어 있지 않은 서버의 DB 데이터를 정리했습니다: %s",
+                ", ".join(str(guild_id) for guild_id in orphan_guild_ids),
+            )
+        return len(orphan_guild_ids)
 
     def log_startup_summary(self) -> None:
         connected_guilds = sorted(self.bot.guilds, key=lambda item: item.id)
@@ -2596,11 +2630,11 @@ class NewsCog(commands.Cog):
             )
             self.storage.mark_posts_seen(target.guild_id, [post.post_id], announced=True)
             LOGGER.info(
-                "새 뉴스 공지 | %s | %s | language=%s | delay=%s초 | 제목=%s",
+                "새 뉴스 공지 | %s | %s | language=%s | delay=%s | 제목=%s",
                 guild_log,
                 channel_log,
                 target.language,
-                _post_delay_seconds(post),
+                _news_delay_label(post),
                 post.title,
             )
             announced += 1
@@ -2640,6 +2674,17 @@ class NewsCog(commands.Cog):
             if created is None:
                 continue
             if created_after is not None and created <= created_after:
+                continue
+            age = (datetime.now(timezone.utc) - created).total_seconds()
+            if age > _NEWS_AUTO_ANNOUNCE_MAX_AGE_SECONDS:
+                LOGGER.info(
+                    "뉴스 자동 전송 후보 제외: 게시물이 너무 오래되었습니다 "
+                    "(post_id=%s, title=%r, age_seconds=%s, max_age_seconds=%s).",
+                    post.post_id,
+                    post.title,
+                    int(age),
+                    _NEWS_AUTO_ANNOUNCE_MAX_AGE_SECONDS,
+                )
                 continue
             if (
                 _is_twitter_news_post(post)
@@ -2821,10 +2866,10 @@ class NewsCog(commands.Cog):
                 continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
             LOGGER.info(
-                "새 뉴스 공지 | %s | %s | delay=%s초 | 제목=%s",
+                "새 뉴스 공지 | %s | %s | delay=%s | 제목=%s",
                 guild_log,
                 channel_log,
-                _post_delay_seconds(post),
+                _news_delay_label(post),
                 post.title,
             )
             announced += 1
@@ -9419,6 +9464,9 @@ async def main() -> None:
         async def on_ready() -> None:
             LOGGER.info("림피 v%s — %s (%s)로 로그인했습니다.", BOT_VERSION, bot.user, bot.user.id if bot.user else "unknown")
             await cog.update_presence_status(show_servers=True)
+            if not bot._pruned_disconnected_guild_data:
+                cog.prune_disconnected_guild_data()
+                bot._pruned_disconnected_guild_data = True
             if not bot._logged_startup_summary:
                 cog.log_startup_summary()
                 bot._logged_startup_summary = True
