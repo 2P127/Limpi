@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from time import perf_counter
+from typing import Iterable, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
@@ -42,6 +43,7 @@ from .core.models import (
     GuildHampangTarget,
     GuildNewsTarget,
     GuildSettings,
+    GuildTwitterTarget,
     GuildYoutubeTarget,
     GuildYoutubeUploadTarget,
     NewsPost,
@@ -68,9 +70,184 @@ from .clients.youtube_client import (
 )
 
 
-from .bot_constants import *
-from .bot_helpers import *
-from .bot_runtime import *
+from .bot_constants import (
+    BOOLEAN_CHOICES,
+    BRIGHTEN_CACHE_MAX_BYTES,
+    BRIGHTEN_CACHE_MAX_ITEM_BYTES,
+    BRIGHTEN_CACHE_MAX_ITEMS,
+    BRIGHTEN_PROCESS_CONCURRENCY,
+    BROADCAST_SOURCE_BOTH,
+    BROADCAST_SOURCE_CHOICES,
+    BROADCAST_SOURCE_CHZZK,
+    BROADCAST_SOURCE_YOUTUBE,
+    CHZZK_LIVE_ANNOUNCE_MAX_AGE,
+    CHZZK_LIVE_END_ANNOUNCE_MAX_AGE,
+    CHZZK_POLL_INTERVAL_SECONDS,
+    COMMAND_GUIDE_IMAGE_NAME,
+    DISCORD_HEARTBEAT_TIMEOUT_SECONDS,
+    EGO_GIFT_FALLBACK_IMAGE_BASE_URL,
+    EGO_GIFT_FALLBACK_IMAGE_INDEX_URL,
+    EGO_GIFT_IMAGE_CACHE_MAX_BYTES,
+    EGO_GIFT_IMAGE_CACHE_MAX_ITEMS,
+    EGO_GIFT_IMAGE_PROCESS_CONCURRENCY,
+    EGO_GIFT_IMAGE_WARMUP_CONCURRENCY,
+    EGO_GIFT_IMAGE_WARMUP_LIMIT,
+    HAMPANG_SOURCE_BOTH,
+    HAMPANG_SOURCE_CHOICES,
+    HAMPANG_SOURCE_X,
+    HAMPANG_SOURCE_YOUTUBE,
+    HAMPANG_X_USERNAME,
+    IMAGE_CACHE_MAX_BYTES,
+    IMAGE_CACHE_MAX_ITEM_BYTES,
+    IMAGE_CACHE_MAX_ITEMS,
+    IMAGE_CACHE_WARM_POST_LIMIT,
+    IMAGE_DELIVERY_CHOICES,
+    IMAGE_DELIVERY_EMBEDS,
+    IMAGE_DELIVERY_FILES,
+    IMAGE_DOWNLOAD_ATTEMPTS,
+    IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+    IMAGE_FAILED_URL_CACHE_MAX_ITEMS,
+    IMAGE_FILES_PER_MESSAGE,
+    IMAGE_PROCESS_CONCURRENCY,
+    KST,
+    LANGUAGE_CHOICES,
+    MAINTENANCE_START_DESCRIPTION,
+    MAINTENANCE_START_TITLE,
+    MAINTENANCE_UPDATE_DESCRIPTION,
+    MAINTENANCE_UPDATE_TITLE,
+    MAX_TWITTER_EMBED_IMAGES,
+    NEWS_BANNER_DIR,
+    NEWS_LOOKUP_SOURCE_CHOICES,
+    NEWS_POLL_TICK_SECONDS,
+    NEWS_POST_LIMIT,
+    NEWS_ROLE_MENTION_COOLDOWN_SECONDS,
+    NEWS_SELECT_POST_LIMIT,
+    NEWS_SOURCE_CHOICES,
+    NEWS_SOURCE_STEAM,
+    NEWS_SOURCE_TWITTER,
+    NEWS_TARGET_SEND_CONCURRENCY,
+    NEWS_UPDATE_NOTICE_COOLDOWN,
+    POST_FORMAT_RICH,
+    SYNC_LANGUAGES,
+    TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS,
+    TWITTER_POLL_TICK_SECONDS,
+    TWITTER_POST_LIMIT,
+    TWITTER_STEAM_PREFERENCE_GRACE_SECONDS,
+    USER_COMMAND_COOLDOWN_SECONDS,
+    YOUTUBE_LIVE_ANNOUNCE_MAX_AGE,
+    YOUTUBE_UPLOAD_POLL_INTERVAL_SECONDS,
+    ZIP_CACHE_MAX_ITEMS,
+    ZIP_IMAGE_CONCURRENCY,
+    ZIP_UPLOAD_HEADROOM_BYTES,
+    ZIP_UPLOAD_SAFE_BYTES,
+)
+from .bot_helpers import (
+    EgoGift,
+    _as_utc_datetime,
+    _banner_autocomplete_choices,
+    _banner_display_name,
+    _bool_label,
+    _broadcast_target_choice_name,
+    _broadcast_source_allows_chzzk,
+    _broadcast_source_allows_youtube,
+    _broadcast_source_label,
+    _broadcast_source_value,
+    _brightenable_image_urls,
+    _brighten_image_bytes,
+    _build_aiohttp_connector,
+    _build_layout_view_for_post,
+    _chzzk_live_view,
+    _choice_bool,
+    _content_image_urls,
+    _current_maintenance_notice,
+    _dedupe_posts_by_id,
+    _downloadable_image_urls,
+    _embed_for_chzzk_live,
+    _embed_for_chzzk_live_end,
+    _embed_for_chzzk_offline,
+    _embed_for_hampang_youtube_upload,
+    _embed_for_youtube_live,
+    _embed_for_youtube_offline,
+    _embed_for_youtube_upload,
+    _embeds_for_twitter_post,
+    _format_chzzk_target,
+    _format_hampang_target,
+    _format_news_targets,
+    _format_windows_label,
+    _format_youtube_target,
+    _format_youtube_upload_target,
+    _hampang_news_items,
+    _hampang_news_items_for_source,
+    _image_bytes_as_png,
+    _image_delivery_label,
+    _image_embed_batches_from_urls,
+    _image_request_headers,
+    _is_chzzk_live_recently_closed,
+    _is_chzzk_live_too_old,
+    _is_hampang_youtube_upload,
+    _is_namu_wiki_image_url,
+    _is_news_update_recent,
+    _is_payload_too_large,
+    _is_twitter_news_post,
+    _is_twitter_news_post_recent,
+    _is_twitter_post_recent,
+    _is_youtube_live_too_old,
+    _language_label,
+    _log_level_from_env,
+    _matching_steam_posts_for_twitter,
+    _maintenance_embed,
+    _minute_in_window,
+    _news_banner_file,
+    _news_source_mode_label,
+    _news_target_choice_value,
+    _news_update_notice_embed,
+    _news_ui_text,
+    _normalize_image_url,
+    _original_image_download_candidates,
+    _parse_news_target_choice,
+    _post_delay_seconds,
+    _post_language,
+    _post_language_independent_id,
+    _prevent_windows_sleep,
+    _process_ego_gift_image_bytes,
+    _recent_auto_posts,
+    _regular_youtube_uploads,
+    _resolve_banner_filename,
+    _resource_path,
+    _restore_windows_sleep,
+    _safe_zip_filename,
+    _sort_posts_newest_first,
+    _sort_twitter_posts_newest_first,
+    _sort_youtube_uploads_newest_first,
+    _standalone_image_urls,
+    _steam_news_link_keys_for_news_post,
+    _steam_news_link_keys_for_twitter,
+    _steam_news_post_ids_for_twitter_posts,
+    _steam_posts_without_fast_twitter_duplicates,
+    _success_embed_color,
+    _twitter_image_urls,
+    _twitter_link_urls,
+    _twitter_news_prefers_available_steam,
+    _twitter_news_without_duplicate_steam_links,
+    _twitter_post_delay_seconds,
+    _twitter_post_needs_refresh,
+    _twitter_posts_as_news_posts,
+    _twitter_video_fallback_url,
+    _twitter_video_fallback_url_from_raw,
+    _twitter_video_url_groups,
+    _twitter_video_url_groups_from_raw,
+    _select_twitter_video_url,
+    _unique_zip_name,
+    _youtube_links_content,
+    _youtube_live_view,
+    _youtube_upload_view,
+)
+from .bot_runtime import (
+    _install_asyncio_exception_handler,
+    _install_windows_selector_event_loop_policy,
+    _is_internet_exception,
+    _log_internet_exception,
+)
 from .bot_views import (
     BrightenSpoilerButton,
     BrightenSpoilerVisibilityView,
@@ -82,6 +259,65 @@ from .bot_views import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+_UNKNOWN_LOG_VALUE = "알 수 없음"
+_TWITTER_AUTO_CHECK_FAILURE = "X 게시물 자동 확인 실패"
+_TWITTER_NEWS_POST_ID_PREFIX = "twitter:"
+_NEWS_SEND_SENT = "sent"
+_NEWS_SEND_BASELINE = "baseline"
+_NEWS_SEND_RETRY = "retry"
+_IMAGE_DOWNLOAD_RETRY = object()
+
+
+def _maintenance_notice_embed(notice_type: str) -> discord.Embed:
+    if notice_type == "start":
+        return _maintenance_embed(
+            MAINTENANCE_START_TITLE,
+            MAINTENANCE_START_DESCRIPTION,
+            color=discord.Color.dark_gray(),
+        )
+    return _maintenance_embed(
+        MAINTENANCE_UPDATE_TITLE,
+        MAINTENANCE_UPDATE_DESCRIPTION,
+        color=discord.Color.yellow(),
+    )
+
+
+@dataclass
+class ManualNewsSendResult:
+    sent_channel_ids: list[int]
+    failed_channel_ids: list[int | None]
+    missing_languages: set[str]
+
+
+@dataclass
+class HampangPollContext:
+    x_posts: list[TwitterPost]
+    youtube_uploads: list[YoutubeUpload]
+    latest_x_post_id: str | None
+    latest_youtube_video_id: str | None
+    x_ids: list[str]
+    youtube_ids: list[str]
+    x_baseline_only: bool
+    youtube_baseline_only: bool
+    window_started_at: datetime | None
+    max_age_seconds: int
+
+
+@dataclass
+class HampangTargetPlan:
+    baseline_x_id: str | None
+    baseline_youtube_id: str | None
+    new_x_posts: list[TwitterPost]
+    new_youtube_uploads: list[YoutubeUpload]
+
+
+@dataclass
+class HampangConfigBaseline:
+    latest_x_post: TwitterPost | None
+    latest_youtube_upload: YoutubeUpload | None
+    x_failed: bool = False
+    youtube_failed: bool = False
 
 
 def _log_text(value: object | None, fallback: str = "-") -> str:
@@ -172,7 +408,7 @@ def _format_guild_for_log(
     if guild is None and resolved_id is None:
         return "서버=DM (ID: DM, 멤버 수: -, 소유자 ID: -)"
 
-    guild_name = _log_value(getattr(guild, "name", None), "알 수 없음", 120)
+    guild_name = _log_value(getattr(guild, "name", None), _UNKNOWN_LOG_VALUE, 120)
     member_count = _log_value(getattr(guild, "member_count", None))
     owner_id = _log_value(getattr(guild, "owner_id", None))
     suffix = ""
@@ -190,7 +426,7 @@ def _format_channel_for_log(channel: object | None, channel_id: int | str | None
         return "채널=DM (ID: DM)"
     channel_name = _log_value(
         getattr(channel, "name", None) or (str(channel) if channel is not None else None),
-        "알 수 없음",
+        _UNKNOWN_LOG_VALUE,
         120,
     )
     return f"채널={channel_name} (ID: {_log_value(resolved_id, 'unknown')})"
@@ -576,9 +812,23 @@ class NewsCog(commands.Cog):
         if show_servers is None:
             self._presence_show_servers = not self._presence_show_servers
 
-    def log_startup_summary(self) -> None:
-        connected_guilds = sorted(self.bot.guilds, key=lambda item: item.id)
-        connected_guild_ids = {guild.id for guild in connected_guilds}
+    @staticmethod
+    def _notification_settings_for_summary(
+        settings_list: list[GuildSettings],
+        news_targets: list[GuildNewsTarget],
+    ) -> list[GuildSettings]:
+        target_guild_ids = {target.guild_id for target in news_targets}
+        return [
+            settings
+            for settings in settings_list
+            if (
+                (settings.enabled and settings.guild_id in target_guild_ids)
+                or (settings.channel_id and settings.maintenance_notifications_enabled)
+            )
+        ]
+
+    @staticmethod
+    def _log_connected_guild_summary(connected_guilds: list[discord.Guild]) -> None:
         LOGGER.info("참여 서버 수: %s", len(connected_guilds))
         for guild in connected_guilds:
             LOGGER.info("참여 서버: %s", _format_guild_for_log(guild, guild.id))
@@ -586,38 +836,26 @@ class NewsCog(commands.Cog):
             "연결된 서버 요약: count=%s guilds=%s",
             len(connected_guilds),
             ", ".join(
-                f"{_log_value(getattr(guild, 'name', None), '알 수 없음', 120)} ({guild.id})"
+                f"{_log_value(getattr(guild, 'name', None), _UNKNOWN_LOG_VALUE, 120)} ({guild.id})"
                 for guild in connected_guilds
             )
             or "none",
         )
 
-        settings_list = self.storage.list_settings()
-        news_targets = self.storage.list_all_news_targets()
-        notification_settings = [
-            settings
-            for settings in settings_list
-            if (
-                (settings.enabled and any(target.guild_id == settings.guild_id for target in news_targets))
-                or (settings.channel_id and settings.maintenance_notifications_enabled)
-            )
-        ]
-        LOGGER.info(
-            "알림 설정 요약: configured_guilds=%s active_targets=%s news_targets=%s",
-            len(settings_list),
-            len(notification_settings),
-            len(news_targets),
-        )
-
+    def _log_notification_settings_summary(
+        self,
+        notification_settings: list[GuildSettings],
+        connected_guild_ids: set[int],
+    ) -> None:
         for settings in notification_settings:
             guild = self.bot.get_guild(settings.guild_id)
             guild_name = _log_value(getattr(guild, "name", None), "연결 안 됨", 120)
             channel = self.bot.get_channel(settings.channel_id) if settings.channel_id else None
-            channel_name = _log_value(getattr(channel, "name", None), "알 수 없음", 120)
+            channel_name = _log_value(getattr(channel, "name", None), _UNKNOWN_LOG_VALUE, 120)
             role_name = "none"
             if guild is not None and settings.role_id is not None:
                 role = guild.get_role(settings.role_id)
-                role_name = _log_value(getattr(role, "name", None), "알 수 없음", 120)
+                role_name = _log_value(getattr(role, "name", None), _UNKNOWN_LOG_VALUE, 120)
 
             LOGGER.info(
                 "알림 대상: guild=%s (%s), connected=%s, "
@@ -637,6 +875,11 @@ class NewsCog(commands.Cog):
                 settings.notification_banner or "none",
             )
 
+    def _log_news_target_summary(
+        self,
+        news_targets: list[GuildNewsTarget],
+        connected_guild_ids: set[int],
+    ) -> None:
         for target in news_targets:
             if target.guild_id not in connected_guild_ids:
                 continue
@@ -646,11 +889,16 @@ class NewsCog(commands.Cog):
                 "뉴스 언어별 대상: guild=%s (%s), channel=%s (%s), language=%s",
                 _log_value(getattr(guild, "name", None), "연결 안 됨", 120),
                 target.guild_id,
-                _log_value(getattr(channel, "name", None), "알 수 없음", 120),
+                _log_value(getattr(channel, "name", None), _UNKNOWN_LOG_VALUE, 120),
                 target.channel_id,
                 target.language,
             )
 
+    @staticmethod
+    def _log_orphan_settings(
+        settings_list: list[GuildSettings],
+        connected_guild_ids: set[int],
+    ) -> None:
         orphan_settings = [
             settings
             for settings in settings_list
@@ -661,6 +909,27 @@ class NewsCog(commands.Cog):
                 "봇이 연결되지 않은 서버에 저장된 설정이 있습니다: %s",
                 ", ".join(str(settings.guild_id) for settings in orphan_settings),
             )
+
+    def log_startup_summary(self) -> None:
+        connected_guilds = sorted(self.bot.guilds, key=lambda item: item.id)
+        connected_guild_ids = {guild.id for guild in connected_guilds}
+        settings_list = self.storage.list_settings()
+        news_targets = self.storage.list_all_news_targets()
+        notification_settings = self._notification_settings_for_summary(
+            settings_list,
+            news_targets,
+        )
+
+        self._log_connected_guild_summary(connected_guilds)
+        LOGGER.info(
+            "알림 설정 요약: configured_guilds=%s active_targets=%s news_targets=%s",
+            len(settings_list),
+            len(notification_settings),
+            len(news_targets),
+        )
+        self._log_notification_settings_summary(notification_settings, connected_guild_ids)
+        self._log_news_target_summary(news_targets, connected_guild_ids)
+        self._log_orphan_settings(settings_list, connected_guild_ids)
 
     @tasks.loop(seconds=NEWS_POLL_TICK_SECONDS)
     async def poll_news(self) -> None:
@@ -698,21 +967,48 @@ class NewsCog(commands.Cog):
     async def before_poll_news(self) -> None:
         await self._wait_until_ready()
 
+    def _log_twitter_tracking_window_transition(
+        self,
+        now: datetime,
+        currently_in_window: bool,
+    ) -> None:
+        if currently_in_window and not self._in_twitter_tracking_window:
+            LOGGER.info(
+                "X 게시물 추적 시작 (KST %s, 확인 간격: %s초).",
+                _format_windows_label(self.config.twitter_tracking_windows_kst),
+                self._current_twitter_poll_interval_seconds(now),
+            )
+        elif not currently_in_window and self._in_twitter_tracking_window:
+            LOGGER.info("X 게시물 추적 일시 중지: 추적 시간대가 아닙니다.")
+        self._in_twitter_tracking_window = currently_in_window
+
+    def _handle_hampang_poll_exception(self, exc: Exception) -> None:
+        self._hampang_x_recovery_baseline_pending = True
+        self._hampang_youtube_recovery_baseline_pending = True
+        if _is_internet_exception(exc):
+            _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", exc)
+        else:
+            LOGGER.exception(
+                "햄햄팡팡 소식 자동 확인 실패.",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    def _handle_twitter_poll_exception(self, exc: Exception) -> None:
+        self._twitter_recovery_baseline_pending = True
+        if _is_internet_exception(exc):
+            _log_internet_exception(_TWITTER_AUTO_CHECK_FAILURE, exc)
+        elif isinstance(exc, XClientError):
+            LOGGER.warning("%s: %s", _TWITTER_AUTO_CHECK_FAILURE, exc)
+        else:
+            LOGGER.exception("%s.", _TWITTER_AUTO_CHECK_FAILURE)
+
     @tasks.loop(seconds=TWITTER_POLL_TICK_SECONDS)
     async def poll_twitter_posts(self) -> None:
         async with self._twitter_poll_lock:
             try:
                 now = datetime.now(timezone.utc)
                 currently_in_window = self._is_twitter_tracking_window(now)
-                if currently_in_window and not self._in_twitter_tracking_window:
-                    LOGGER.info(
-                        "X 게시물 추적 시작 (KST %s, 확인 간격: %s초).",
-                        _format_windows_label(self.config.twitter_tracking_windows_kst),
-                        self._current_twitter_poll_interval_seconds(now),
-                    )
-                elif not currently_in_window and self._in_twitter_tracking_window:
-                    LOGGER.info("X 게시물 추적 일시 중지: 추적 시간대가 아닙니다.")
-                self._in_twitter_tracking_window = currently_in_window
+                self._log_twitter_tracking_window_transition(now, currently_in_window)
 
                 if not self.bot.is_ready():
                     self._twitter_recovery_baseline_pending = True
@@ -728,31 +1024,9 @@ class NewsCog(commands.Cog):
                 if isinstance(twitter_result, Exception):
                     raise twitter_result
                 if isinstance(hampang_result, Exception):
-                    self._hampang_x_recovery_baseline_pending = True
-                    self._hampang_youtube_recovery_baseline_pending = True
-                    if _is_internet_exception(hampang_result):
-                        _log_internet_exception("햄햄팡팡 소식 자동 확인 실패", hampang_result)
-                    else:
-                        LOGGER.exception(
-                            "햄햄팡팡 소식 자동 확인 실패.",
-                            exc_info=(
-                                type(hampang_result),
-                                hampang_result,
-                                hampang_result.__traceback__,
-                            ),
-                        )
-            except XClientError as exc:
-                self._twitter_recovery_baseline_pending = True
-                if _is_internet_exception(exc):
-                    _log_internet_exception("X 게시물 자동 확인 실패", exc)
-                else:
-                    LOGGER.warning("X 게시물 자동 확인 실패: %s", exc)
+                    self._handle_hampang_poll_exception(hampang_result)
             except Exception as exc:
-                self._twitter_recovery_baseline_pending = True
-                if _is_internet_exception(exc):
-                    _log_internet_exception("X 게시물 자동 확인 실패", exc)
-                else:
-                    LOGGER.exception("X 게시물 자동 확인 실패.")
+                self._handle_twitter_poll_exception(exc)
 
     @poll_twitter_posts.before_loop
     async def before_poll_twitter_posts(self) -> None:
@@ -904,33 +1178,15 @@ class NewsCog(commands.Cog):
         sent_count = 0
         skipped_count = 0
         target_count = 0
+        embed = _maintenance_notice_embed(notice_type)
         for settings in self.storage.list_settings():
-            if (
-                not settings.maintenance_notifications_enabled
-                or settings.channel_id is None
-                or self.bot.get_guild(settings.guild_id) is None
-            ):
+            if not self._is_maintenance_notice_target(settings):
                 continue
 
             target_count += 1
-            if notice_type == "start":
-                if settings.last_maintenance_start_notice == notice_key:
-                    skipped_count += 1
-                    continue
-                embed = _maintenance_embed(
-                    MAINTENANCE_START_TITLE,
-                    MAINTENANCE_START_DESCRIPTION,
-                    color=discord.Color.dark_gray(),
-                )
-            else:
-                if settings.last_maintenance_update_notice == notice_key:
-                    skipped_count += 1
-                    continue
-                embed = _maintenance_embed(
-                    MAINTENANCE_UPDATE_TITLE,
-                    MAINTENANCE_UPDATE_DESCRIPTION,
-                    color=discord.Color.yellow(),
-                )
+            if self._maintenance_notice_already_sent(settings, notice_type, notice_key):
+                skipped_count += 1
+                continue
 
             sent = await self._send_maintenance_notice(settings, embed, notice_type)
             if sent:
@@ -951,6 +1207,23 @@ class NewsCog(commands.Cog):
             skipped_count,
         )
         return sent_count
+
+    def _is_maintenance_notice_target(self, settings: GuildSettings) -> bool:
+        return (
+            settings.maintenance_notifications_enabled
+            and settings.channel_id is not None
+            and self.bot.get_guild(settings.guild_id) is not None
+        )
+
+    def _maintenance_notice_already_sent(
+        self,
+        settings: GuildSettings,
+        notice_type: str,
+        notice_key: str,
+    ) -> bool:
+        if notice_type == "start":
+            return settings.last_maintenance_start_notice == notice_key
+        return settings.last_maintenance_update_notice == notice_key
 
     async def _send_maintenance_notice(
         self,
@@ -1081,63 +1354,48 @@ class NewsCog(commands.Cog):
             )
             return 0
 
-        announced_count = 0
-        target_tasks: list[asyncio.Task[int]] = []
         send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
-
-        async def process_target(
-            settings: GuildSettings,
-            target: GuildNewsTarget,
-            guild_posts: list[NewsPost],
-        ) -> int:
-            async with send_semaphore:
-                return await self._process_news_target(settings, target, guild_posts)
-
-        for language, target_list in targets_by_language.items():
-            posts = posts_by_language.get(language, [])
-            if not posts:
-                continue
-
-            for target in target_list:
-                settings = self.storage.get_settings(target.guild_id)
-                guild_posts = self._posts_for_source_mode(
-                    posts,
-                    settings,
-                    defer_linked_twitter=True,
-                )[:NEWS_POST_LIMIT]
-                if not guild_posts:
-                    continue
-                newest_post_id = guild_posts[0].post_id
-                fetched_post_ids = [post.post_id for post in guild_posts]
-                if not settings.enabled:
-                    self.storage.mark_news_target_posts_seen(target.target_id, fetched_post_ids)
-                    self.storage.mark_posts_seen(target.guild_id, fetched_post_ids)
-                    self.storage.set_last_seen_post_id(target.guild_id, newest_post_id)
-                    continue
-                target_tasks.append(
-                    asyncio.create_task(process_target(settings, target, guild_posts))
-                )
+        target_tasks = self._news_target_tasks_for_poll(
+            targets_by_language,
+            posts_by_language,
+            send_semaphore,
+        )
 
         if target_tasks:
             results = await asyncio.gather(*target_tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    if _is_internet_exception(result):
-                        _log_internet_exception(
-                            "뉴스 자동 전송 대상 처리 실패",
-                            result,
-                            level=logging.ERROR,
-                        )
-                    else:
-                        LOGGER.error(
-                            "뉴스 자동 전송 대상 처리 실패.",
-                            exc_info=(type(result), result, result.__traceback__),
-                        )
-                    continue
-                announced_count += result
+            announced_count = self._sum_news_target_results(results)
+        else:
+            announced_count = 0
 
         await self._broadcast_post_updates(changed_post_ids)
         return announced_count
+
+    def _cached_posts_after_steam_sync_failure(
+        self,
+        language: str,
+        exc: Exception,
+    ) -> list[NewsPost]:
+        message = f"Steam 뉴스 자동 확인 실패: language={language}. 저장된 소식을 사용합니다"
+        if _is_internet_exception(exc):
+            _log_internet_exception(message, exc)
+        else:
+            LOGGER.warning(
+                "%s.",
+                message,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        return self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
+
+    def _track_successful_steam_sync_result(
+        self,
+        language: str,
+        posts: list[NewsPost],
+        fetched_posts: list[NewsPost],
+        newest_new_posts: list[tuple[str, NewsPost]],
+    ) -> None:
+        if posts and self.storage.get_post(posts[0].post_id) is None:
+            newest_new_posts.append((language, posts[0]))
+        fetched_posts.extend(posts[:NEWS_POST_LIMIT])
 
     async def _sync_global_news_cache(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
         if self.news_source is None:
@@ -1158,21 +1416,15 @@ class NewsCog(commands.Cog):
         for language, result in zip(SYNC_LANGUAGES, results):
             if isinstance(result, Exception):
                 had_fetch_failure = True
-                message = f"Steam 뉴스 자동 확인 실패: language={language}. 저장된 소식을 사용합니다"
-                if _is_internet_exception(result):
-                    _log_internet_exception(message, result)
-                else:
-                    LOGGER.warning(
-                        "%s.",
-                        message,
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
-                posts = self.storage.search_posts("", limit=NEWS_POST_LIMIT, language=language)
+                posts = self._cached_posts_after_steam_sync_failure(language, result)
             else:
                 posts = result
-                if posts and self.storage.get_post(posts[0].post_id) is None:
-                    newest_new_posts.append((language, posts[0]))
-                fetched_posts.extend(posts[:NEWS_POST_LIMIT])
+                self._track_successful_steam_sync_result(
+                    language,
+                    posts,
+                    fetched_posts,
+                    newest_new_posts,
+                )
             posts_by_language[language] = posts[:NEWS_POST_LIMIT]
 
         if fetched_posts:
@@ -1188,6 +1440,88 @@ class NewsCog(commands.Cog):
             self._schedule_image_cache_warmup(fetched_posts)
         return posts_by_language, changed, had_fetch_failure
 
+    def _handle_combined_steam_result(
+        self,
+        result: tuple[dict[str, list[NewsPost]], list[str], bool] | BaseException,
+    ) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
+        if not isinstance(result, Exception):
+            posts_by_language, changed, steam_had_failure = result
+            return posts_by_language, changed, steam_had_failure
+
+        if _is_internet_exception(result):
+            _log_internet_exception(
+                "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다",
+                result,
+            )
+        else:
+            LOGGER.warning(
+                "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
+                exc_info=(type(result), result, result.__traceback__),
+            )
+        return self._cached_posts_by_language(), [], True
+
+    def _handle_combined_twitter_result(
+        self,
+        result: tuple[int, list[TwitterPost]] | BaseException,
+    ) -> tuple[list[TwitterPost], bool]:
+        if not isinstance(result, Exception):
+            _, twitter_posts = result
+            return twitter_posts, False
+
+        if isinstance(result, XClientError):
+            if _is_internet_exception(result):
+                _log_internet_exception(_TWITTER_AUTO_CHECK_FAILURE, result)
+            else:
+                LOGGER.warning("%s: %s", _TWITTER_AUTO_CHECK_FAILURE, result)
+        elif _is_internet_exception(result):
+            _log_internet_exception(
+                f"{_TWITTER_AUTO_CHECK_FAILURE}. Steam 자동 알림은 계속 처리합니다",
+                result,
+            )
+        else:
+            LOGGER.warning(
+                "%s. Steam 자동 알림은 계속 처리합니다.",
+                _TWITTER_AUTO_CHECK_FAILURE,
+                exc_info=(type(result), result, result.__traceback__),
+            )
+        return [], True
+
+    def _combine_steam_and_twitter_news(
+        self,
+        posts_by_language: dict[str, list[NewsPost]],
+        twitter_posts: list[TwitterPost],
+    ) -> dict[str, list[NewsPost]]:
+        cached_linked_steam_posts = self._cached_steam_posts_for_twitter_links(twitter_posts)
+        steam_posts = _dedupe_posts_by_id([
+            post
+            for posts in posts_by_language.values()
+            for post in posts
+        ] + cached_linked_steam_posts)
+        twitter_news = _twitter_news_without_duplicate_steam_links(
+            _twitter_posts_as_news_posts(twitter_posts, steam_posts)
+        )
+        if not twitter_news and not cached_linked_steam_posts:
+            return posts_by_language
+
+        for language in SYNC_LANGUAGES:
+            steam_posts_for_language = _dedupe_posts_by_id(
+                [
+                    *posts_by_language.get(language, []),
+                    *(
+                        post
+                        for post in cached_linked_steam_posts
+                        if _post_language(post) == language
+                    ),
+                ]
+            )
+            steam_language_posts = _steam_posts_without_fast_twitter_duplicates(
+                steam_posts_for_language,
+                twitter_news,
+            )
+            combined = [*steam_language_posts, *twitter_news]
+            posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
+        return posts_by_language
+
     async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
         now = datetime.now(timezone.utc)
         news_task = asyncio.create_task(self._sync_global_news_cache())
@@ -1201,75 +1535,15 @@ class NewsCog(commands.Cog):
         else:
             news_result = await news_task
             twitter_result = (0, [])
-        had_upstream_failure = False
-        if isinstance(news_result, Exception):
-            had_upstream_failure = True
-            if _is_internet_exception(news_result):
-                _log_internet_exception(
-                    "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다",
-                    news_result,
-                )
-            else:
-                LOGGER.warning(
-                    "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
-                    exc_info=(type(news_result), news_result, news_result.__traceback__),
-                )
-            posts_by_language = self._cached_posts_by_language()
-            changed = []
-        else:
-            posts_by_language, changed, steam_had_failure = news_result
-            had_upstream_failure = had_upstream_failure or steam_had_failure
-
-        if isinstance(twitter_result, XClientError):
-            had_upstream_failure = True
-            if _is_internet_exception(twitter_result):
-                _log_internet_exception("X 게시물 자동 확인 실패", twitter_result)
-            else:
-                LOGGER.warning("X 게시물 자동 확인 실패: %s", twitter_result)
-            twitter_posts = []
-        elif isinstance(twitter_result, Exception):
-            had_upstream_failure = True
-            if _is_internet_exception(twitter_result):
-                _log_internet_exception(
-                    "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다",
-                    twitter_result,
-                )
-            else:
-                LOGGER.warning(
-                    "X 게시물 자동 확인 실패. Steam 자동 알림은 계속 처리합니다.",
-                    exc_info=(type(twitter_result), twitter_result, twitter_result.__traceback__),
-                )
-            twitter_posts = []
-        else:
-            _, twitter_posts = twitter_result
-
-        cached_linked_steam_posts = self._cached_steam_posts_for_twitter_links(twitter_posts)
-        steam_posts = _dedupe_posts_by_id([
-            post
-            for posts in posts_by_language.values()
-            for post in posts
-        ] + cached_linked_steam_posts)
-        twitter_news = _twitter_news_without_duplicate_steam_links(
-            _twitter_posts_as_news_posts(twitter_posts, steam_posts)
+        posts_by_language, changed, steam_had_failure = self._handle_combined_steam_result(
+            news_result
         )
-        if twitter_news or cached_linked_steam_posts:
-            for language in SYNC_LANGUAGES:
-                steam_posts_for_language = _dedupe_posts_by_id(
-                    [
-                        *posts_by_language.get(language, []),
-                        *(
-                            post
-                            for post in cached_linked_steam_posts
-                            if _post_language(post) == language
-                        ),
-                    ]
-                )
-                steam_language_posts = _steam_posts_without_fast_twitter_duplicates(
-                    steam_posts_for_language,
-                    twitter_news,
-                )
-                combined = [*steam_language_posts, *twitter_news]
-                posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
+        twitter_posts, twitter_had_failure = self._handle_combined_twitter_result(twitter_result)
+        had_upstream_failure = steam_had_failure or twitter_had_failure
+        posts_by_language = self._combine_steam_and_twitter_news(
+            posts_by_language,
+            twitter_posts,
+        )
         return posts_by_language, changed, had_upstream_failure
 
     def _mark_news_targets_recovery_baseline(
@@ -1293,6 +1567,62 @@ class NewsCog(commands.Cog):
                 self.storage.set_last_seen_post_id(target.guild_id, target_posts[0].post_id)
                 updated += 1
         return updated
+
+    def _news_target_tasks_for_poll(
+        self,
+        targets_by_language: dict[str, list[GuildNewsTarget]],
+        posts_by_language: dict[str, list[NewsPost]],
+        send_semaphore: asyncio.Semaphore,
+    ) -> list[asyncio.Task[int]]:
+        async def process_target(
+            settings: GuildSettings,
+            target: GuildNewsTarget,
+            guild_posts: list[NewsPost],
+        ) -> int:
+            async with send_semaphore:
+                return await self._process_news_target(settings, target, guild_posts)
+
+        target_tasks: list[asyncio.Task[int]] = []
+        for language, target_list in targets_by_language.items():
+            posts = posts_by_language.get(language, [])
+            if not posts:
+                continue
+            for target in target_list:
+                settings = self.storage.get_settings(target.guild_id)
+                guild_posts = self._posts_for_source_mode(
+                    posts,
+                    settings,
+                    defer_linked_twitter=True,
+                )[:NEWS_POST_LIMIT]
+                if not guild_posts:
+                    continue
+                if not settings.enabled:
+                    self._mark_news_target_posts_seen_for_poll(target, guild_posts)
+                    continue
+                target_tasks.append(
+                    asyncio.create_task(process_target(settings, target, guild_posts))
+                )
+        return target_tasks
+
+    @staticmethod
+    def _sum_news_target_results(results: list[int | BaseException]) -> int:
+        announced_count = 0
+        for result in results:
+            if isinstance(result, Exception):
+                if _is_internet_exception(result):
+                    _log_internet_exception(
+                        "뉴스 자동 전송 대상 처리 실패",
+                        result,
+                        level=logging.ERROR,
+                    )
+                else:
+                    LOGGER.error(
+                        "뉴스 자동 전송 대상 처리 실패.",
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                continue
+            announced_count += result
+        return announced_count
 
     def _cached_posts_by_language(self) -> dict[str, list[NewsPost]]:
         return {
@@ -1400,8 +1730,10 @@ class NewsCog(commands.Cog):
         if steam_post is None:
             steam_post = self.storage.get_post_by_id_or_title(value)
         twitter_post = None
-        if value.startswith("twitter:"):
-            twitter_post = self.storage.get_twitter_post(value.removeprefix("twitter:"))
+        if value.startswith(_TWITTER_NEWS_POST_ID_PREFIX):
+            twitter_post = self.storage.get_twitter_post(
+                value.removeprefix(_TWITTER_NEWS_POST_ID_PREFIX)
+            )
         if twitter_post is None:
             twitter_post = self.storage.get_twitter_post_by_id_or_title(value)
         if twitter_post is not None:
@@ -1489,13 +1821,9 @@ class NewsCog(commands.Cog):
         attach_photos: bool,
         settings: GuildSettings | None = None,
     ) -> None:
-        resolved_settings = (
-            settings
-            if settings is not None
-            else self.storage.get_settings(interaction.guild_id)
-            if interaction.guild_id
-            else None
-        )
+        resolved_settings = settings
+        if resolved_settings is None and interaction.guild_id:
+            resolved_settings = self.storage.get_settings(interaction.guild_id)
         post = await self._get_combined_post(
             title,
             language=language,
@@ -1529,6 +1857,108 @@ class NewsCog(commands.Cog):
                     interaction.guild_id, interaction.channel_id, message
                 )
 
+    async def _manual_news_delivery_targets(
+        self,
+        interaction: discord.Interaction,
+        post: NewsPost,
+        language: str,
+        channel_id: int | None,
+        configured_targets: list[GuildNewsTarget],
+    ) -> list[tuple[discord.abc.Messageable, str]] | None:
+        if channel_id is not None:
+            resolved_channel = await self._resolve_target_channel(None, channel_id)
+            if resolved_channel is None:
+                await interaction.followup.send(
+                    "보낼 채널을 찾지 못했어요. 채널 권한을 확인해주세요.",
+                    ephemeral=True,
+                )
+                return None
+            channel_languages = [
+                target.language
+                for target in configured_targets
+                if target.channel_id == channel_id
+            ]
+            if not channel_languages:
+                channel_languages = [_post_language(post) or language]
+            return [(resolved_channel, target_language) for target_language in channel_languages]
+
+        delivery_targets: list[tuple[discord.abc.Messageable, str]] = []
+        for news_target in configured_targets:
+            resolved = await self._resolve_target_channel(None, news_target.channel_id)
+            if resolved is not None:
+                delivery_targets.append((resolved, news_target.language))
+        if delivery_targets:
+            return delivery_targets
+
+        await interaction.followup.send(
+            "보낼 채널이 없어요. 채널 옵션을 지정하거나 /소식채널설정으로 언어별 채널을 설정해주세요.",
+            ephemeral=True,
+        )
+        return None
+
+    async def _send_manual_news_to_targets(
+        self,
+        post: NewsPost,
+        settings: GuildSettings,
+        role_to_send: int | None,
+        delivery_targets: list[tuple[discord.abc.Messageable, str]],
+    ) -> ManualNewsSendResult:
+        result = ManualNewsSendResult([], [], set())
+        mentioned_channel_ids: set[int] = set()
+
+        for target, target_language in delivery_targets:
+            resolved_channel_id = getattr(target, "id", None)
+            target_post = self._post_variant_for_language(post, target_language)
+            if target_post is None:
+                result.missing_languages.add(target_language)
+                result.failed_channel_ids.append(resolved_channel_id)
+                continue
+
+            mention_role = not (
+                isinstance(resolved_channel_id, int)
+                and resolved_channel_id in mentioned_channel_ids
+            )
+            try:
+                await self._broadcast_post(
+                    target,
+                    target_post,
+                    role_to_send if mention_role else None,
+                    banner_filename=settings.notification_banner,
+                    image_delivery=settings.image_delivery,
+                )
+            except discord.Forbidden:
+                result.failed_channel_ids.append(resolved_channel_id)
+                continue
+            except discord.HTTPException:
+                LOGGER.exception("수동 뉴스 전송 실패.")
+                result.failed_channel_ids.append(resolved_channel_id)
+                continue
+
+            if isinstance(resolved_channel_id, int):
+                result.sent_channel_ids.append(resolved_channel_id)
+                mentioned_channel_ids.add(resolved_channel_id)
+        return result
+
+    @staticmethod
+    def _manual_news_send_message(result: ManualNewsSendResult) -> str:
+        sent_text = ", ".join(
+            f"<#{sent_channel_id}>" for sent_channel_id in result.sent_channel_ids
+        )
+        message = f"{sent_text}에 소식을 보냈어요."
+        if result.failed_channel_ids:
+            failed_text = ", ".join(
+                f"<#{failed_channel_id}>" if failed_channel_id else "지정한 채널"
+                for failed_channel_id in result.failed_channel_ids
+            )
+            message = f"{message}\n전송 실패: {failed_text}"
+        if result.missing_languages:
+            missing_text = ", ".join(
+                _language_label(missing_language)
+                for missing_language in sorted(result.missing_languages)
+            )
+            message = f"{message}\n같은 소식의 {missing_text} 게시물을 아직 찾지 못했어요."
+        return message
+
     async def _send_news_by_selected_post(
         self,
         interaction: discord.Interaction,
@@ -1555,101 +1985,35 @@ class NewsCog(commands.Cog):
             return
 
         configured_targets = self.storage.list_news_targets(interaction.guild_id)
-        delivery_targets: list[tuple[discord.abc.Messageable, str]] = []
-        if channel_id is not None:
-            resolved_channel = await self._resolve_target_channel(None, channel_id)
-            if resolved_channel is None:
-                await interaction.followup.send(
-                    "보낼 채널을 찾지 못했어요. 채널 권한을 확인해주세요.",
-                    ephemeral=True,
-                )
-                return
-            channel_languages = [
-                target.language
-                for target in configured_targets
-                if target.channel_id == channel_id
-            ]
-            if not channel_languages:
-                channel_languages = [_post_language(post) or language]
-            delivery_targets = [
-                (resolved_channel, target_language)
-                for target_language in channel_languages
-            ]
-        else:
-            for news_target in configured_targets:
-                resolved = await self._resolve_target_channel(None, news_target.channel_id)
-                if resolved is not None:
-                    delivery_targets.append((resolved, news_target.language))
-
-        if not delivery_targets:
-            await interaction.followup.send(
-                "보낼 채널이 없어요. 채널 옵션을 지정하거나 /소식채널설정으로 언어별 채널을 설정해주세요.",
-                ephemeral=True,
-            )
+        delivery_targets = await self._manual_news_delivery_targets(
+            interaction,
+            post,
+            language,
+            channel_id,
+            configured_targets,
+        )
+        if delivery_targets is None:
             return
 
         role_to_send = role_id if role_id is not None else settings.role_id
-        sent_channel_ids: list[int] = []
-        failed_channel_ids: list[int | None] = []
-        missing_languages: set[str] = set()
-        mentioned_channel_ids: set[int] = set()
+        result = await self._send_manual_news_to_targets(
+            post,
+            settings,
+            role_to_send,
+            delivery_targets,
+        )
 
-        for target, target_language in delivery_targets:
-            resolved_channel_id = getattr(target, "id", None)
-            target_post = self._post_variant_for_language(post, target_language)
-            if target_post is None:
-                missing_languages.add(target_language)
-                failed_channel_ids.append(resolved_channel_id)
-                continue
-
-            mention_role = not (
-                isinstance(resolved_channel_id, int)
-                and resolved_channel_id in mentioned_channel_ids
-            )
-            try:
-                await self._broadcast_post(
-                    target,
-                    target_post,
-                    role_to_send if mention_role else None,
-                    banner_filename=settings.notification_banner,
-                    image_delivery=settings.image_delivery,
-                )
-            except discord.Forbidden:
-                failed_channel_ids.append(resolved_channel_id)
-                continue
-            except discord.HTTPException:
-                LOGGER.exception("수동 뉴스 전송 실패.")
-                failed_channel_ids.append(resolved_channel_id)
-                continue
-
-            if isinstance(resolved_channel_id, int):
-                sent_channel_ids.append(resolved_channel_id)
-                mentioned_channel_ids.add(resolved_channel_id)
-
-        if not sent_channel_ids:
+        if not result.sent_channel_ids:
             await interaction.followup.send(
                 "소식을 보낼 수 있는 채널이 없어요. 채널 권한을 확인해주세요.",
                 ephemeral=True,
             )
             return
 
-        sent_text = ", ".join(f"<#{sent_channel_id}>" for sent_channel_id in sent_channel_ids)
-        if failed_channel_ids:
-            failed_text = ", ".join(
-                f"<#{failed_channel_id}>" if failed_channel_id else "지정한 채널"
-                for failed_channel_id in failed_channel_ids
-            )
-            message = f"{sent_text}에 소식을 보냈어요.\n전송 실패: {failed_text}"
-        else:
-            message = f"{sent_text}에 소식을 보냈어요."
-        if missing_languages:
-            missing_text = ", ".join(
-                _language_label(missing_language)
-                for missing_language in sorted(missing_languages)
-            )
-            message += f"\n같은 소식의 {missing_text} 게시물을 아직 찾지 못했어요."
-
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(
+            self._manual_news_send_message(result),
+            ephemeral=True,
+        )
 
     async def _latest_combined_post(
         self,
@@ -1977,7 +2341,7 @@ class NewsCog(commands.Cog):
             return {}
 
         match = re.search(
-            r"<script[^>]*>\s*(\{\"egoGifts\":.*?\})\s*</script>",
+            r"<script[^>]*>\s*(\{\"egoGifts\":[^\}]*\})\s*</script>",
             html,
             flags=re.DOTALL,
         )
@@ -2136,6 +2500,35 @@ class NewsCog(commands.Cog):
             return start <= current_hour < end
         return current_hour >= start or current_hour < end
 
+    def _mark_news_target_posts_seen_for_poll(
+        self,
+        target: GuildNewsTarget,
+        posts: list[NewsPost],
+        *,
+        exclude_post_ids: set[str] | None = None,
+    ) -> None:
+        excluded = exclude_post_ids or set()
+        post_ids = [post.post_id for post in posts if post.post_id not in excluded]
+        if not post_ids:
+            return
+        self.storage.mark_news_target_posts_seen(target.target_id, post_ids)
+        self.storage.mark_posts_seen(target.guild_id, post_ids)
+        self.storage.set_last_seen_post_id(target.guild_id, post_ids[0])
+
+    def _mark_guild_posts_seen_for_poll(
+        self,
+        settings: GuildSettings,
+        posts: list[NewsPost],
+        *,
+        exclude_post_ids: set[str] | None = None,
+    ) -> None:
+        excluded = exclude_post_ids or set()
+        post_ids = [post.post_id for post in posts if post.post_id not in excluded]
+        if not post_ids:
+            return
+        self.storage.mark_posts_seen(settings.guild_id, post_ids)
+        self.storage.set_last_seen_post_id(settings.guild_id, post_ids[0])
+
     async def _process_news_target(
         self,
         settings: GuildSettings,
@@ -2156,6 +2549,7 @@ class NewsCog(commands.Cog):
 
         channel = await self._resolve_automatic_news_channel(target)
         if channel is None:
+            self._mark_news_target_posts_seen_for_poll(target, posts)
             return 0
 
         new_posts = self._auto_sendable_news_posts(
@@ -2163,15 +2557,7 @@ class NewsCog(commands.Cog):
             target=target,
         )
         if not new_posts:
-            self.storage.mark_news_target_posts_seen(
-                target.target_id,
-                (post.post_id for post in posts),
-            )
-            self.storage.mark_posts_seen(
-                target.guild_id,
-                (post.post_id for post in posts),
-            )
-            self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
+            self._mark_news_target_posts_seen_for_poll(target, posts)
             return 0
 
         guild_log, channel_log = self._destination_logs(
@@ -2180,19 +2566,19 @@ class NewsCog(commands.Cog):
             target.channel_id,
         )
         announced = 0
-        failed_post_ids: set[str] = set()
+        retry_post_ids: set[str] = set()
         for post in new_posts:
-            sent = await self._send_news_post_to_target(
+            send_result = await self._send_news_post_to_target(
                 channel,
                 settings,
                 target,
                 post,
                 mention_role=announced == 0,
             )
-            if not sent:
-                failed_post_ids.add(post.post_id)
+            if send_result == _NEWS_SEND_RETRY:
+                retry_post_ids.add(post.post_id)
                 LOGGER.warning(
-                    "뉴스 자동 전송 실패 "
+                    "뉴스 자동 전송 일시 실패: 다음 자동 폴링에서 재시도합니다 "
                     "(guild_id=%s, channel_id=%s, language=%s, post_id=%s, title=%r).",
                     target.guild_id,
                     target.channel_id,
@@ -2200,6 +2586,8 @@ class NewsCog(commands.Cog):
                     post.post_id,
                     post.title,
                 )
+                continue
+            if send_result == _NEWS_SEND_BASELINE:
                 continue
             self.storage.mark_news_target_posts_seen(
                 target.target_id,
@@ -2217,18 +2605,19 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids:
+        if retry_post_ids:
             LOGGER.warning(
-                "실패한 게시물은 해당 대상에서 본 것으로 처리되어 이후 자동 폴링에서 건너뜁니다 "
+                "일시 실패한 게시물은 해당 대상에서 본 것으로 처리하지 않아 이후 자동 폴링에서 재시도합니다 "
                 "(guild_id=%s, channel_id=%s, post_ids=%s).",
                 target.guild_id,
                 target.channel_id,
-                ", ".join(sorted(failed_post_ids)),
+                ", ".join(sorted(retry_post_ids)),
             )
-        seen_posts = [post.post_id for post in posts]
-        self.storage.mark_news_target_posts_seen(target.target_id, seen_posts)
-        self.storage.mark_posts_seen(target.guild_id, seen_posts)
-        self.storage.set_last_seen_post_id(target.guild_id, posts[0].post_id)
+        self._mark_news_target_posts_seen_for_poll(
+            target,
+            posts,
+            exclude_post_ids=retry_post_ids,
+        )
         return announced
 
     def _auto_sendable_news_posts(
@@ -2326,6 +2715,25 @@ class NewsCog(commands.Cog):
             )
             return 0
 
+        channel = await self._resolve_guild_news_channel_for_poll(settings, posts)
+        if channel is None:
+            return 0
+
+        new_posts = self._auto_sendable_news_posts(
+            self._new_posts_for_guild(settings, posts),
+        )
+        if not new_posts:
+            self._mark_guild_posts_seen_for_poll(settings, posts)
+            return 0
+
+        return await self._send_guild_news_posts(settings, posts, channel, new_posts)
+
+    async def _resolve_guild_news_channel_for_poll(
+        self,
+        settings: GuildSettings,
+        posts: list[NewsPost],
+    ) -> discord.abc.Messageable | None:
+        assert settings.channel_id is not None
         channel = self.bot.get_channel(settings.channel_id)
         if channel is None:
             try:
@@ -2339,7 +2747,8 @@ class NewsCog(commands.Cog):
                     settings.channel_id,
                     getattr(exc, "code", None),
                 )
-                return 0
+                self._mark_guild_posts_seen_for_poll(settings, posts)
+                return None
             except discord.NotFound as exc:
                 LOGGER.warning(
                     "뉴스 자동 전송 건너뜀: 설정된 채널을 찾을 수 없음 "
@@ -2348,7 +2757,8 @@ class NewsCog(commands.Cog):
                     settings.channel_id,
                     getattr(exc, "code", None),
                 )
-                return 0
+                self._mark_guild_posts_seen_for_poll(settings, posts)
+                return None
             except discord.HTTPException as exc:
                 LOGGER.exception(
                     "뉴스 자동 전송 건너뜀: 설정된 채널 조회 실패 "
@@ -2358,7 +2768,8 @@ class NewsCog(commands.Cog):
                     getattr(exc, "status", None),
                     getattr(exc, "code", None),
                 )
-                return 0
+                self._mark_guild_posts_seen_for_poll(settings, posts)
+                return None
 
         if not isinstance(channel, discord.abc.Messageable):
             LOGGER.warning(
@@ -2368,43 +2779,45 @@ class NewsCog(commands.Cog):
                 settings.channel_id,
                 type(channel).__name__,
             )
-            return 0
+            self._mark_guild_posts_seen_for_poll(settings, posts)
+            return None
 
-        new_posts = self._auto_sendable_news_posts(
-            self._new_posts_for_guild(settings, posts),
-        )
-        if not new_posts:
-            self.storage.mark_posts_seen(
-                settings.guild_id,
-                (post.post_id for post in posts),
-            )
-            self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
-            return 0
+        return channel
 
+    async def _send_guild_news_posts(
+        self,
+        settings: GuildSettings,
+        posts: list[NewsPost],
+        channel: discord.abc.Messageable,
+        new_posts: list[NewsPost],
+    ) -> int:
+        assert settings.channel_id is not None
         guild_log, channel_log = self._destination_logs(
             settings.guild_id,
             channel,
             settings.channel_id,
         )
         announced = 0
-        failed_post_ids: set[str] = set()
+        retry_post_ids: set[str] = set()
         for post in new_posts:
-            sent = await self._send_news_post(
+            send_result = await self._send_news_post(
                 channel,
                 settings,
                 post,
                 mention_role=announced == 0,
             )
-            if not sent:
-                failed_post_ids.add(post.post_id)
+            if send_result == _NEWS_SEND_RETRY:
+                retry_post_ids.add(post.post_id)
                 LOGGER.warning(
-                    "뉴스 자동 전송 실패 "
+                    "뉴스 자동 전송 일시 실패: 다음 자동 폴링에서 재시도합니다 "
                     "(guild_id=%s, channel_id=%s, post_id=%s, title=%r).",
                     settings.guild_id,
                     settings.channel_id,
                     post.post_id,
                     post.title,
                 )
+                continue
+            if send_result == _NEWS_SEND_BASELINE:
                 continue
             self.storage.mark_posts_seen(settings.guild_id, [post.post_id], announced=True)
             LOGGER.info(
@@ -2416,20 +2829,19 @@ class NewsCog(commands.Cog):
             )
             announced += 1
 
-        if failed_post_ids:
+        if retry_post_ids:
             LOGGER.warning(
-                "실패한 게시물은 본 것으로 처리되어 이후 자동 폴링에서 건너뜁니다 "
+                "일시 실패한 게시물은 본 것으로 처리하지 않아 이후 자동 폴링에서 재시도합니다 "
                 "(guild_id=%s, channel_id=%s, post_ids=%s).",
                 settings.guild_id,
                 settings.channel_id,
-                ", ".join(sorted(failed_post_ids)),
+                ", ".join(sorted(retry_post_ids)),
             )
-        seen_posts = [post.post_id for post in posts]
-        self.storage.mark_posts_seen(
-            settings.guild_id,
-            seen_posts,
+        self._mark_guild_posts_seen_for_poll(
+            settings,
+            posts,
+            exclude_post_ids=retry_post_ids,
         )
-        self.storage.set_last_seen_post_id(settings.guild_id, posts[0].post_id)
         return announced
 
     def _new_posts_for_guild(
@@ -2551,9 +2963,9 @@ class NewsCog(commands.Cog):
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         mention_role: bool = True,
-    ) -> bool:
+    ) -> str:
         channel_id = getattr(channel, "id", settings.channel_id)
-        role_id = self._claim_automatic_news_role_mention(
+        role_id = self._automatic_news_role_mention_id(
             channel_id,
             settings.role_id,
             requested=mention_role,
@@ -2567,7 +2979,8 @@ class NewsCog(commands.Cog):
                 batch_tasks=batch_tasks,
                 image_delivery=settings.image_delivery,
             )
-            return True
+            self._record_automatic_news_role_mention(role_id)
+            return _NEWS_SEND_SENT
         except discord.Forbidden as exc:
             LOGGER.warning(
                 "뉴스 자동 전송 권한 없음: Discord가 메시지 전송을 거부했습니다 "
@@ -2580,7 +2993,7 @@ class NewsCog(commands.Cog):
                 post.title,
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_BASELINE
         except discord.NotFound as exc:
             LOGGER.warning(
                 "뉴스 자동 전송 대상이 사라졌습니다 "
@@ -2592,7 +3005,7 @@ class NewsCog(commands.Cog):
                 post.title,
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_BASELINE
         except discord.HTTPException as exc:
             LOGGER.exception(
                 "뉴스 자동 전송 HTTP 오류 "
@@ -2606,7 +3019,7 @@ class NewsCog(commands.Cog):
                 getattr(exc, "status", None),
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_RETRY
         except Exception:
             LOGGER.exception(
                 "뉴스 자동 전송 중 예상치 못한 오류 "
@@ -2617,7 +3030,7 @@ class NewsCog(commands.Cog):
                 post.post_id,
                 post.title,
             )
-            return False
+            return _NEWS_SEND_RETRY
 
     async def _send_news_post_to_target(
         self,
@@ -2628,9 +3041,9 @@ class NewsCog(commands.Cog):
         *,
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         mention_role: bool = True,
-    ) -> bool:
+    ) -> str:
         channel_id = getattr(channel, "id", target.channel_id)
-        role_id = self._claim_automatic_news_role_mention(
+        role_id = self._automatic_news_role_mention_id(
             channel_id,
             settings.role_id,
             requested=mention_role,
@@ -2645,14 +3058,6 @@ class NewsCog(commands.Cog):
                 image_delivery=settings.image_delivery,
                 news_target_id=target.target_id,
             )
-            if sent_message is not None:
-                self.storage.record_news_post_message(
-                    target.target_id,
-                    post.post_id,
-                    getattr(channel, "id", target.channel_id),
-                    sent_message.id,
-                )
-            return True
         except discord.Forbidden as exc:
             LOGGER.warning(
                 "뉴스 자동 전송 권한 없음: Discord가 메시지 전송을 거부했습니다 "
@@ -2666,7 +3071,7 @@ class NewsCog(commands.Cog):
                 post.title,
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_BASELINE
         except discord.NotFound as exc:
             LOGGER.warning(
                 "뉴스 자동 전송 대상이 사라졌습니다 "
@@ -2679,7 +3084,7 @@ class NewsCog(commands.Cog):
                 post.title,
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_BASELINE
         except discord.HTTPException as exc:
             LOGGER.exception(
                 "뉴스 자동 전송 HTTP 오류 "
@@ -2694,7 +3099,7 @@ class NewsCog(commands.Cog):
                 getattr(exc, "status", None),
                 getattr(exc, "code", None),
             )
-            return False
+            return _NEWS_SEND_RETRY
         except Exception:
             LOGGER.exception(
                 "뉴스 자동 전송 중 예상치 못한 오류 "
@@ -2706,9 +3111,30 @@ class NewsCog(commands.Cog):
                 post.post_id,
                 post.title,
             )
-            return False
+            return _NEWS_SEND_RETRY
 
-    def _claim_automatic_news_role_mention(
+        self._record_automatic_news_role_mention(role_id)
+        if sent_message is not None:
+            try:
+                self.storage.record_news_post_message(
+                    target.target_id,
+                    post.post_id,
+                    getattr(channel, "id", target.channel_id),
+                    sent_message.id,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "뉴스 메시지 기록 실패: 메시지는 전송되었으므로 공지 완료로 처리합니다 "
+                    "(guild_id=%s, channel_id=%s, language=%s, post_id=%s, message_id=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    target.language,
+                    post.post_id,
+                    sent_message.id,
+                )
+        return _NEWS_SEND_SENT
+
+    def _automatic_news_role_mention_id(
         self,
         channel_id: int | None,
         role_id: int | None,
@@ -2733,15 +3159,58 @@ class NewsCog(commands.Cog):
             )
             return None
 
-        self._news_role_mention_times[role_id] = now
         return role_id
 
-    async def _broadcast_post_updates(self, post_ids: list[str]) -> None:
-        pending_targets = self.storage.get_pending_news_update_targets()
-        targets_by_post_id: dict[str, list[GuildNewsTarget]] = {}
-        for pending_post_id, target in pending_targets:
-            targets_by_post_id.setdefault(pending_post_id, []).append(target)
+    def _record_automatic_news_role_mention(self, role_id: int | None) -> None:
+        if role_id is None:
+            return
+        self._news_role_mention_times[role_id] = perf_counter()
 
+    def _pending_news_update_targets_by_post(self) -> dict[str, list[GuildNewsTarget]]:
+        targets_by_post_id: dict[str, list[GuildNewsTarget]] = {}
+        for pending_post_id, target in self.storage.get_pending_news_update_targets():
+            targets_by_post_id.setdefault(pending_post_id, []).append(target)
+        return targets_by_post_id
+
+    def _mark_old_news_update_targets_sent(
+        self,
+        post_id: str,
+        post: NewsPost,
+        targets: list[GuildNewsTarget],
+    ) -> None:
+        for target in targets:
+            self.storage.mark_news_update_sent(target.target_id, post_id)
+        LOGGER.info(
+            "오래된 글이라 수정 재전송을 건너뛰고 큐를 정리합니다 "
+            "(post_id=%s, title=%r, targets=%s).",
+            post_id,
+            post.title,
+            len(targets),
+        )
+
+    async def _broadcast_news_update_to_target(
+        self,
+        post_id: str,
+        post: NewsPost,
+        target: GuildNewsTarget,
+    ) -> None:
+        settings = self.storage.get_settings(target.guild_id)
+        if not settings.enabled:
+            self.storage.mark_news_update_sent(target.target_id, post_id)
+            return
+        try:
+            await self._apply_news_post_update(settings, target, post)
+            self.storage.mark_news_update_sent(target.target_id, post_id)
+        except Exception:
+            LOGGER.exception(
+                "뉴스 수정 반영 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                post_id,
+            )
+
+    async def _broadcast_post_updates(self, post_ids: list[str]) -> None:
+        targets_by_post_id = self._pending_news_update_targets_by_post()
         pending_post_ids = list(dict.fromkeys([*post_ids, *targets_by_post_id.keys()]))
         for post_id in pending_post_ids:
             post = self.storage.get_post(post_id)
@@ -2751,15 +3220,7 @@ class NewsCog(commands.Cog):
             if not targets:
                 continue
             if not _is_news_update_recent(post):
-                for target in targets:
-                    self.storage.mark_news_update_sent(target.target_id, post_id)
-                LOGGER.info(
-                    "오래된 글이라 수정 재전송을 건너뛰고 큐를 정리합니다 "
-                    "(post_id=%s, title=%r, targets=%s).",
-                    post_id,
-                    post.title,
-                    len(targets),
-                )
+                self._mark_old_news_update_targets_sent(post_id, post, targets)
                 continue
             LOGGER.info(
                 "뉴스 수정 감지 — 원본 메시지 수정 (post_id=%s, title=%r, targets=%s).",
@@ -2768,20 +3229,7 @@ class NewsCog(commands.Cog):
                 len(targets),
             )
             for target in targets:
-                settings = self.storage.get_settings(target.guild_id)
-                if not settings.enabled:
-                    self.storage.mark_news_update_sent(target.target_id, post_id)
-                    continue
-                try:
-                    await self._apply_news_post_update(settings, target, post)
-                    self.storage.mark_news_update_sent(target.target_id, post_id)
-                except Exception:
-                    LOGGER.exception(
-                        "뉴스 수정 반영 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
-                        target.guild_id,
-                        target.channel_id,
-                        post_id,
-                    )
+                await self._broadcast_news_update_to_target(post_id, post, target)
 
     async def _apply_news_post_update(
         self,
@@ -2924,6 +3372,83 @@ class NewsCog(commands.Cog):
                 if cached is not None:
                     self._image_cache_bytes -= len(cached[0])
 
+    @staticmethod
+    def _news_post_send_kwargs(
+        news_view: discord.ui.View,
+        mention: str | None,
+        role_id: int | None,
+        banner_file: discord.File | None,
+    ) -> dict[str, object]:
+        allowed_mentions = discord.AllowedMentions(
+            everyone=False,
+            users=False,
+            roles=[discord.Object(id=role_id)] if role_id else False,
+        )
+        send_kwargs: dict[str, object] = {
+            "view": news_view,
+            "allowed_mentions": allowed_mentions if mention else discord.AllowedMentions.none(),
+        }
+        if banner_file is not None:
+            send_kwargs["file"] = banner_file
+        return send_kwargs
+
+    def _news_followup_tasks(
+        self,
+        channel: discord.abc.Messageable,
+        post: NewsPost,
+    ) -> list[asyncio.Task[object]]:
+        followup_tasks: list[asyncio.Task[object]] = []
+        youtube_content = _youtube_links_content(post)
+        if youtube_content:
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content=youtube_content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                )
+            )
+        if not _is_twitter_news_post(post):
+            return followup_tasks
+
+        video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
+        video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
+        if video_url_groups:
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_twitter_video_to_channel(
+                        channel, video_url_groups, video_fallback_url or post.url
+                    )
+                )
+            )
+        elif video_fallback_url:
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content=video_fallback_url,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                )
+            )
+        return followup_tasks
+
+    @staticmethod
+    async def _log_news_followup_results(
+        post: NewsPost,
+        followup_tasks: list[asyncio.Task[object]],
+    ) -> None:
+        if not followup_tasks:
+            return
+        results = await asyncio.gather(*followup_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.error(
+                    "뉴스 후속 메시지 전송 실패 (post_id=%s, title=%r).",
+                    post.post_id,
+                    post.title,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
     async def _broadcast_post(
         self,
         channel: discord.abc.Messageable,
@@ -2937,11 +3462,6 @@ class NewsCog(commands.Cog):
         news_target_id: int | None = None,
     ) -> discord.Message | None:
         mention = f"<@&{role_id}>" if role_id else None
-        allowed_mentions = discord.AllowedMentions(
-            everyone=False,
-            users=False,
-            roles=[discord.Object(id=role_id)] if role_id else False,
-        )
 
         banner_file = _news_banner_file(banner_filename)
         standalone_urls = _standalone_image_urls(
@@ -2954,24 +3474,14 @@ class NewsCog(commands.Cog):
             post,
             include_zip_button=True,
             include_banner=banner_file is not None,
+            leading_text=mention,
             is_update=is_update,
             include_content_images=image_delivery == IMAGE_DELIVERY_EMBEDS,
         )
 
-        if mention:
-            await channel.send(
-                content=mention,
-                allowed_mentions=allowed_mentions,
-            )
-        send_kwargs = {
-            "view": news_view,
-            "allowed_mentions": discord.AllowedMentions.none(),
-        }
-        if banner_file is not None:
-            send_kwargs["file"] = banner_file
+        send_kwargs = self._news_post_send_kwargs(news_view, mention, role_id, banner_file)
         sent_message = await channel.send(**send_kwargs)
 
-        followup_tasks = []
         if image_delivery == IMAGE_DELIVERY_FILES:
             self._schedule_channel_image_messages(
                 channel,
@@ -2980,46 +3490,7 @@ class NewsCog(commands.Cog):
                 image_urls=standalone_urls,
                 news_target_id=news_target_id,
             )
-        youtube_content = _youtube_links_content(post)
-        if youtube_content:
-            followup_tasks.append(
-                asyncio.create_task(
-                    channel.send(
-                        content=youtube_content,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                )
-            )
-        if _is_twitter_news_post(post):
-            video_url_groups = _twitter_video_url_groups_from_raw(post.raw)
-            video_fallback_url = _twitter_video_fallback_url_from_raw(post.raw)
-            if video_url_groups:
-                followup_tasks.append(
-                    asyncio.create_task(
-                        self._send_twitter_video_to_channel(
-                            channel, video_url_groups, video_fallback_url or post.url
-                        )
-                    )
-                )
-            elif video_fallback_url:
-                followup_tasks.append(
-                    asyncio.create_task(
-                        channel.send(
-                            content=video_fallback_url,
-                            allowed_mentions=discord.AllowedMentions.none(),
-                        )
-                    )
-                )
-        if followup_tasks:
-            results = await asyncio.gather(*followup_tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    LOGGER.error(
-                        "뉴스 후속 메시지 전송 실패 (post_id=%s, title=%r).",
-                        post.post_id,
-                        post.title,
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
+        await self._log_news_followup_results(post, self._news_followup_tasks(channel, post))
         return sent_message
 
     async def _send_news_post_followups(
@@ -3131,6 +3602,101 @@ class NewsCog(commands.Cog):
                 return None
         return cached if isinstance(cached, discord.abc.Messageable) else None
 
+    async def _zip_buffers_for_post(
+        self,
+        post: NewsPost,
+        upload_limit: int,
+    ) -> tuple[list[io.BytesIO], int, int]:
+        cached = self._zip_cache.get(post.post_id)
+        if cached is None or cached[3] != upload_limit:
+            buffers, count, skipped = await self._build_image_zip_parts(
+                post,
+                max_part_bytes=upload_limit,
+            )
+            if buffers and count > 0:
+                self._cache_zip(
+                    post.post_id,
+                    [buffer.getvalue() for buffer in buffers],
+                    count,
+                    skipped,
+                    upload_limit,
+                )
+            return buffers, count, skipped
+
+        zip_part_bytes, count, skipped, _ = cached
+        return [io.BytesIO(part) for part in zip_part_bytes], count, skipped
+
+    @staticmethod
+    def _zip_empty_message(language: str, skipped: int) -> str:
+        return (
+            _news_ui_text(language, "zip_upload_too_large")
+            if skipped
+            else _news_ui_text(language, "zip_empty")
+        )
+
+    @staticmethod
+    def _zip_ready_message(language: str, count: int, total_parts: int, skipped: int) -> str:
+        if total_parts > 1:
+            message = _news_ui_text(language, "zip_ready_split").format(
+                count=count,
+                parts=total_parts,
+            )
+        else:
+            message = _news_ui_text(language, "zip_ready").format(count=count)
+        if skipped:
+            message = (
+                f"{message}\n"
+                f"{_news_ui_text(language, 'zip_oversized_skipped').format(skipped=skipped)}"
+            )
+        return message
+
+    async def _send_zip_buffers(
+        self,
+        interaction: discord.Interaction,
+        filename: str,
+        buffers: list[io.BytesIO],
+        message: str,
+    ) -> None:
+        total_parts = len(buffers)
+        for index, buffer in enumerate(buffers, start=1):
+            buffer.seek(0)
+            part_filename = self._zip_part_filename(filename, index, total_parts)
+            content = message if index == 1 else f"{index}/{total_parts}"
+            await interaction.followup.send(
+                content,
+                file=discord.File(buffer, filename=part_filename),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def _send_zip_upload_failure(
+        self,
+        interaction: discord.Interaction,
+        post_id: str,
+        language: str,
+        exc: discord.HTTPException,
+        *,
+        total_parts: int,
+        upload_limit: int,
+    ) -> None:
+        if getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005:
+            LOGGER.warning(
+                "게시물 %s의 이미지 ZIP 업로드가 Discord 한도를 초과했습니다 "
+                "(parts=%s, limit=%s).",
+                post_id,
+                total_parts,
+                upload_limit,
+            )
+            message = _news_ui_text(language, "zip_upload_too_large")
+        else:
+            LOGGER.exception("게시물 %s의 이미지 ZIP 업로드 실패.", post_id)
+            message = _news_ui_text(language, "zip_fetch_failed")
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     async def handle_zip_request(
         self, interaction: discord.Interaction, post_id: str
     ) -> None:
@@ -3145,23 +3711,7 @@ class NewsCog(commands.Cog):
 
         try:
             upload_limit = self._zip_upload_limit_bytes(interaction)
-            cached = self._zip_cache.get(post.post_id)
-            if cached is None or cached[3] != upload_limit:
-                buffers, count, skipped = await self._build_image_zip_parts(
-                    post,
-                    max_part_bytes=upload_limit,
-                )
-                if buffers and count > 0:
-                    self._cache_zip(
-                        post.post_id,
-                        [buffer.getvalue() for buffer in buffers],
-                        count,
-                        skipped,
-                        upload_limit,
-                    )
-            else:
-                zip_part_bytes, count, skipped, _ = cached
-                buffers = [io.BytesIO(part) for part in zip_part_bytes]
+            buffers, count, skipped = await self._zip_buffers_for_post(post, upload_limit)
         except Exception:
             LOGGER.exception("게시물 %s의 이미지 ZIP 생성 실패.", post_id)
             await interaction.followup.send(
@@ -3171,13 +3721,8 @@ class NewsCog(commands.Cog):
             return
 
         if not buffers or count == 0:
-            message = (
-                _news_ui_text(language, "zip_upload_too_large")
-                if skipped
-                else _news_ui_text(language, "zip_empty")
-            )
             await interaction.followup.send(
-                message,
+                self._zip_empty_message(language, skipped),
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
@@ -3185,51 +3730,18 @@ class NewsCog(commands.Cog):
 
         filename = _safe_zip_filename(post)
         total_parts = len(buffers)
-        message = (
-            _news_ui_text(language, "zip_ready_split").format(
-                count=count,
-                parts=total_parts,
-            )
-            if total_parts > 1
-            else _news_ui_text(language, "zip_ready").format(count=count)
-        )
-        if skipped:
-            message = (
-                f"{message}\n"
-                f"{_news_ui_text(language, 'zip_oversized_skipped').format(skipped=skipped)}"
-            )
+        message = self._zip_ready_message(language, count, total_parts, skipped)
 
         try:
-            for index, buffer in enumerate(buffers, start=1):
-                buffer.seek(0)
-                part_filename = self._zip_part_filename(filename, index, total_parts)
-                content = message if index == 1 else f"{index}/{total_parts}"
-                await interaction.followup.send(
-                    content,
-                    file=discord.File(buffer, filename=part_filename),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+            await self._send_zip_buffers(interaction, filename, buffers, message)
         except discord.HTTPException as exc:
-            if getattr(exc, "status", None) == 413 or getattr(exc, "code", None) == 40005:
-                LOGGER.warning(
-                    "게시물 %s의 이미지 ZIP 업로드가 Discord 한도를 초과했습니다 "
-                    "(parts=%s, limit=%s).",
-                    post_id,
-                    total_parts,
-                    upload_limit,
-                )
-                await interaction.followup.send(
-                    _news_ui_text(language, "zip_upload_too_large"),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
-            LOGGER.exception("게시물 %s의 이미지 ZIP 업로드 실패.", post_id)
-            await interaction.followup.send(
-                _news_ui_text(language, "zip_fetch_failed"),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
+            await self._send_zip_upload_failure(
+                interaction,
+                post_id,
+                language,
+                exc,
+                total_parts=total_parts,
+                upload_limit=upload_limit,
             )
 
     async def handle_brighten_spoiler_request(
@@ -3358,7 +3870,7 @@ class NewsCog(commands.Cog):
         if post is not None:
             return post
 
-        twitter_id = post_id.removeprefix("twitter:")
+        twitter_id = post_id.removeprefix(_TWITTER_NEWS_POST_ID_PREFIX)
         twitter_post = self.storage.get_twitter_post(twitter_id)
         if twitter_post is not None:
             return _twitter_posts_as_news_posts([twitter_post], [])[0]
@@ -3373,16 +3885,18 @@ class NewsCog(commands.Cog):
             return None
 
         wanted_ids = {post_id, twitter_id}
-        wanted_ids.update(
-            value.removeprefix("twitter:")
-            for value in list(wanted_ids)
-            if value.startswith("twitter:")
-        )
-        wanted_ids.update(
+        prefixed_twitter_ids = {
+            value.removeprefix(_TWITTER_NEWS_POST_ID_PREFIX)
+            for value in wanted_ids
+            if value.startswith(_TWITTER_NEWS_POST_ID_PREFIX)
+        }
+        wanted_ids.update(prefixed_twitter_ids)
+        prefixed_x_ids = {
             value.removeprefix("x:")
-            for value in list(wanted_ids)
+            for value in wanted_ids
             if value.startswith("x:")
-        )
+        }
+        wanted_ids.update(prefixed_x_ids)
         for candidate in recent_posts:
             tweet_id = str(candidate.raw.get("tweet_id") or "").strip()
             if candidate.post_id in wanted_ids or tweet_id in wanted_ids:
@@ -3897,6 +4411,72 @@ class NewsCog(commands.Cog):
             if task.done():
                 self._image_download_tasks.pop(url, None)
 
+    async def _image_download_response_result(
+        self,
+        response: aiohttp.ClientResponse,
+        url: str,
+        attempt: int,
+    ) -> tuple[bytes, str | None] | object | None:
+        if 400 <= response.status < 500:
+            self._handle_image_download_client_error(response.status, url)
+            return None
+        if response.status >= 500:
+            return await self._image_download_retry_or_none(
+                "이미지 다운로드 최종 실패 (%s/%s, HTTP %s): %s",
+                "이미지 다운로드 재시도 (%s/%s, HTTP %s): %s",
+                attempt,
+                url,
+                response.status,
+            )
+
+        content_type = response.headers.get("Content-Type")
+        data = await response.read()
+        if data:
+            return data, content_type
+        return await self._image_download_retry_or_none(
+            "이미지 다운로드 최종 실패: 빈 응답 (%s/%s): %s",
+            "이미지 다운로드 재시도: 빈 응답 (%s/%s): %s",
+            attempt,
+            url,
+        )
+
+    def _handle_image_download_client_error(self, status: int, url: str) -> None:
+        if status in {400, 401, 403, 404, 410}:
+            self._remember_failed_image_url(url)
+        if status == 403 and _is_namu_wiki_image_url(url):
+            LOGGER.debug("나무위키 이미지 직접 다운로드 거부 (403): %s", url)
+        else:
+            LOGGER.warning("이미지 다운로드 실패 (%s): %s", status, url)
+
+    async def _image_download_retry_or_none(
+        self,
+        final_message: str,
+        retry_message: str,
+        attempt: int,
+        url: str,
+        *extra: object,
+    ) -> object | None:
+        if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
+            LOGGER.warning(final_message, attempt, IMAGE_DOWNLOAD_ATTEMPTS, *extra, url)
+            return None
+        LOGGER.info(retry_message, attempt, IMAGE_DOWNLOAD_ATTEMPTS, *extra, url)
+        await asyncio.sleep(0.5 * attempt)
+        return _IMAGE_DOWNLOAD_RETRY
+
+    async def _image_download_exception_result(
+        self,
+        exc: aiohttp.ClientError | asyncio.TimeoutError,
+        attempt: int,
+        url: str,
+    ) -> object | None:
+        return await self._image_download_retry_or_none(
+            "이미지 다운로드 최종 실패 (%s/%s, %s): %s",
+            "이미지 다운로드 재시도 (%s/%s, %s): %s",
+            attempt,
+            url,
+            type(exc).__name__,
+        )
+
     async def _fetch_image(self, url: str) -> tuple[bytes, str | None] | None:
         cached = self._image_cache.get(url)
         if cached is not None:
@@ -3914,72 +4494,21 @@ class NewsCog(commands.Cog):
                     timeout=timeout,
                     headers=_image_request_headers(url),
                 ) as response:
-                    if 400 <= response.status < 500:
-                        if response.status in {400, 401, 403, 404, 410}:
-                            self._remember_failed_image_url(url)
-                        if response.status == 403 and _is_namu_wiki_image_url(url):
-                            LOGGER.debug("나무위키 이미지 직접 다운로드 거부 (403): %s", url)
-                        else:
-                            LOGGER.warning("이미지 다운로드 실패 (%s): %s", response.status, url)
+                    result = await self._image_download_response_result(
+                        response,
+                        url,
+                        attempt,
+                    )
+                    if result is _IMAGE_DOWNLOAD_RETRY:
+                        continue
+                    if result is None:
                         return None
-                    if response.status >= 500:
-                        if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
-                            LOGGER.warning(
-                                "이미지 다운로드 최종 실패 (%s/%s, HTTP %s): %s",
-                                attempt,
-                                IMAGE_DOWNLOAD_ATTEMPTS,
-                                response.status,
-                                url,
-                            )
-                            return None
-                        LOGGER.info(
-                            "이미지 다운로드 재시도 (%s/%s, HTTP %s): %s",
-                            attempt,
-                            IMAGE_DOWNLOAD_ATTEMPTS,
-                            response.status,
-                            url,
-                        )
-                        await asyncio.sleep(0.5 * attempt)
-                        continue
-                    content_type = response.headers.get("Content-Type")
-                    data = await response.read()
-                    if not data:
-                        if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
-                            LOGGER.warning(
-                                "이미지 다운로드 최종 실패: 빈 응답 (%s/%s): %s",
-                                attempt,
-                                IMAGE_DOWNLOAD_ATTEMPTS,
-                                url,
-                            )
-                            return None
-                        LOGGER.info(
-                            "이미지 다운로드 재시도: 빈 응답 (%s/%s): %s",
-                            attempt,
-                            IMAGE_DOWNLOAD_ATTEMPTS,
-                            url,
-                        )
-                        await asyncio.sleep(0.5 * attempt)
-                        continue
+                    data, content_type = result
                     self._cache_image(url, data, content_type)
                     return data, content_type
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt >= IMAGE_DOWNLOAD_ATTEMPTS:
-                    LOGGER.warning(
-                        "이미지 다운로드 최종 실패 (%s/%s, %s): %s",
-                        attempt,
-                        IMAGE_DOWNLOAD_ATTEMPTS,
-                        type(exc).__name__,
-                        url,
-                    )
+                if await self._image_download_exception_result(exc, attempt, url) is None:
                     return None
-                LOGGER.info(
-                    "이미지 다운로드 재시도 (%s/%s, %s): %s",
-                    attempt,
-                    IMAGE_DOWNLOAD_ATTEMPTS,
-                    type(exc).__name__,
-                    url,
-                )
-                await asyncio.sleep(0.5 * attempt)
         return None
 
     def _remember_failed_image_url(self, url: str) -> None:
@@ -4078,54 +4607,83 @@ class NewsCog(commands.Cog):
             LOGGER.info("시작 시 동기화 생략: 이미 완료되었습니다.")
             return
         LOGGER.info("시작 시 동기화 시작: Steam 뉴스, 유튜브 기준선, X 게시물을 확인합니다.")
+        await self._sync_steam_news_on_startup()
+        await self._sync_youtube_startup_baseline()
+        await self._sync_twitter_on_startup()
+        LOGGER.info("시작 시 동기화 처리 완료.")
+        await self.run_startup_news_delivery()
+
+    async def _sync_steam_news_on_startup(self) -> None:
         if self.news_source is not None:
             try:
                 posts_by_language, _, _ = await self._sync_global_news_cache()
                 self._startup_synced = True
-                synced_posts = posts_by_language.get(self.config.steam_language) or next(
-                    iter(posts_by_language.values()),
-                    [],
-                )
-                latest = max(
-                    synced_posts,
-                    key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
-                    default=None,
-                )
-                if latest is not None:
-                    LOGGER.info(
-                        "시작 시 Steam 뉴스 동기화 완료: %d개 등록. 최신 소식: %s (%s)",
-                        len(synced_posts),
-                        latest.title,
-                        latest.url,
-                    )
-                else:
-                    LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
+                self._log_startup_steam_sync_result(posts_by_language)
             except Exception as exc:
                 if _is_internet_exception(exc):
                     _log_internet_exception("시작 시 뉴스 동기화 실패", exc)
                 else:
                     LOGGER.exception("시작 시 뉴스 동기화 실패.")
-        await self._sync_youtube_startup_baseline()
+
+    def _log_startup_steam_sync_result(
+        self,
+        posts_by_language: Mapping[str, list[NewsPost]],
+    ) -> None:
+        synced_posts = posts_by_language.get(self.config.steam_language) or next(
+            iter(posts_by_language.values()),
+            [],
+        )
+        latest = max(
+            synced_posts,
+            key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc),
+            default=None,
+        )
+        if latest is None:
+            LOGGER.info("시작 시 Steam 뉴스 동기화 완료: 0개 등록.")
+            return
+        LOGGER.info(
+            "시작 시 Steam 뉴스 동기화 완료: %d개 등록. 최신 소식: %s (%s)",
+            len(synced_posts),
+            latest.title,
+            latest.url,
+        )
+
+    def _startup_twitter_sync_skip_reason(self, observed_at: datetime) -> str | None:
+        if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
+            return "no_targets"
+        if not self._is_twitter_tracking_window(observed_at):
+            return "outside_window"
+        return None
+
+    def _log_startup_twitter_sync_skip(self, reason: str) -> None:
+        if reason == "no_targets":
+            LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
+            return
+        LOGGER.info(
+            "시작 시 X 게시물 동기화 생략: 현재 X 추적 시간대가 아닙니다 (KST %s).",
+            _format_windows_label(self.config.twitter_tracking_windows_kst),
+        )
+
+    def _log_startup_twitter_sync_result(self, saved: int) -> None:
+        latest = self.storage.get_latest_twitter_post()
+        if latest is None:
+            LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
+            return
+        LOGGER.info(
+            "시작 시 X 게시물 동기화 완료: %d개 저장. 최신 소식: %s (%s)",
+            saved,
+            latest.title,
+            latest.url,
+        )
+
+    async def _sync_twitter_on_startup(self) -> None:
         try:
-            if not self.storage.list_all_news_targets() and not self.storage.list_twitter_targets():
-                LOGGER.info("시작 시 X 게시물 동기화 생략: 설정된 X/뉴스 자동 전송 대상이 없습니다.")
-            elif not self._is_twitter_tracking_window(datetime.now(timezone.utc)):
-                LOGGER.info(
-                    "시작 시 X 게시물 동기화 생략: 현재 X 추적 시간대가 아닙니다 (KST %s).",
-                    _format_windows_label(self.config.twitter_tracking_windows_kst),
-                )
-            else:
-                saved, _ = await self._sync_twitter_posts()
-                latest = self.storage.get_latest_twitter_post()
-                if latest is not None:
-                    LOGGER.info(
-                        "시작 시 X 게시물 동기화 완료: %d개 저장. 최신 소식: %s (%s)",
-                        saved,
-                        latest.title,
-                        latest.url,
-                    )
-                else:
-                    LOGGER.info("시작 시 X 게시물 동기화 완료: %d개 저장.", saved)
+            skip_reason = self._startup_twitter_sync_skip_reason(datetime.now(timezone.utc))
+            if skip_reason is not None:
+                self._log_startup_twitter_sync_skip(skip_reason)
+                return
+            saved, _ = await self._sync_twitter_posts()
+            self._log_startup_twitter_sync_result(saved)
         except XClientError as exc:
             if _is_internet_exception(exc):
                 _log_internet_exception("시작 시 X 게시물 동기화 건너뜀", exc)
@@ -4136,9 +4694,6 @@ class NewsCog(commands.Cog):
                 _log_internet_exception("시작 시 X 게시물 동기화 실패", exc)
             else:
                 LOGGER.exception("시작 시 X 게시물 동기화 실패.")
-        LOGGER.info("시작 시 동기화 처리 완료.")
-        await self.run_startup_news_delivery()
-
 
     async def run_startup_news_delivery(self) -> None:
         async with self._poll_lock:
@@ -4195,6 +4750,10 @@ class NewsCog(commands.Cog):
         )
 
     async def _refresh_recent_news_cache(self, language: str) -> None:
+        await self._refresh_recent_steam_news_cache(language)
+        await self._refresh_recent_twitter_news_cache()
+
+    async def _refresh_recent_steam_news_cache(self, language: str) -> None:
         if self.news_source is not None:
             try:
                 fresh = await self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
@@ -4208,6 +4767,7 @@ class NewsCog(commands.Cog):
                     self.storage.save_posts(fresh[:NEWS_POST_LIMIT])
                     self._schedule_image_cache_warmup(fresh[:NEWS_POST_LIMIT])
 
+    async def _refresh_recent_twitter_news_cache(self) -> None:
         if self.x_source is not None and self._is_twitter_tracking_window(datetime.now(timezone.utc)):
             try:
                 await self._sync_twitter_posts()
@@ -4330,6 +4890,229 @@ class NewsCog(commands.Cog):
         saved = self.storage.save_twitter_posts(posts)
         return saved, posts
 
+    def _mark_twitter_recovery_baseline(
+        self,
+        targets: list[GuildTwitterTarget],
+        latest_post_id: str,
+    ) -> None:
+        updated = 0
+        for target in targets:
+            if target.enabled and target.last_seen_post_id != latest_post_id:
+                self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+                updated += 1
+        self._twitter_recovery_baseline_pending = False
+        LOGGER.info(
+            "네트워크 복구 후 X 게시물 기준선을 갱신했습니다. 누적 X 자동 전송은 건너뜁니다 "
+            "(post_id=%s, targets=%s).",
+            latest_post_id,
+            updated,
+        )
+
+    def _twitter_target_settings(
+        self,
+        targets: list[GuildTwitterTarget],
+    ) -> dict[int, GuildSettings]:
+        return {
+            target.guild_id: self.storage.get_settings(target.guild_id)
+            for target in targets
+        }
+
+    def _twitter_targets_using_steam_preference(
+        self,
+        targets: list[GuildTwitterTarget],
+        settings_by_guild_id: Mapping[int, GuildSettings],
+    ) -> list[GuildTwitterTarget]:
+        return [
+            target
+            for target in targets
+            if target.enabled
+            and settings_by_guild_id[target.guild_id].news_source_mode != NEWS_SOURCE_TWITTER
+        ]
+
+    async def _steam_posts_by_twitter_id_for_targets(
+        self,
+        targets: list[GuildTwitterTarget],
+        settings_by_guild_id: Mapping[int, GuildSettings],
+        posts: list[TwitterPost],
+    ) -> dict[str, list[NewsPost]]:
+        targets_using_steam_preference = self._twitter_targets_using_steam_preference(
+            targets,
+            settings_by_guild_id,
+        )
+        if not targets_using_steam_preference:
+            return {}
+        await self._refresh_steam_cache_for_twitter_links(posts)
+        return self._steam_posts_by_twitter_post_id(posts)
+
+    def _new_recent_twitter_posts_for_target(
+        self,
+        target: GuildTwitterTarget,
+        posts: list[TwitterPost],
+    ) -> list[TwitterPost]:
+        latest_post_id = posts[0].post_id
+        new_posts = self._new_twitter_posts_for_target(target, posts)
+        if not new_posts:
+            self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+            return []
+
+        max_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
+        if max_age <= 0:
+            return new_posts
+
+        recent_posts = [post for post in new_posts if _is_twitter_post_recent(post, max_age)]
+        if not recent_posts:
+            self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
+        return recent_posts
+
+    async def _process_twitter_targets(
+        self,
+        targets: list[GuildTwitterTarget],
+        posts: list[TwitterPost],
+        settings_by_guild_id: Mapping[int, GuildSettings],
+        steam_posts_by_twitter_id: Mapping[str, list[NewsPost]],
+    ) -> int:
+        send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
+        results = await asyncio.gather(
+            *(
+                asyncio.create_task(
+                    self._process_twitter_target(
+                        target,
+                        posts,
+                        settings_by_guild_id[target.guild_id],
+                        steam_posts_by_twitter_id,
+                        send_semaphore,
+                    )
+                )
+                for target in targets
+            ),
+            return_exceptions=True,
+        )
+        return self._sum_twitter_target_results(results)
+
+    def _sum_twitter_target_results(self, results: Iterable[object]) -> int:
+        announced = 0
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.error(
+                    "X 게시물 자동 전송 대상 처리 실패.",
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                continue
+            announced += int(result)
+        return announced
+
+    async def _process_twitter_target(
+        self,
+        target: GuildTwitterTarget,
+        posts: list[TwitterPost],
+        settings: GuildSettings,
+        steam_posts_by_twitter_id: Mapping[str, list[NewsPost]],
+        send_semaphore: asyncio.Semaphore,
+    ) -> int:
+        if not target.enabled:
+            return 0
+        async with send_semaphore:
+            channel = await self._resolve_twitter_target_channel(target)
+            if channel is None:
+                return 0
+            new_posts = self._new_recent_twitter_posts_for_target(target, posts)
+            if not new_posts:
+                return 0
+            prefer_steam_duplicates = settings.news_source_mode != NEWS_SOURCE_TWITTER
+            return await self._send_twitter_posts_to_target(
+                target,
+                channel,
+                new_posts,
+                steam_posts_by_twitter_id,
+                prefer_steam_duplicates=prefer_steam_duplicates,
+            )
+
+    async def _send_twitter_posts_to_target(
+        self,
+        target: GuildTwitterTarget,
+        channel: discord.abc.Messageable,
+        new_posts: list[TwitterPost],
+        steam_posts_by_twitter_id: Mapping[str, list[NewsPost]],
+        *,
+        prefer_steam_duplicates: bool,
+    ) -> int:
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
+        announced = 0
+        image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
+        for post in new_posts:
+            matching_steam_posts = (
+                steam_posts_by_twitter_id.get(post.post_id, [])
+                if prefer_steam_duplicates
+                else []
+            )
+            if matching_steam_posts:
+                self._skip_twitter_post_for_steam_duplicate(target, post, matching_steam_posts)
+                continue
+            sent = await self._send_twitter_post_for_target(
+                target,
+                channel,
+                post,
+                image_batches_by_post_id.get(post.post_id),
+            )
+            if not sent:
+                continue
+            self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
+            LOGGER.info(
+                "새 X 게시물 공지 | %s | %s | delay=%s초 | 제목=%s",
+                guild_log,
+                channel_log,
+                _twitter_post_delay_seconds(post),
+                post.title,
+            )
+            announced += 1
+        return announced
+
+    def _skip_twitter_post_for_steam_duplicate(
+        self,
+        target: GuildTwitterTarget,
+        post: TwitterPost,
+        matching_steam_posts: list[NewsPost],
+    ) -> None:
+        self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
+        LOGGER.info(
+            "X 게시물 자동 전송 생략: 같은 Steam 소식을 우선합니다 "
+            "(guild_id=%s, channel_id=%s, twitter_post_id=%s, steam_post_ids=%s).",
+            target.guild_id,
+            target.channel_id,
+            post.post_id,
+            ", ".join(steam_post.post_id for steam_post in matching_steam_posts),
+        )
+
+    async def _send_twitter_post_for_target(
+        self,
+        target: GuildTwitterTarget,
+        channel: discord.abc.Messageable,
+        post: TwitterPost,
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None,
+    ) -> bool:
+        try:
+            await self._send_twitter_post_to_channel(
+                channel,
+                post,
+                batch_tasks=batch_tasks,
+            )
+        except discord.HTTPException:
+            LOGGER.exception(
+                "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                post.post_id,
+            )
+            return False
+        return True
+
     async def _poll_twitter_once(self) -> int:
         targets = self.storage.list_twitter_targets()
         if not targets:
@@ -4346,126 +5129,338 @@ class NewsCog(commands.Cog):
 
         posts = posts[:TWITTER_POST_LIMIT]
         if self._twitter_recovery_baseline_pending:
-            latest_post_id = posts[0].post_id
-            updated = 0
-            for target in targets:
-                if target.enabled and target.last_seen_post_id != latest_post_id:
-                    self.storage.mark_twitter_target_seen(target.guild_id, latest_post_id)
-                    updated += 1
-            self._twitter_recovery_baseline_pending = False
-            LOGGER.info(
-                "네트워크 복구 후 X 게시물 기준선을 갱신했습니다. 누적 X 자동 전송은 건너뜁니다 "
-                "(post_id=%s, targets=%s).",
-                latest_post_id,
-                updated,
-            )
+            self._mark_twitter_recovery_baseline(targets, posts[0].post_id)
             return 0
 
-        settings_by_guild_id = {
-            target.guild_id: self.storage.get_settings(target.guild_id)
-            for target in targets
-        }
-        targets_using_steam_preference = [
-            target
-            for target in targets
-            if target.enabled
-            and settings_by_guild_id[target.guild_id].news_source_mode != NEWS_SOURCE_TWITTER
-        ]
-        if targets_using_steam_preference:
-            await self._refresh_steam_cache_for_twitter_links(posts)
-            steam_posts_by_twitter_id = self._steam_posts_by_twitter_post_id(posts)
-        else:
-            steam_posts_by_twitter_id = {}
-        send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
-
-        async def process_target(target: GuildTwitterTarget) -> int:
-            if not target.enabled:
-                return 0
-            settings = settings_by_guild_id[target.guild_id]
-            prefer_steam_duplicates = settings.news_source_mode != NEWS_SOURCE_TWITTER
-            async with send_semaphore:
-                channel = await self._resolve_twitter_target_channel(target)
-                if channel is None:
-                    return 0
-                guild_log, channel_log = self._destination_logs(
-                    target.guild_id,
-                    channel,
-                    target.channel_id,
-                )
-                new_posts = self._new_twitter_posts_for_target(target, posts)
-                if not new_posts:
-                    self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
-                    return 0
-                max_age = (
-                    self.config.twitter_announce_max_age_seconds
-                    or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
-                )
-                if max_age > 0:
-                    new_posts = [
-                        post for post in new_posts
-                        if _is_twitter_post_recent(post, max_age)
-                    ]
-                    if not new_posts:
-                        self.storage.mark_twitter_target_seen(target.guild_id, posts[0].post_id)
-                        return 0
-                announced = 0
-                image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(new_posts)
-                for post in new_posts:
-                    matching_steam_posts = (
-                        steam_posts_by_twitter_id.get(post.post_id, [])
-                        if prefer_steam_duplicates
-                        else []
-                    )
-                    if matching_steam_posts:
-                        self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
-                        LOGGER.info(
-                            "X 게시물 자동 전송 생략: 같은 Steam 소식을 우선합니다 "
-                            "(guild_id=%s, channel_id=%s, twitter_post_id=%s, steam_post_ids=%s).",
-                            target.guild_id,
-                            target.channel_id,
-                            post.post_id,
-                            ", ".join(steam_post.post_id for steam_post in matching_steam_posts),
-                        )
-                        continue
-                    try:
-                        await self._send_twitter_post_to_channel(
-                            channel,
-                            post,
-                            batch_tasks=image_batches_by_post_id.get(post.post_id),
-                        )
-                    except discord.HTTPException:
-                        LOGGER.exception(
-                            "X 게시물 자동 전송 실패 (guild_id=%s, channel_id=%s, post_id=%s).",
-                            target.guild_id,
-                            target.channel_id,
-                            post.post_id,
-                        )
-                        continue
-                    self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
-                    LOGGER.info(
-                        "새 X 게시물 공지 | %s | %s | delay=%s초 | 제목=%s",
-                        guild_log,
-                        channel_log,
-                        _twitter_post_delay_seconds(post),
-                        post.title,
-                    )
-                    announced += 1
-                return announced
-
-        announced = 0
-        results = await asyncio.gather(
-            *(asyncio.create_task(process_target(target)) for target in targets),
-            return_exceptions=True,
+        settings_by_guild_id = self._twitter_target_settings(targets)
+        steam_posts_by_twitter_id = await self._steam_posts_by_twitter_id_for_targets(
+            targets,
+            settings_by_guild_id,
+            posts,
         )
+        return await self._process_twitter_targets(
+            targets,
+            posts,
+            settings_by_guild_id,
+            steam_posts_by_twitter_id,
+        )
+
+    def _hampang_poll_context(
+        self,
+        x_posts: list[TwitterPost],
+        youtube_uploads: list[YoutubeUpload],
+        window_started_at: datetime | None,
+    ) -> HampangPollContext:
+        latest_x_post_id = x_posts[0].post_id if x_posts else None
+        latest_youtube_video_id = youtube_uploads[0].video_id if youtube_uploads else None
+        max_age = (
+            self.config.twitter_announce_max_age_seconds
+            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        )
+        return HampangPollContext(
+            x_posts=x_posts,
+            youtube_uploads=youtube_uploads,
+            latest_x_post_id=latest_x_post_id,
+            latest_youtube_video_id=latest_youtube_video_id,
+            x_ids=[post.post_id for post in x_posts],
+            youtube_ids=[upload.video_id for upload in youtube_uploads],
+            x_baseline_only=self._hampang_x_recovery_baseline_pending
+            and latest_x_post_id is not None,
+            youtube_baseline_only=self._hampang_youtube_recovery_baseline_pending
+            and latest_youtube_video_id is not None,
+            window_started_at=window_started_at,
+            max_age_seconds=max_age,
+        )
+
+    def _hampang_x_target_plan(
+        self,
+        target: GuildHampangTarget,
+        context: HampangPollContext,
+    ) -> tuple[str | None, list[TwitterPost]]:
+        if not context.x_posts or context.latest_x_post_id is None:
+            return None, []
+        if context.x_baseline_only:
+            return context.latest_x_post_id, []
+        if not target.last_x_post_id or target.last_x_post_id not in context.x_ids:
+            LOGGER.info(
+                "햄햄팡팡 X 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
+                "(guild_id=%s, post_id=%s).",
+                target.guild_id,
+                context.latest_x_post_id,
+            )
+            return context.latest_x_post_id, []
+
+        last_seen_index = context.x_ids.index(target.last_x_post_id)
+        candidate_posts = list(reversed(context.x_posts[:last_seen_index]))
+        new_posts = self._auto_sendable_hampang_x_posts(
+            candidate_posts,
+            target=target,
+            window_started_at=context.window_started_at,
+            max_age_seconds=context.max_age_seconds,
+        )
+        if candidate_posts and not new_posts:
+            self._log_hampang_x_baseline_skip(target, context, len(candidate_posts))
+            return context.latest_x_post_id, []
+        return None, new_posts
+
+    def _hampang_youtube_target_plan(
+        self,
+        target: GuildHampangTarget,
+        context: HampangPollContext,
+    ) -> tuple[str | None, list[YoutubeUpload]]:
+        if not context.youtube_uploads or context.latest_youtube_video_id is None:
+            return None, []
+        if context.youtube_baseline_only:
+            return context.latest_youtube_video_id, []
+        if (
+            not target.last_youtube_video_id
+            or target.last_youtube_video_id not in context.youtube_ids
+        ):
+            LOGGER.info(
+                "햄햄팡팡 YouTube 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
+                "(guild_id=%s, video_id=%s).",
+                target.guild_id,
+                context.latest_youtube_video_id,
+            )
+            return context.latest_youtube_video_id, []
+
+        last_seen_index = context.youtube_ids.index(target.last_youtube_video_id)
+        candidate_uploads = list(reversed(context.youtube_uploads[:last_seen_index]))
+        new_uploads = self._auto_sendable_hampang_youtube_uploads(
+            candidate_uploads,
+            target=target,
+            window_started_at=context.window_started_at,
+        )
+        if candidate_uploads and not new_uploads:
+            self._log_hampang_youtube_baseline_skip(target, context, len(candidate_uploads))
+            return context.latest_youtube_video_id, []
+        return None, new_uploads
+
+    def _hampang_target_plan(
+        self,
+        target: GuildHampangTarget,
+        context: HampangPollContext,
+    ) -> HampangTargetPlan:
+        baseline_x_id, new_x_posts = self._hampang_x_target_plan(target, context)
+        baseline_youtube_id, new_youtube_uploads = self._hampang_youtube_target_plan(
+            target,
+            context,
+        )
+        return HampangTargetPlan(
+            baseline_x_id,
+            baseline_youtube_id,
+            new_x_posts,
+            new_youtube_uploads,
+        )
+
+    @staticmethod
+    def _hampang_target_created_at_log(target: GuildHampangTarget) -> str:
+        if not target.created_at:
+            return "none"
+        created_at = _as_utc_datetime(target.created_at)
+        return created_at.isoformat() if created_at else "none"
+
+    def _log_hampang_x_baseline_skip(
+        self,
+        target: GuildHampangTarget,
+        context: HampangPollContext,
+        candidate_count: int,
+    ) -> None:
+        LOGGER.info(
+            "햄햄팡팡 X 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
+            "(guild_id=%s, channel_id=%s, candidates=%s, latest_post_id=%s, "
+            "window_started_at=%s, target_created_at=%s).",
+            target.guild_id,
+            target.channel_id,
+            candidate_count,
+            context.latest_x_post_id,
+            context.window_started_at.isoformat() if context.window_started_at else "none",
+            self._hampang_target_created_at_log(target),
+        )
+
+    def _log_hampang_youtube_baseline_skip(
+        self,
+        target: GuildHampangTarget,
+        context: HampangPollContext,
+        candidate_count: int,
+    ) -> None:
+        LOGGER.info(
+            "햄햄팡팡 YouTube 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
+            "(guild_id=%s, channel_id=%s, candidates=%s, latest_video_id=%s, "
+            "window_started_at=%s, target_created_at=%s).",
+            target.guild_id,
+            target.channel_id,
+            candidate_count,
+            context.latest_youtube_video_id,
+            context.window_started_at.isoformat() if context.window_started_at else "none",
+            self._hampang_target_created_at_log(target),
+        )
+
+    def _mark_hampang_plan_baseline(
+        self,
+        target: GuildHampangTarget,
+        plan: HampangTargetPlan,
+    ) -> None:
+        if plan.baseline_x_id is None and plan.baseline_youtube_id is None:
+            return
+        self.storage.mark_hampang_target_seen(
+            target.guild_id,
+            x_post_id=plan.baseline_x_id,
+            youtube_video_id=plan.baseline_youtube_id,
+        )
+
+    async def _send_hampang_target_plan(
+        self,
+        target: GuildHampangTarget,
+        plan: HampangTargetPlan,
+        send_semaphore: asyncio.Semaphore,
+    ) -> int:
+        items = _hampang_news_items(
+            plan.new_x_posts,
+            plan.new_youtube_uploads,
+            newest_first=False,
+        )
+        if not items:
+            return 0
+
+        async with send_semaphore:
+            channel = await self._resolve_hampang_target_channel(target)
+            if channel is None:
+                return 0
+            guild_log, channel_log = self._destination_logs(
+                target.guild_id,
+                channel,
+                target.channel_id,
+            )
+            settings = self.storage.get_settings(target.guild_id)
+            image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(
+                plan.new_x_posts
+            )
+            return await self._send_hampang_items_to_channel(
+                target,
+                channel,
+                settings,
+                items,
+                image_batches_by_post_id,
+                guild_log,
+                channel_log,
+            )
+
+    async def _send_hampang_items_to_channel(
+        self,
+        target: GuildHampangTarget,
+        channel: discord.abc.Messageable,
+        settings: GuildSettings,
+        items: list[tuple[str, TwitterPost | YoutubeUpload]],
+        image_batches_by_post_id: dict[str, list[asyncio.Task[list[discord.File]]]],
+        guild_log: str,
+        channel_log: str,
+    ) -> int:
+        announced = 0
+        for source, item in items:
+            role_id = settings.role_id if announced == 0 else None
+            try:
+                message = await self._send_hampang_item_to_channel(
+                    target,
+                    channel,
+                    source,
+                    item,
+                    role_id,
+                    image_batches_by_post_id,
+                    guild_log,
+                    channel_log,
+                )
+            except discord.HTTPException:
+                LOGGER.exception(
+                    "햄햄팡팡 소식 자동 전송 실패 "
+                    "(guild_id=%s, channel_id=%s, source=%s).",
+                    target.guild_id,
+                    target.channel_id,
+                    source,
+                )
+                break
+            if message is None:
+                continue
+            await self._track_manual_message(target.guild_id, target.channel_id, message)
+            announced += 1
+        return announced
+
+    async def _send_hampang_item_to_channel(
+        self,
+        target: GuildHampangTarget,
+        channel: discord.abc.Messageable,
+        source: str,
+        item: TwitterPost | YoutubeUpload,
+        role_id: int | None,
+        image_batches_by_post_id: dict[str, list[asyncio.Task[list[discord.File]]]],
+        guild_log: str,
+        channel_log: str,
+    ) -> discord.Message | None:
+        if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
+            message = await self._send_twitter_post_to_channel(
+                channel,
+                item,
+                role_id=role_id,
+                batch_tasks=image_batches_by_post_id.get(item.post_id),
+            )
+            self.storage.mark_hampang_target_seen(target.guild_id, x_post_id=item.post_id)
+            LOGGER.info(
+                "새 햄햄팡팡 X 소식 공지 | %s | %s | 제목=%s",
+                guild_log,
+                channel_log,
+                item.title,
+            )
+            return message
+        if source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
+            message = await self._send_hampang_youtube_upload_to_channel(
+                channel,
+                item,
+                role_id=role_id,
+            )
+            self.storage.mark_hampang_target_seen(
+                target.guild_id,
+                youtube_video_id=item.video_id,
+            )
+            LOGGER.info(
+                "새 햄햄팡팡 YouTube 소식 공지 | %s | %s | 제목=%s",
+                guild_log,
+                channel_log,
+                item.title,
+            )
+            return message
+        return None
+
+    @staticmethod
+    def _sum_successful_results(results: list[int | BaseException], message: str) -> int:
+        announced = 0
         for result in results:
             if isinstance(result, Exception):
-                LOGGER.error(
-                    "X 게시물 자동 전송 대상 처리 실패.",
-                    exc_info=(type(result), result, result.__traceback__),
-                )
+                LOGGER.error(message, exc_info=(type(result), result, result.__traceback__))
                 continue
             announced += result
         return announced
+
+    def _finish_hampang_recovery_baselines(
+        self,
+        context: HampangPollContext,
+        target_count: int,
+    ) -> None:
+        if context.x_baseline_only:
+            self._hampang_x_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 햄햄팡팡 X 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
+                "(post_id=%s, targets=%s).",
+                context.latest_x_post_id,
+                target_count,
+            )
+        if context.youtube_baseline_only:
+            self._hampang_youtube_recovery_baseline_pending = False
+            LOGGER.info(
+                "네트워크 복구 후 햄햄팡팡 YouTube 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
+                "(video_id=%s, targets=%s).",
+                context.latest_youtube_video_id,
+                target_count,
+            )
 
     async def _poll_hampang_news_once(self) -> int:
         targets = self.storage.list_hampang_targets()
@@ -4487,220 +5482,29 @@ class NewsCog(commands.Cog):
         if not x_posts and not youtube_uploads:
             return 0
 
-        latest_x_post_id = x_posts[0].post_id if x_posts else None
-        latest_youtube_video_id = youtube_uploads[0].video_id if youtube_uploads else None
-        x_ids = [post.post_id for post in x_posts]
-        youtube_ids = [upload.video_id for upload in youtube_uploads]
-        x_baseline_only = self._hampang_x_recovery_baseline_pending and latest_x_post_id is not None
-        youtube_baseline_only = (
-            self._hampang_youtube_recovery_baseline_pending
-            and latest_youtube_video_id is not None
-        )
-        max_age = (
-            self.config.twitter_announce_max_age_seconds
-            or TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS
+        context = self._hampang_poll_context(
+            x_posts,
+            youtube_uploads,
+            window_started_at,
         )
         send_semaphore = asyncio.Semaphore(NEWS_TARGET_SEND_CONCURRENCY)
 
         async def process_target(target: GuildHampangTarget) -> int:
             if not target.enabled:
                 return 0
+            plan = self._hampang_target_plan(target, context)
+            self._mark_hampang_plan_baseline(target, plan)
+            return await self._send_hampang_target_plan(target, plan, send_semaphore)
 
-            baseline_x_id: str | None = None
-            baseline_youtube_id: str | None = None
-            new_x_posts: list[TwitterPost] = []
-            new_youtube_uploads: list[YoutubeUpload] = []
-
-            if x_posts and latest_x_post_id is not None:
-                if x_baseline_only:
-                    baseline_x_id = latest_x_post_id
-                elif not target.last_x_post_id or target.last_x_post_id not in x_ids:
-                    baseline_x_id = latest_x_post_id
-                    LOGGER.info(
-                        "햄햄팡팡 X 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
-                        "(guild_id=%s, post_id=%s).",
-                        target.guild_id,
-                        latest_x_post_id,
-                    )
-                else:
-                    last_seen_index = x_ids.index(target.last_x_post_id)
-                    candidate_x_posts = list(reversed(x_posts[:last_seen_index]))
-                    new_x_posts = self._auto_sendable_hampang_x_posts(
-                        candidate_x_posts,
-                        target=target,
-                        window_started_at=window_started_at,
-                        max_age_seconds=max_age,
-                    )
-                    if candidate_x_posts and not new_x_posts:
-                        baseline_x_id = latest_x_post_id
-                        LOGGER.info(
-                            "햄햄팡팡 X 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
-                            "(guild_id=%s, channel_id=%s, candidates=%s, latest_post_id=%s, "
-                            "window_started_at=%s, target_created_at=%s).",
-                            target.guild_id,
-                            target.channel_id,
-                            len(candidate_x_posts),
-                            latest_x_post_id,
-                            window_started_at.isoformat() if window_started_at else "none",
-                            (
-                                _as_utc_datetime(target.created_at).isoformat()
-                                if target.created_at
-                                else "none"
-                            ),
-                        )
-
-            if youtube_uploads and latest_youtube_video_id is not None:
-                if youtube_baseline_only:
-                    baseline_youtube_id = latest_youtube_video_id
-                elif (
-                    not target.last_youtube_video_id
-                    or target.last_youtube_video_id not in youtube_ids
-                ):
-                    baseline_youtube_id = latest_youtube_video_id
-                    LOGGER.info(
-                        "햄햄팡팡 YouTube 기준선 설정: 기존 데이터가 없어 누적 소식 공지를 건너뜁니다 "
-                        "(guild_id=%s, video_id=%s).",
-                        target.guild_id,
-                        latest_youtube_video_id,
-                    )
-                else:
-                    last_seen_index = youtube_ids.index(target.last_youtube_video_id)
-                    candidate_youtube_uploads = list(reversed(youtube_uploads[:last_seen_index]))
-                    new_youtube_uploads = self._auto_sendable_hampang_youtube_uploads(
-                        candidate_youtube_uploads,
-                        target=target,
-                        window_started_at=window_started_at,
-                    )
-                    if candidate_youtube_uploads and not new_youtube_uploads:
-                        baseline_youtube_id = latest_youtube_video_id
-                        LOGGER.info(
-                            "햄햄팡팡 YouTube 자동 전송 후보를 기준선만 갱신하고 건너뜁니다 "
-                            "(guild_id=%s, channel_id=%s, candidates=%s, latest_video_id=%s, "
-                            "window_started_at=%s, target_created_at=%s).",
-                            target.guild_id,
-                            target.channel_id,
-                            len(candidate_youtube_uploads),
-                            latest_youtube_video_id,
-                            window_started_at.isoformat() if window_started_at else "none",
-                            (
-                                _as_utc_datetime(target.created_at).isoformat()
-                                if target.created_at
-                                else "none"
-                            ),
-                        )
-
-            if baseline_x_id is not None or baseline_youtube_id is not None:
-                self.storage.mark_hampang_target_seen(
-                    target.guild_id,
-                    x_post_id=baseline_x_id,
-                    youtube_video_id=baseline_youtube_id,
-                )
-
-            items = _hampang_news_items(
-                new_x_posts,
-                new_youtube_uploads,
-                newest_first=False,
-            )
-            if not items:
-                return 0
-
-            async with send_semaphore:
-                channel = await self._resolve_hampang_target_channel(target)
-                if channel is None:
-                    return 0
-                guild_log, channel_log = self._destination_logs(
-                    target.guild_id,
-                    channel,
-                    target.channel_id,
-                )
-
-                settings = self.storage.get_settings(target.guild_id)
-                announced = 0
-                image_batches_by_post_id = self._start_twitter_image_batch_tasks_for_posts(
-                    new_x_posts
-                )
-                for source, item in items:
-                    role_id = settings.role_id if announced == 0 else None
-                    try:
-                        if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
-                            message = await self._send_twitter_post_to_channel(
-                                channel,
-                                item,
-                                role_id=role_id,
-                                batch_tasks=image_batches_by_post_id.get(item.post_id),
-                            )
-                            self.storage.mark_hampang_target_seen(
-                                target.guild_id,
-                                x_post_id=item.post_id,
-                            )
-                            LOGGER.info(
-                                "새 햄햄팡팡 X 소식 공지 | %s | %s | 제목=%s",
-                                guild_log,
-                                channel_log,
-                                item.title,
-                            )
-                        elif source == HAMPANG_SOURCE_YOUTUBE and isinstance(item, YoutubeUpload):
-                            message = await self._send_hampang_youtube_upload_to_channel(
-                                channel,
-                                item,
-                                role_id=role_id,
-                            )
-                            self.storage.mark_hampang_target_seen(
-                                target.guild_id,
-                                youtube_video_id=item.video_id,
-                            )
-                            LOGGER.info(
-                                "새 햄햄팡팡 YouTube 소식 공지 | %s | %s | 제목=%s",
-                                guild_log,
-                                channel_log,
-                                item.title,
-                            )
-                        else:
-                            continue
-                    except discord.HTTPException:
-                        LOGGER.exception(
-                            "햄햄팡팡 소식 자동 전송 실패 "
-                            "(guild_id=%s, channel_id=%s, source=%s).",
-                            target.guild_id,
-                            target.channel_id,
-                            source,
-                        )
-                        break
-
-                    await self._track_manual_message(target.guild_id, target.channel_id, message)
-                    announced += 1
-                return announced
-
-        announced = 0
         results = await asyncio.gather(
             *(asyncio.create_task(process_target(target)) for target in targets),
             return_exceptions=True,
         )
-        for result in results:
-            if isinstance(result, Exception):
-                LOGGER.error(
-                    "햄햄팡팡 소식 자동 전송 대상 처리 실패.",
-                    exc_info=(type(result), result, result.__traceback__),
-                )
-                continue
-            announced += result
-
-        if x_baseline_only:
-            self._hampang_x_recovery_baseline_pending = False
-            LOGGER.info(
-                "네트워크 복구 후 햄햄팡팡 X 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
-                "(post_id=%s, targets=%s).",
-                latest_x_post_id,
-                len(targets),
-            )
-        if youtube_baseline_only:
-            self._hampang_youtube_recovery_baseline_pending = False
-            LOGGER.info(
-                "네트워크 복구 후 햄햄팡팡 YouTube 기준선을 갱신했습니다. 누적 소식 공지는 건너뜁니다 "
-                "(video_id=%s, targets=%s).",
-                latest_youtube_video_id,
-                len(targets),
-            )
+        announced = self._sum_successful_results(
+            results,
+            "햄햄팡팡 소식 자동 전송 대상 처리 실패.",
+        )
+        self._finish_hampang_recovery_baselines(context, len(targets))
         return announced
 
     async def _refresh_steam_cache_for_twitter_links(
@@ -4770,6 +5574,157 @@ class NewsCog(commands.Cog):
             ]
         return []
 
+    async def _process_chzzk_offline_targets(
+        self,
+        targets: list[GuildChzzkTarget],
+    ) -> int:
+        live_detail = await self.chzzk_client.fetch_live_detail()
+        ended = 0
+        for target in targets:
+            if not target.enabled or not target.is_live:
+                continue
+            if not _is_chzzk_live_recently_closed(live_detail, target.last_live_id):
+                self._skip_chzzk_live_end_notice(target)
+                continue
+            ended += await self._send_chzzk_live_end_notice_to_target(target)
+        return ended
+
+    def _skip_chzzk_live_end_notice(self, target: GuildChzzkTarget) -> None:
+        self.storage.mark_chzzk_target_offline(target.guild_id)
+        LOGGER.info(
+            "치지직 라이브 종료 공지 건너뜀: 종료 후 10분 이상 경과 또는 종료 시간 확인 불가 (guild %s, live_id=%s).",
+            target.guild_id,
+            target.last_live_id,
+        )
+
+    async def _send_chzzk_live_end_notice_to_target(
+        self,
+        target: GuildChzzkTarget,
+    ) -> int:
+        channel = await self._resolve_chzzk_target_channel(target)
+        if channel is None:
+            return 0
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
+        try:
+            message = await self._send_chzzk_live_end_to_channel(channel)
+        except discord.HTTPException:
+            LOGGER.exception(
+                "치지직 라이브 종료 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                target.last_live_id,
+            )
+            return 0
+        self.storage.mark_chzzk_target_offline(target.guild_id)
+        await self._track_manual_message(target.guild_id, target.channel_id, message)
+        LOGGER.info(
+            "치지직 라이브 종료 공지 | %s | %s | live_id=%s.",
+            guild_log,
+            channel_log,
+            target.last_live_id,
+        )
+        return 1
+
+    def _mark_chzzk_recovery_baseline(
+        self,
+        targets: list[GuildChzzkTarget],
+        live: ChzzkLive,
+    ) -> None:
+        updated = 0
+        for target in targets:
+            if not target.enabled:
+                continue
+            if str(target.last_live_id) != live.live_id or not target.is_live:
+                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+                updated += 1
+        LOGGER.info(
+            "네트워크 복구 후 치지직 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
+            "(live_id=%s, targets=%s).",
+            live.live_id,
+            updated,
+        )
+
+    def _should_skip_chzzk_live_target(
+        self,
+        target: GuildChzzkTarget,
+        live: ChzzkLive,
+    ) -> bool:
+        if not target.enabled:
+            return True
+        if str(target.last_live_id) == live.live_id:
+            if not target.is_live:
+                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+            return True
+        if _is_chzzk_live_too_old(live):
+            self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+            LOGGER.info(
+                "치지직 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, live_id=%s, title=%r).",
+                target.guild_id,
+                live.live_id,
+                live.title,
+            )
+            return True
+        return False
+
+    async def _send_chzzk_live_to_target(
+        self,
+        target: GuildChzzkTarget,
+        live: ChzzkLive,
+    ) -> int:
+        channel = await self._resolve_chzzk_target_channel(target)
+        if channel is None:
+            return 0
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
+        try:
+            settings = self.storage.get_settings(target.guild_id)
+            youtube_target = self.storage.get_youtube_target(target.guild_id)
+            message = await self._send_chzzk_live_to_channel(
+                channel,
+                live,
+                role_id=settings.role_id,
+                include_youtube_button=not (
+                    youtube_target is not None and youtube_target.enabled
+                ),
+            )
+        except discord.HTTPException:
+            LOGGER.exception(
+                "치지직 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                live.live_id,
+            )
+            return 0
+
+        self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
+        await self._track_manual_message(target.guild_id, target.channel_id, message)
+        LOGGER.info(
+            "새 치지직 라이브 공지 | %s | %s | 제목=%s",
+            guild_log,
+            channel_log,
+            live.title,
+        )
+        return 1
+
+    async def _send_chzzk_live_updates(
+        self,
+        targets: list[GuildChzzkTarget],
+        live: ChzzkLive,
+    ) -> int:
+        announced = 0
+        for target in targets:
+            if self._should_skip_chzzk_live_target(target, live):
+                continue
+            announced += await self._send_chzzk_live_to_target(target, live)
+        return announced
+
     async def _poll_chzzk_once(self) -> int:
         targets = self.storage.list_chzzk_targets()
         if not targets:
@@ -4777,117 +5732,116 @@ class NewsCog(commands.Cog):
 
         live = await self.chzzk_client.fetch_live()
         if live is None:
-            live_detail = await self.chzzk_client.fetch_live_detail()
-            ended = 0
-            for target in targets:
-                if not target.enabled or not target.is_live:
-                    continue
-                if not _is_chzzk_live_recently_closed(live_detail, target.last_live_id):
-                    self.storage.mark_chzzk_target_offline(target.guild_id)
-                    LOGGER.info(
-                        "치지직 라이브 종료 공지 건너뜀: 종료 후 10분 이상 경과 또는 종료 시간 확인 불가 (guild %s, live_id=%s).",
-                        target.guild_id,
-                        target.last_live_id,
-                    )
-                    continue
-                channel = await self._resolve_chzzk_target_channel(target)
-                if channel is None:
-                    continue
-                guild_log, channel_log = self._destination_logs(
-                    target.guild_id,
-                    channel,
-                    target.channel_id,
-                )
-                try:
-                    message = await self._send_chzzk_live_end_to_channel(channel)
-                except discord.HTTPException:
-                    LOGGER.exception(
-                        "치지직 라이브 종료 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
-                        target.guild_id,
-                        target.channel_id,
-                        target.last_live_id,
-                    )
-                    continue
-                self.storage.mark_chzzk_target_offline(target.guild_id)
-                await self._track_manual_message(target.guild_id, target.channel_id, message)
-                LOGGER.info(
-                    "치지직 라이브 종료 공지 | %s | %s | live_id=%s.",
-                    guild_log,
-                    channel_log,
-                    target.last_live_id,
-                )
-                ended += 1
-            return ended
+            return await self._process_chzzk_offline_targets(targets)
 
         if self._chzzk_recovery_baseline_pending:
-            updated = 0
-            for target in targets:
-                if not target.enabled:
-                    continue
-                if str(target.last_live_id) != live.live_id or not target.is_live:
-                    self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
-                    updated += 1
-            LOGGER.info(
-                "네트워크 복구 후 치지직 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
-                "(live_id=%s, targets=%s).",
-                live.live_id,
-                updated,
-            )
+            self._mark_chzzk_recovery_baseline(targets, live)
             return 0
 
-        announced = 0
+        return await self._send_chzzk_live_updates(targets, live)
+
+    def _mark_youtube_targets_offline(
+        self,
+        targets: list[GuildYoutubeTarget],
+    ) -> None:
+        for target in targets:
+            if target.enabled and target.is_live:
+                self.storage.mark_youtube_target_offline(target.guild_id)
+
+    def _mark_youtube_recovery_baseline(
+        self,
+        targets: list[GuildYoutubeTarget],
+        live: YoutubeLive,
+    ) -> None:
+        updated = 0
         for target in targets:
             if not target.enabled:
                 continue
-            if str(target.last_live_id) == live.live_id:
-                if not target.is_live:
-                    self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
-                continue
-            if _is_chzzk_live_too_old(live):
-                self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
-                LOGGER.info(
-                    "치지직 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, live_id=%s, title=%r).",
-                    target.guild_id,
-                    live.live_id,
-                    live.title,
-                )
-                continue
+            if str(target.last_live_id) != live.video_id or not target.is_live:
+                self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+                updated += 1
+        LOGGER.info(
+            "네트워크 복구 후 유튜브 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
+            "(video_id=%s, targets=%s).",
+            live.video_id,
+            updated,
+        )
 
-            channel = await self._resolve_chzzk_target_channel(target)
-            if channel is None:
-                continue
-            guild_log, channel_log = self._destination_logs(
-                target.guild_id,
-                channel,
-                target.channel_id,
-            )
-            try:
-                settings = self.storage.get_settings(target.guild_id)
-                youtube_target = self.storage.get_youtube_target(target.guild_id)
-                message = await self._send_chzzk_live_to_channel(
-                    channel,
-                    live,
-                    role_id=settings.role_id,
-                    include_youtube_button=not (youtube_target is not None and youtube_target.enabled),
-                )
-            except discord.HTTPException:
-                LOGGER.exception(
-                    "치지직 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, live_id=%s).",
-                    target.guild_id,
-                    target.channel_id,
-                    live.live_id,
-                )
-                continue
-
-            self.storage.mark_chzzk_target_seen(target.guild_id, live.live_id)
-            await self._track_manual_message(target.guild_id, target.channel_id, message)
+    def _should_skip_youtube_live_target(
+        self,
+        target: GuildYoutubeTarget,
+        live: YoutubeLive,
+    ) -> bool:
+        if not target.enabled:
+            return True
+        if str(target.last_live_id) == live.video_id:
+            if not target.is_live:
+                self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+            return True
+        if _is_youtube_live_too_old(live):
+            self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
             LOGGER.info(
-                "새 치지직 라이브 공지 | %s | %s | 제목=%s",
-                guild_log,
-                channel_log,
+                "유튜브 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, video_id=%s, title=%r).",
+                target.guild_id,
+                live.video_id,
                 live.title,
             )
-            announced += 1
+            return True
+        return False
+
+    async def _send_youtube_live_to_target(
+        self,
+        target: GuildYoutubeTarget,
+        live: YoutubeLive,
+    ) -> int:
+        channel = await self._resolve_youtube_target_channel(target)
+        if channel is None:
+            return 0
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
+        try:
+            settings = self.storage.get_settings(target.guild_id)
+            chzzk_target = self.storage.get_chzzk_target(target.guild_id)
+            message = await self._send_youtube_live_to_channel(
+                channel,
+                live,
+                role_id=settings.role_id,
+                include_chzzk_button=not (
+                    chzzk_target is not None and chzzk_target.enabled
+                ),
+            )
+        except discord.HTTPException:
+            LOGGER.exception(
+                "유튜브 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, video_id=%s).",
+                target.guild_id,
+                target.channel_id,
+                live.video_id,
+            )
+            return 0
+
+        self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+        await self._track_manual_message(target.guild_id, target.channel_id, message)
+        LOGGER.info(
+            "새 유튜브 라이브 공지 | %s | %s | 제목=%s",
+            guild_log,
+            channel_log,
+            live.title,
+        )
+        return 1
+
+    async def _send_youtube_live_updates(
+        self,
+        targets: list[GuildYoutubeTarget],
+        live: YoutubeLive,
+    ) -> int:
+        announced = 0
+        for target in targets:
+            if self._should_skip_youtube_live_target(target, live):
+                continue
+            announced += await self._send_youtube_live_to_target(target, live)
         return announced
 
     async def _poll_youtube_once(self) -> int:
@@ -4897,78 +5851,92 @@ class NewsCog(commands.Cog):
 
         live = await self.youtube_client.fetch_live()
         if live is None:
-            for target in targets:
-                if target.enabled and target.is_live:
-                    self.storage.mark_youtube_target_offline(target.guild_id)
+            self._mark_youtube_targets_offline(targets)
             return 0
 
         if self._youtube_recovery_baseline_pending:
-            updated = 0
-            for target in targets:
-                if not target.enabled:
-                    continue
-                if str(target.last_live_id) != live.video_id or not target.is_live:
-                    self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
-                    updated += 1
-            LOGGER.info(
-                "네트워크 복구 후 유튜브 라이브 기준선을 갱신했습니다. 누적 라이브 공지는 건너뜁니다 "
-                "(video_id=%s, targets=%s).",
-                live.video_id,
-                updated,
-            )
+            self._mark_youtube_recovery_baseline(targets, live)
             return 0
 
-        announced = 0
-        for target in targets:
-            if not target.enabled:
-                continue
-            if str(target.last_live_id) == live.video_id:
-                if not target.is_live:
-                    self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
-                continue
-            if _is_youtube_live_too_old(live):
-                self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
-                LOGGER.info(
-                    "유튜브 라이브 공지 건너뜀: 시작 후 10분 이상 경과 (guild %s, video_id=%s, title=%r).",
-                    target.guild_id,
-                    live.video_id,
-                    live.title,
-                )
-                continue
+        return await self._send_youtube_live_updates(targets, live)
 
-            channel = await self._resolve_youtube_target_channel(target)
-            if channel is None:
-                continue
-            guild_log, channel_log = self._destination_logs(
+    def _mark_youtube_upload_recovery_baseline(
+        self,
+        targets: list[GuildYoutubeUploadTarget],
+        latest_video_id: str,
+    ) -> None:
+        for target in targets:
+            self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
+        LOGGER.info(
+            "네트워크 복구 후 유튜브 업로드 기준선을 갱신했습니다. 누적 영상 공지는 건너뜁니다 "
+            "(video_id=%s, targets=%s).",
+            latest_video_id,
+            len(targets),
+        )
+
+    def _new_youtube_uploads_for_target(
+        self,
+        target: GuildYoutubeUploadTarget,
+        uploads: list[YoutubeUpload],
+        upload_ids: list[str],
+        latest_video_id: str,
+    ) -> list[YoutubeUpload]:
+        if not target.enabled:
+            return []
+        if not target.last_video_id or target.last_video_id not in upload_ids:
+            self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
+            LOGGER.info(
+                "유튜브 업로드 기준선 설정: 기존 데이터가 없어 누적 영상 공지를 건너뜁니다 "
+                "(guild_id=%s, video_id=%s).",
                 target.guild_id,
-                channel,
-                target.channel_id,
+                latest_video_id,
             )
+            return []
+        last_seen_index = upload_ids.index(target.last_video_id)
+        return list(reversed(uploads[:last_seen_index]))
+
+    async def _send_youtube_uploads_to_target(
+        self,
+        target: GuildYoutubeUploadTarget,
+        uploads: list[YoutubeUpload],
+    ) -> int:
+        if not uploads:
+            return 0
+        channel = await self._resolve_youtube_upload_target_channel(target)
+        if channel is None:
+            return 0
+
+        guild_log, channel_log = self._destination_logs(
+            target.guild_id,
+            channel,
+            target.channel_id,
+        )
+        settings = self.storage.get_settings(target.guild_id)
+        announced = 0
+        for upload in uploads:
             try:
-                settings = self.storage.get_settings(target.guild_id)
-                chzzk_target = self.storage.get_chzzk_target(target.guild_id)
-                message = await self._send_youtube_live_to_channel(
+                message = await self._send_youtube_upload_to_channel(
                     channel,
-                    live,
-                    role_id=settings.role_id,
-                    include_chzzk_button=not (chzzk_target is not None and chzzk_target.enabled),
+                    upload,
+                    role_id=settings.role_id if announced == 0 else None,
                 )
             except discord.HTTPException:
                 LOGGER.exception(
-                    "유튜브 라이브 자동 전송 실패 (guild_id=%s, channel_id=%s, video_id=%s).",
+                    "유튜브 업로드 자동 전송 실패 "
+                    "(guild_id=%s, channel_id=%s, video_id=%s).",
                     target.guild_id,
                     target.channel_id,
-                    live.video_id,
+                    upload.video_id,
                 )
-                continue
+                break
 
-            self.storage.mark_youtube_target_seen(target.guild_id, live.video_id)
+            self.storage.mark_youtube_upload_target_seen(target.guild_id, upload.video_id)
             await self._track_manual_message(target.guild_id, target.channel_id, message)
             LOGGER.info(
-                "새 유튜브 라이브 공지 | %s | %s | 제목=%s",
+                "새 유튜브 업로드 공지 | %s | %s | 제목=%s",
                 guild_log,
                 channel_log,
-                live.title,
+                upload.title,
             )
             announced += 1
         return announced
@@ -4984,74 +5952,19 @@ class NewsCog(commands.Cog):
 
         latest_video_id = uploads[0].video_id
         if self._youtube_upload_recovery_baseline_pending:
-            for target in targets:
-                self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
-            LOGGER.info(
-                "네트워크 복구 후 유튜브 업로드 기준선을 갱신했습니다. 누적 영상 공지는 건너뜁니다 "
-                "(video_id=%s, targets=%s).",
-                latest_video_id,
-                len(targets),
-            )
+            self._mark_youtube_upload_recovery_baseline(targets, latest_video_id)
             return 0
 
         announced = 0
         upload_ids = [upload.video_id for upload in uploads]
         for target in targets:
-            if not target.enabled:
-                continue
-
-            if not target.last_video_id or target.last_video_id not in upload_ids:
-                self.storage.mark_youtube_upload_target_seen(target.guild_id, latest_video_id)
-                LOGGER.info(
-                    "유튜브 업로드 기준선 설정: 기존 데이터가 없어 누적 영상 공지를 건너뜁니다 "
-                    "(guild_id=%s, video_id=%s).",
-                    target.guild_id,
-                    latest_video_id,
-                )
-                continue
-
-            last_seen_index = upload_ids.index(target.last_video_id)
-            new_uploads = list(reversed(uploads[:last_seen_index]))
-            if not new_uploads:
-                continue
-
-            channel = await self._resolve_youtube_upload_target_channel(target)
-            if channel is None:
-                continue
-            guild_log, channel_log = self._destination_logs(
-                target.guild_id,
-                channel,
-                target.channel_id,
+            new_uploads = self._new_youtube_uploads_for_target(
+                target,
+                uploads,
+                upload_ids,
+                latest_video_id,
             )
-            settings = self.storage.get_settings(target.guild_id)
-            target_announced = 0
-            for upload in new_uploads:
-                try:
-                    message = await self._send_youtube_upload_to_channel(
-                        channel,
-                        upload,
-                        role_id=settings.role_id if target_announced == 0 else None,
-                    )
-                except discord.HTTPException:
-                    LOGGER.exception(
-                        "유튜브 업로드 자동 전송 실패 "
-                        "(guild_id=%s, channel_id=%s, video_id=%s).",
-                        target.guild_id,
-                        target.channel_id,
-                        upload.video_id,
-                    )
-                    break
-
-                self.storage.mark_youtube_upload_target_seen(target.guild_id, upload.video_id)
-                await self._track_manual_message(target.guild_id, target.channel_id, message)
-                LOGGER.info(
-                    "새 유튜브 업로드 공지 | %s | %s | 제목=%s",
-                    guild_log,
-                    channel_log,
-                    upload.title,
-                )
-                target_announced += 1
-                announced += 1
+            announced += await self._send_youtube_uploads_to_target(target, new_uploads)
         return announced
 
     async def _fetch_hampang_news_sources(
@@ -5325,6 +6238,85 @@ class NewsCog(commands.Cog):
                 return None
         return channel if isinstance(channel, discord.abc.Messageable) else None
 
+    def _twitter_image_batch_tasks(
+        self,
+        image_urls: list[str],
+        batch_tasks: list[asyncio.Task[list[discord.File]]] | None,
+    ) -> list[asyncio.Task[list[discord.File]]]:
+        if batch_tasks is not None:
+            return batch_tasks
+        if len(image_urls) > MAX_TWITTER_EMBED_IMAGES:
+            return self._start_image_batch_tasks(image_urls[MAX_TWITTER_EMBED_IMAGES:])
+        return []
+
+    def _twitter_post_followup_tasks(
+        self,
+        channel: discord.abc.Messageable,
+        post: TwitterPost,
+        image_batch_tasks: list[asyncio.Task[list[discord.File]]],
+    ) -> list[asyncio.Task]:
+        followup_tasks: list[asyncio.Task] = []
+        if image_batch_tasks:
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_twitter_channel_image_messages(
+                        channel,
+                        batch_tasks=image_batch_tasks,
+                    )
+                )
+            )
+
+        link_urls = _twitter_link_urls(post)
+        if link_urls:
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content="\n".join(link_urls),
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                )
+            )
+
+        video_url_groups = _twitter_video_url_groups(post)
+        video_fallback_url = _twitter_video_fallback_url(post)
+        if video_url_groups:
+            followup_tasks.append(
+                asyncio.create_task(
+                    self._send_twitter_video_to_channel(
+                        channel,
+                        video_url_groups,
+                        video_fallback_url or post.url,
+                    )
+                )
+            )
+        elif video_fallback_url:
+            followup_tasks.append(
+                asyncio.create_task(
+                    channel.send(
+                        content=video_fallback_url,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                )
+            )
+        return followup_tasks
+
+    async def _run_twitter_post_followups(
+        self,
+        post: TwitterPost,
+        followup_tasks: list[asyncio.Task],
+    ) -> None:
+        if not followup_tasks:
+            return
+        results = await asyncio.gather(*followup_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                LOGGER.error(
+                    "X 게시물 후속 메시지 전송 실패 (post_id=%s, title=%r).",
+                    post.post_id,
+                    post.title,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+
     async def _send_twitter_post_to_channel(
         self,
         channel: discord.abc.Messageable,
@@ -5336,15 +6328,7 @@ class NewsCog(commands.Cog):
     ) -> discord.Message:
         image_urls = _twitter_image_urls(post) if attach_photos else []
         embeds = _embeds_for_twitter_post(post, image_urls=image_urls)
-        image_batch_tasks = (
-            batch_tasks
-            if batch_tasks is not None
-            else (
-                self._start_image_batch_tasks(image_urls[MAX_TWITTER_EMBED_IMAGES:])
-                if len(image_urls) > MAX_TWITTER_EMBED_IMAGES
-                else []
-            )
-        )
+        image_batch_tasks = self._twitter_image_batch_tasks(image_urls, batch_tasks)
         if role_id:
             await channel.send(
                 content=f"<@&{role_id}>",
@@ -5358,55 +6342,8 @@ class NewsCog(commands.Cog):
             embeds=embeds,
             allowed_mentions=discord.AllowedMentions.none(),
         )
-        followup_tasks = []
-        if image_batch_tasks:
-            followup_tasks.append(
-                asyncio.create_task(
-                    self._send_twitter_channel_image_messages(
-                        channel,
-                        batch_tasks=image_batch_tasks,
-                    )
-                )
-            )
-        link_urls = _twitter_link_urls(post)
-        if link_urls:
-            followup_tasks.append(
-                asyncio.create_task(
-                    channel.send(
-                        content="\n".join(link_urls),
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                )
-            )
-        video_url_groups = _twitter_video_url_groups(post)
-        video_fallback_url = _twitter_video_fallback_url(post)
-        if video_url_groups:
-            followup_tasks.append(
-                asyncio.create_task(
-                    self._send_twitter_video_to_channel(
-                        channel, video_url_groups, video_fallback_url or post.url
-                    )
-                )
-            )
-        elif video_fallback_url:
-            followup_tasks.append(
-                asyncio.create_task(
-                    channel.send(
-                        content=video_fallback_url,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                )
-            )
-        if followup_tasks:
-            results = await asyncio.gather(*followup_tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    LOGGER.error(
-                        "X 게시물 후속 메시지 전송 실패 (post_id=%s, title=%r).",
-                        post.post_id,
-                        post.title,
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
+        followup_tasks = self._twitter_post_followup_tasks(channel, post, image_batch_tasks)
+        await self._run_twitter_post_followups(post, followup_tasks)
         return message
 
     async def _send_twitter_post_followups(
@@ -5920,6 +6857,80 @@ class NewsCog(commands.Cog):
                 youtube_live = result
         return chzzk_live, youtube_live, errors
 
+    def _mark_offline_broadcast_targets(
+        self,
+        guild_id: int | None,
+        source_value: str,
+        chzzk_live: ChzzkLive | None,
+        youtube_live: YoutubeLive | None,
+    ) -> None:
+        if guild_id is None:
+            return
+        if _broadcast_source_allows_chzzk(source_value) and chzzk_live is None:
+            target = self.storage.get_chzzk_target(guild_id)
+            if target is not None and target.is_live:
+                self.storage.mark_chzzk_target_offline(guild_id)
+        if _broadcast_source_allows_youtube(source_value) and youtube_live is None:
+            target = self.storage.get_youtube_target(guild_id)
+            if target is not None and target.is_live:
+                self.storage.mark_youtube_target_offline(guild_id)
+
+    @staticmethod
+    def _all_broadcast_sources_failed(source_value: str, errors: list[str]) -> bool:
+        requested_count = int(_broadcast_source_allows_chzzk(source_value)) + int(
+            _broadcast_source_allows_youtube(source_value)
+        )
+        return bool(errors) and len(errors) == requested_count
+
+    async def _send_chzzk_broadcast_status(
+        self,
+        interaction: discord.Interaction,
+        chzzk_live: ChzzkLive | None,
+        youtube_url: str,
+    ) -> None:
+        if chzzk_live is None:
+            latest_chzzk = await self._fetch_chzzk_latest_broadcast()
+            await interaction.followup.send(
+                embed=_embed_for_chzzk_offline(latest_chzzk),
+                view=_chzzk_live_view(youtube_url),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await interaction.followup.send(
+            content=PROJECT_MOON_CHZZK_LIVE_URL,
+            embed=_embed_for_chzzk_live(chzzk_live),
+            view=_chzzk_live_view(youtube_url),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _send_youtube_broadcast_status(
+        self,
+        interaction: discord.Interaction,
+        youtube_live: YoutubeLive | None,
+    ) -> None:
+        if youtube_live is None:
+            latest_youtube = await self._fetch_youtube_latest_stream()
+            await interaction.followup.send(
+                embed=_embed_for_youtube_offline(latest_youtube),
+                view=_youtube_live_view(
+                    latest_youtube.url
+                    if latest_youtube
+                    else PROJECT_MOON_YOUTUBE_STREAMS_URL
+                ),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        await interaction.followup.send(
+            content=youtube_live.url,
+            embed=_embed_for_youtube_live(youtube_live),
+            view=_youtube_live_view(youtube_live.url),
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
     async def _fetch_chzzk_latest_broadcast(self) -> ChzzkBroadcast | None:
         try:
             return await self.chzzk_client.fetch_latest_broadcast()
@@ -5944,6 +6955,40 @@ class NewsCog(commands.Cog):
                 LOGGER.exception("유튜브 최근 방송 확인 실패.")
         return None
 
+    @staticmethod
+    def _as_text_channel(channel: object | None) -> discord.TextChannel | None:
+        return channel if isinstance(channel, discord.TextChannel) else None
+
+    async def _resolve_default_broadcast_channel(
+        self,
+        interaction: discord.Interaction,
+    ) -> discord.TextChannel | None:
+        settings = self.storage.get_settings(interaction.guild_id)
+        if settings.channel_id is None:
+            return None
+        resolved = await self._resolve_target_channel(None, settings.channel_id)
+        return self._as_text_channel(resolved)
+
+    async def _resolve_source_broadcast_channel(
+        self,
+        guild_id: int | None,
+        source_value: str,
+    ) -> discord.TextChannel | None:
+        if _broadcast_source_allows_chzzk(source_value):
+            chzzk_target = self.storage.get_chzzk_target(guild_id)
+            if chzzk_target is not None:
+                resolved = await self._resolve_chzzk_target_channel(chzzk_target)
+                text_channel = self._as_text_channel(resolved)
+                if text_channel is not None:
+                    return text_channel
+
+        if _broadcast_source_allows_youtube(source_value):
+            youtube_target = self.storage.get_youtube_target(guild_id)
+            if youtube_target is not None:
+                resolved = await self._resolve_youtube_target_channel(youtube_target)
+                return self._as_text_channel(resolved)
+        return None
+
     async def _resolve_broadcast_target_channel(
         self,
         interaction: discord.Interaction,
@@ -5953,31 +6998,18 @@ class NewsCog(commands.Cog):
         if channel is not None:
             return channel
 
-        settings = self.storage.get_settings(interaction.guild_id)
-        if settings.channel_id is not None:
-            resolved = await self._resolve_target_channel(None, settings.channel_id)
-            if isinstance(resolved, discord.TextChannel):
-                return resolved
+        resolved = await self._resolve_default_broadcast_channel(interaction)
+        if resolved is not None:
+            return resolved
 
-        if _broadcast_source_allows_chzzk(source_value):
-            chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
-            if chzzk_target is not None:
-                resolved = await self._resolve_chzzk_target_channel(chzzk_target)
-                if isinstance(resolved, discord.TextChannel):
-                    return resolved
-
-        if _broadcast_source_allows_youtube(source_value):
-            youtube_target = self.storage.get_youtube_target(interaction.guild_id)
-            if youtube_target is not None:
-                resolved = await self._resolve_youtube_target_channel(youtube_target)
-                if isinstance(resolved, discord.TextChannel):
-                    return resolved
-
-        return (
-            interaction.channel
-            if isinstance(interaction.channel, discord.TextChannel)
-            else None
+        resolved = await self._resolve_source_broadcast_channel(
+            interaction.guild_id,
+            source_value,
         )
+        if resolved is not None:
+            return resolved
+
+        return self._as_text_channel(interaction.channel)
 
     async def _resolve_youtube_upload_config_channel(
         self,
@@ -5999,11 +7031,28 @@ class NewsCog(commands.Cog):
             if isinstance(resolved, discord.TextChannel):
                 return resolved
 
-        return (
-            interaction.channel
-            if isinstance(interaction.channel, discord.TextChannel)
-            else None
-        )
+        return self._as_text_channel(interaction.channel)
+
+    async def _resolve_youtube_upload_send_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+        target: GuildYoutubeUploadTarget | None,
+        settings: GuildSettings,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        if target is not None:
+            resolved = await self._resolve_youtube_upload_target_channel(target)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        return self._as_text_channel(interaction.channel)
 
     async def _resolve_hampang_config_channel(
         self,
@@ -6202,6 +7251,69 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _hampang_config_baseline(
+        self,
+        enabled: bool,
+    ) -> HampangConfigBaseline:
+        if not enabled:
+            return HampangConfigBaseline(None, None)
+
+        x_posts, youtube_uploads, x_failed, youtube_failed = (
+            await self._fetch_hampang_news_sources_detailed()
+        )
+        baseline = HampangConfigBaseline(
+            latest_x_post=x_posts[0] if x_posts else None,
+            latest_youtube_upload=youtube_uploads[0] if youtube_uploads else None,
+            x_failed=x_failed,
+            youtube_failed=youtube_failed,
+        )
+        if baseline.x_failed or baseline.latest_x_post is None:
+            self._hampang_x_recovery_baseline_pending = True
+        if baseline.youtube_failed or baseline.latest_youtube_upload is None:
+            self._hampang_youtube_recovery_baseline_pending = True
+        return baseline
+
+    def _hampang_config_response_lines(
+        self,
+        target: GuildHampangTarget,
+        enabled: bool,
+        baseline: HampangConfigBaseline,
+    ) -> list[str]:
+        lines = [
+            f"햄햄팡팡 소식 자동 알림: {_bool_label(target.enabled)}",
+            f"채널: <#{target.channel_id}>",
+            f"추적 시간대: X 게시물 추적 시간대와 동일 (KST {_format_windows_label(self.config.twitter_tracking_windows_kst)})",
+        ]
+        lines.extend(self._hampang_x_baseline_lines(enabled, baseline))
+        lines.extend(self._hampang_youtube_baseline_lines(enabled, baseline))
+        return lines
+
+    @staticmethod
+    def _hampang_x_baseline_lines(
+        enabled: bool,
+        baseline: HampangConfigBaseline,
+    ) -> list[str]:
+        if baseline.latest_x_post is not None:
+            return [f"현재 X 기준선: {baseline.latest_x_post.title}"]
+        if enabled and baseline.x_failed:
+            return ["현재 X 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다."]
+        if enabled:
+            return ["최근 X 소식을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다."]
+        return []
+
+    @staticmethod
+    def _hampang_youtube_baseline_lines(
+        enabled: bool,
+        baseline: HampangConfigBaseline,
+    ) -> list[str]:
+        if baseline.latest_youtube_upload is not None:
+            return [f"현재 YouTube 기준선: {baseline.latest_youtube_upload.title}"]
+        if enabled and baseline.youtube_failed:
+            return ["현재 YouTube 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다."]
+        if enabled:
+            return ["최근 햄햄팡팡 YouTube 영상을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다."]
+        return []
+
     @app_commands.command(name="햄팡소식알림설정", description="햄햄팡팡 공식 X와 관련 YouTube 소식 자동 알림을 설정합니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
     @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
@@ -6234,56 +7346,30 @@ class NewsCog(commands.Cog):
             return
 
         enabled_value = _choice_bool(enabled, False)
-        latest_x_post: TwitterPost | None = None
-        latest_youtube_upload: YoutubeUpload | None = None
-        x_failed = False
-        youtube_failed = False
-        if enabled_value:
-            (
-                x_posts,
-                youtube_uploads,
-                x_failed,
-                youtube_failed,
-            ) = await self._fetch_hampang_news_sources_detailed()
-            latest_x_post = x_posts[0] if x_posts else None
-            latest_youtube_upload = youtube_uploads[0] if youtube_uploads else None
-            if x_failed or latest_x_post is None:
-                self._hampang_x_recovery_baseline_pending = True
-            if youtube_failed or latest_youtube_upload is None:
-                self._hampang_youtube_recovery_baseline_pending = True
+        baseline = await self._hampang_config_baseline(enabled_value)
 
         target = self.storage.upsert_hampang_target(
             interaction.guild_id,
             channel_id=target_channel.id,
             enabled=bool(enabled_value),
-            last_x_post_id=latest_x_post.post_id if latest_x_post is not None else None,
+            last_x_post_id=(
+                baseline.latest_x_post.post_id
+                if baseline.latest_x_post is not None
+                else None
+            ),
             last_youtube_video_id=(
-                latest_youtube_upload.video_id if latest_youtube_upload is not None else None
+                baseline.latest_youtube_upload.video_id
+                if baseline.latest_youtube_upload is not None
+                else None
             ),
         )
-
-        lines = [
-            f"햄햄팡팡 소식 자동 알림: {_bool_label(target.enabled)}",
-            f"채널: <#{target.channel_id}>",
-            f"추적 시간대: X 게시물 추적 시간대와 동일 (KST {_format_windows_label(self.config.twitter_tracking_windows_kst)})",
-        ]
-        if latest_x_post is not None:
-            lines.append(f"현재 X 기준선: {latest_x_post.title}")
-        elif enabled_value and x_failed:
-            lines.append("현재 X 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다.")
-        elif enabled_value:
-            lines.append("최근 X 소식을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다.")
-        if latest_youtube_upload is not None:
-            lines.append(f"현재 YouTube 기준선: {latest_youtube_upload.title}")
-        elif enabled_value and youtube_failed:
-            lines.append("현재 YouTube 확인 오류로 기준선을 잡지 못했습니다. 다음 정상 확인에서 기준선만 설정합니다.")
-        elif enabled_value:
-            lines.append("최근 햄햄팡팡 YouTube 영상을 찾지 못했습니다. 첫 정상 확인에서 기준선만 설정합니다.")
 
         await interaction.followup.send(
             embed=discord.Embed(
                 title="햄햄팡팡 소식 알림 설정이 완료되었어요",
-                description="\n".join(lines),
+                description="\n".join(
+                    self._hampang_config_response_lines(target, enabled_value, baseline)
+                ),
                 color=_success_embed_color(),
             ),
             ephemeral=True,
@@ -6610,19 +7696,12 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         target = self.storage.get_youtube_upload_target(interaction.guild_id)
         settings = self.storage.get_settings(interaction.guild_id)
-        target_channel = channel
-        if target_channel is None and target is not None:
-            resolved = await self._resolve_youtube_upload_target_channel(target)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None and settings.channel_id is not None:
-            resolved = await self._resolve_target_channel(None, settings.channel_id)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None:
-            target_channel = (
-                interaction.channel
-                if isinstance(interaction.channel, discord.TextChannel)
-                else None
-            )
+        target_channel = await self._resolve_youtube_upload_send_channel(
+            interaction,
+            channel,
+            target,
+            settings,
+        )
         if target_channel is None:
             await interaction.followup.send(
                 "유튜브 영상을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
@@ -6885,20 +7964,14 @@ class NewsCog(commands.Cog):
 
         source_value = _broadcast_source_value(source)
         chzzk_live, youtube_live, errors = await self._fetch_broadcast_lives(source_value)
-        if interaction.guild_id is not None:
-            if _broadcast_source_allows_chzzk(source_value) and chzzk_live is None:
-                target = self.storage.get_chzzk_target(interaction.guild_id)
-                if target is not None and target.is_live:
-                    self.storage.mark_chzzk_target_offline(interaction.guild_id)
-            if _broadcast_source_allows_youtube(source_value) and youtube_live is None:
-                target = self.storage.get_youtube_target(interaction.guild_id)
-                if target is not None and target.is_live:
-                    self.storage.mark_youtube_target_offline(interaction.guild_id)
+        self._mark_offline_broadcast_targets(
+            interaction.guild_id,
+            source_value,
+            chzzk_live,
+            youtube_live,
+        )
 
-        if errors and len(errors) == (
-            int(_broadcast_source_allows_chzzk(source_value))
-            + int(_broadcast_source_allows_youtube(source_value))
-        ):
+        if self._all_broadcast_sources_failed(source_value, errors):
             await interaction.followup.send(
                 "방송 현황을 확인하지 못했어요. 잠시 뒤 다시 시도해주세요.",
                 ephemeral=True,
@@ -6908,40 +7981,10 @@ class NewsCog(commands.Cog):
 
         youtube_url = youtube_live.url if youtube_live is not None else PROJECT_MOON_YOUTUBE_STREAMS_URL
         if _broadcast_source_allows_chzzk(source_value) and "치지직" not in errors:
-            if chzzk_live is None:
-                latest_chzzk = await self._fetch_chzzk_latest_broadcast()
-                await interaction.followup.send(
-                    embed=_embed_for_chzzk_offline(latest_chzzk),
-                    view=_chzzk_live_view(youtube_url),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await interaction.followup.send(
-                    content=PROJECT_MOON_CHZZK_LIVE_URL,
-                    embed=_embed_for_chzzk_live(chzzk_live),
-                    view=_chzzk_live_view(youtube_url),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+            await self._send_chzzk_broadcast_status(interaction, chzzk_live, youtube_url)
 
         if _broadcast_source_allows_youtube(source_value) and "유튜브" not in errors:
-            if youtube_live is None:
-                latest_youtube = await self._fetch_youtube_latest_stream()
-                await interaction.followup.send(
-                    embed=_embed_for_youtube_offline(latest_youtube),
-                    view=_youtube_live_view(latest_youtube.url if latest_youtube else PROJECT_MOON_YOUTUBE_STREAMS_URL),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-            else:
-                await interaction.followup.send(
-                    content=youtube_live.url,
-                    embed=_embed_for_youtube_live(youtube_live),
-                    view=_youtube_live_view(youtube_live.url),
-                    ephemeral=True,
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
+            await self._send_youtube_broadcast_status(interaction, youtube_live)
 
         if errors:
             await interaction.followup.send(
@@ -6949,6 +7992,124 @@ class NewsCog(commands.Cog):
                 ephemeral=True,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+
+    async def _send_manual_broadcast_error(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+    ) -> None:
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def _process_manual_chzzk_broadcast(
+        self,
+        interaction: discord.Interaction,
+        target_channel: discord.TextChannel,
+        source_value: str,
+        chzzk_live: ChzzkLive | None,
+        youtube_live: YoutubeLive | None,
+        role_id: int | None,
+        sent: list[str],
+        skipped: list[str],
+        errors: list[str],
+    ) -> bool:
+        if not _broadcast_source_allows_chzzk(source_value) or "치지직" in errors:
+            return True
+        if chzzk_live is None:
+            skipped.append("치지직: 방송 없음 / 오프라인")
+            return True
+        if _is_chzzk_live_too_old(chzzk_live):
+            if self.storage.get_chzzk_target(interaction.guild_id) is not None:
+                self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
+            skipped.append("치지직: 방송 시작 후 10분 이상 지남")
+            return True
+
+        try:
+            message = await self._send_chzzk_live_to_channel(
+                target_channel,
+                chzzk_live,
+                role_id=role_id if not sent else None,
+                youtube_url=youtube_live.url if youtube_live is not None else None,
+                include_youtube_button=not _broadcast_source_allows_youtube(source_value),
+            )
+        except discord.Forbidden:
+            await self._send_manual_broadcast_error(interaction, "지정한 채널에 방송을 보낼 권한이 없어요.")
+            return False
+        except discord.HTTPException:
+            LOGGER.exception("치지직 라이브 수동 전송 실패.")
+            await self._send_manual_broadcast_error(
+                interaction,
+                "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+            )
+            return False
+
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        if self.storage.get_chzzk_target(interaction.guild_id) is not None:
+            self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
+        sent.append("치지직")
+        return True
+
+    async def _process_manual_youtube_broadcast(
+        self,
+        interaction: discord.Interaction,
+        target_channel: discord.TextChannel,
+        source_value: str,
+        youtube_live: YoutubeLive | None,
+        role_id: int | None,
+        sent: list[str],
+        skipped: list[str],
+        errors: list[str],
+    ) -> bool:
+        if not _broadcast_source_allows_youtube(source_value) or "유튜브" in errors:
+            return True
+        if youtube_live is None:
+            skipped.append("유튜브: 방송 없음 / 오프라인")
+            return True
+        if _is_youtube_live_too_old(youtube_live):
+            if self.storage.get_youtube_target(interaction.guild_id) is not None:
+                self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
+            skipped.append("유튜브: 방송 시작 후 10분 이상 지남")
+            return True
+
+        try:
+            message = await self._send_youtube_live_to_channel(
+                target_channel,
+                youtube_live,
+                role_id=role_id if not sent else None,
+                include_chzzk_button=not _broadcast_source_allows_chzzk(source_value),
+            )
+        except discord.Forbidden:
+            await self._send_manual_broadcast_error(interaction, "지정한 채널에 방송을 보낼 권한이 없어요.")
+            return False
+        except discord.HTTPException:
+            LOGGER.exception("유튜브 라이브 수동 전송 실패.")
+            await self._send_manual_broadcast_error(
+                interaction,
+                "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+            )
+            return False
+
+        await self._track_manual_message(interaction.guild_id, target_channel.id, message)
+        if self.storage.get_youtube_target(interaction.guild_id) is not None:
+            self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
+        sent.append("유튜브")
+        return True
+
+    @staticmethod
+    def _manual_broadcast_result_text(
+        target_channel: discord.TextChannel,
+        sent: list[str],
+        skipped: list[str],
+    ) -> str:
+        if not sent:
+            return "보낼 수 있는 현재 방송이 없어요.\n" + "\n".join(skipped)
+        result = f"{target_channel.mention}에 {', '.join(sent)} 방송을 보냈어요."
+        if skipped:
+            result += "\n" + "\n".join(skipped)
+        return result
 
     @app_commands.command(name="방송알림보내기", description="현재 ProjectMoon Official 방송을 지정 채널에 보냅니다.")
     @app_commands.allowed_installs(guilds=True, users=False)
@@ -6991,102 +8152,87 @@ class NewsCog(commands.Cog):
 
         chzzk_live, youtube_live, errors = await self._fetch_broadcast_lives(source_value)
         settings = self.storage.get_settings(interaction.guild_id)
-        chzzk_target = self.storage.get_chzzk_target(interaction.guild_id)
-        youtube_target = self.storage.get_youtube_target(interaction.guild_id)
         role_id = role.id if role else settings.role_id
         sent: list[str] = []
         skipped: list[str] = []
 
-        if _broadcast_source_allows_chzzk(source_value) and "치지직" not in errors:
-            if chzzk_live is None:
-                skipped.append("치지직: 방송 없음 / 오프라인")
-            elif _is_chzzk_live_too_old(chzzk_live):
-                if chzzk_target is not None:
-                    self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
-                skipped.append("치지직: 방송 시작 후 10분 이상 지남")
-            else:
-                try:
-                    message = await self._send_chzzk_live_to_channel(
-                        target_channel,
-                        chzzk_live,
-                        role_id=role_id if not sent else None,
-                        youtube_url=youtube_live.url if youtube_live is not None else None,
-                        include_youtube_button=not _broadcast_source_allows_youtube(source_value),
-                    )
-                except discord.Forbidden:
-                    await interaction.followup.send(
-                        "지정한 채널에 방송을 보낼 권한이 없어요.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                except discord.HTTPException:
-                    LOGGER.exception("치지직 라이브 수동 전송 실패.")
-                    await interaction.followup.send(
-                        "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                await self._track_manual_message(interaction.guild_id, target_channel.id, message)
-                if chzzk_target is not None:
-                    self.storage.mark_chzzk_target_seen(interaction.guild_id, chzzk_live.live_id)
-                sent.append("치지직")
-
-        if _broadcast_source_allows_youtube(source_value) and "유튜브" not in errors:
-            if youtube_live is None:
-                skipped.append("유튜브: 방송 없음 / 오프라인")
-            elif _is_youtube_live_too_old(youtube_live):
-                if youtube_target is not None:
-                    self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
-                skipped.append("유튜브: 방송 시작 후 10분 이상 지남")
-            else:
-                try:
-                    message = await self._send_youtube_live_to_channel(
-                        target_channel,
-                        youtube_live,
-                        role_id=role_id if not sent else None,
-                        include_chzzk_button=not _broadcast_source_allows_chzzk(source_value),
-                    )
-                except discord.Forbidden:
-                    await interaction.followup.send(
-                        "지정한 채널에 방송을 보낼 권한이 없어요.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                except discord.HTTPException:
-                    LOGGER.exception("유튜브 라이브 수동 전송 실패.")
-                    await interaction.followup.send(
-                        "방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
-                        ephemeral=True,
-                        allowed_mentions=discord.AllowedMentions.none(),
-                    )
-                    return
-                await self._track_manual_message(interaction.guild_id, target_channel.id, message)
-                if youtube_target is not None:
-                    self.storage.mark_youtube_target_seen(interaction.guild_id, youtube_live.video_id)
-                sent.append("유튜브")
+        if not await self._process_manual_chzzk_broadcast(
+            interaction,
+            target_channel,
+            source_value,
+            chzzk_live,
+            youtube_live,
+            role_id,
+            sent,
+            skipped,
+            errors,
+        ):
+            return
+        if not await self._process_manual_youtube_broadcast(
+            interaction,
+            target_channel,
+            source_value,
+            youtube_live,
+            role_id,
+            sent,
+            skipped,
+            errors,
+        ):
+            return
 
         for label in errors:
             skipped.append(f"{label}: 방송 현황 확인 실패")
 
-        if not sent:
-            await interaction.followup.send(
-                "보낼 수 있는 현재 방송이 없어요.\n" + "\n".join(skipped),
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        result = f"{target_channel.mention}에 {', '.join(sent)} 방송을 보냈어요."
-        if skipped:
-            result += "\n" + "\n".join(skipped)
         await interaction.followup.send(
-            result,
+            self._manual_broadcast_result_text(target_channel, sent, skipped),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+
+    async def _resolve_chzzk_config_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+        current: GuildChzzkTarget | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        if current is not None and interaction.guild is not None:
+            return self._as_text_channel(interaction.guild.get_channel(current.channel_id))
+        return self._as_text_channel(interaction.channel)
+
+    async def _fetch_chzzk_config_live(self, enabled: bool) -> ChzzkLive | None:
+        if not enabled:
+            return None
+        try:
+            return await self.chzzk_client.fetch_live()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("치지직 현재 라이브 확인 실패", exc)
+            return None
+
+    async def _resolve_youtube_config_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+        current: GuildYoutubeTarget | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        if current is not None:
+            resolved = await self._resolve_youtube_target_channel(current)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        return self._as_text_channel(interaction.channel)
+
+    async def _fetch_youtube_config_live(self, enabled: bool) -> YoutubeLive | None:
+        if not enabled:
+            return None
+        try:
+            return await self.youtube_client.fetch_live()
+        except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
+            _log_internet_exception("유튜브 현재 라이브 확인 실패", exc)
+            return None
 
     async def configure_chzzk_notifications(
         self,
@@ -7101,14 +8247,7 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         current = self.storage.get_chzzk_target(interaction.guild_id)
-        if channel is None and current is not None:
-            channel = interaction.guild.get_channel(current.channel_id) if interaction.guild else None
-        if channel is None:
-            channel = (
-                interaction.channel
-                if isinstance(interaction.channel, discord.TextChannel)
-                else None
-            )
+        channel = await self._resolve_chzzk_config_channel(interaction, channel, current)
         if channel is None:
             await interaction.followup.send(
                 "치지직 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
@@ -7118,15 +8257,8 @@ class NewsCog(commands.Cog):
             return
 
         enabled_value = _choice_bool(enabled, False)
-        live = None
-        last_live_id = None
-        if enabled_value:
-            try:
-                live = await self.chzzk_client.fetch_live()
-            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
-                _log_internet_exception("치지직 현재 라이브 확인 실패", exc)
-            if live is not None:
-                last_live_id = live.live_id
+        live = await self._fetch_chzzk_config_live(enabled_value)
+        last_live_id = live.live_id if live is not None else None
 
         target = self.storage.upsert_chzzk_target(
             interaction.guild_id,
@@ -7185,6 +8317,55 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _resolve_chzzk_live_send_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+        settings: GuildSettings,
+        chzzk_target: GuildChzzkTarget | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        if chzzk_target is not None:
+            resolved = await self._resolve_chzzk_target_channel(chzzk_target)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        return self._as_text_channel(interaction.channel)
+
+    async def _send_manual_chzzk_live_message(
+        self,
+        interaction: discord.Interaction,
+        target_channel: discord.TextChannel,
+        live: ChzzkLive,
+        role_id: int | None,
+    ) -> discord.Message | None:
+        try:
+            return await self._send_chzzk_live_to_channel(
+                target_channel,
+                live,
+                role_id=role_id,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "지정한 채널에 치지직 방송을 보낼 권한이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            LOGGER.exception("치지직 라이브 수동 전송 실패.")
+            await interaction.followup.send(
+                "치지직 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return None
+
     async def send_chzzk_live(
         self,
         interaction: discord.Interaction,
@@ -7228,19 +8409,12 @@ class NewsCog(commands.Cog):
             return
 
         settings = self.storage.get_settings(interaction.guild_id)
-        target_channel = channel
-        if target_channel is None and settings.channel_id is not None:
-            resolved = await self._resolve_target_channel(None, settings.channel_id)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None and chzzk_target is not None:
-            resolved = await self._resolve_chzzk_target_channel(chzzk_target)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None:
-            target_channel = (
-                interaction.channel
-                if isinstance(interaction.channel, discord.TextChannel)
-                else None
-            )
+        target_channel = await self._resolve_chzzk_live_send_channel(
+            interaction,
+            channel,
+            settings,
+            chzzk_target,
+        )
         if target_channel is None:
             await interaction.followup.send(
                 "치지직 방송을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
@@ -7250,26 +8424,13 @@ class NewsCog(commands.Cog):
             return
 
         role_id = role.id if role else settings.role_id
-        try:
-            message = await self._send_chzzk_live_to_channel(
-                target_channel,
-                live,
-                role_id=role_id,
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "지정한 채널에 치지직 방송을 보낼 권한이 없어요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        except discord.HTTPException:
-            LOGGER.exception("치지직 라이브 수동 전송 실패.")
-            await interaction.followup.send(
-                "치지직 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        message = await self._send_manual_chzzk_live_message(
+            interaction,
+            target_channel,
+            live,
+            role_id,
+        )
+        if message is None:
             return
 
         await self._track_manual_message(interaction.guild_id, target_channel.id, message)
@@ -7295,16 +8456,11 @@ class NewsCog(commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         current = self.storage.get_youtube_target(interaction.guild_id)
-        target_channel = channel
-        if target_channel is None and current is not None:
-            resolved = await self._resolve_youtube_target_channel(current)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None:
-            target_channel = (
-                interaction.channel
-                if isinstance(interaction.channel, discord.TextChannel)
-                else None
-            )
+        target_channel = await self._resolve_youtube_config_channel(
+            interaction,
+            channel,
+            current,
+        )
         if target_channel is None:
             await interaction.followup.send(
                 "유튜브 알림을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
@@ -7314,15 +8470,8 @@ class NewsCog(commands.Cog):
             return
 
         enabled_value = _choice_bool(enabled, False)
-        live = None
-        last_live_id = None
-        if enabled_value:
-            try:
-                live = await self.youtube_client.fetch_live()
-            except (aiohttp.ClientError, asyncio.TimeoutError, TimeoutError) as exc:
-                _log_internet_exception("유튜브 현재 라이브 확인 실패", exc)
-            if live is not None:
-                last_live_id = live.video_id
+        live = await self._fetch_youtube_config_live(enabled_value)
+        last_live_id = live.video_id if live is not None else None
 
         target = self.storage.upsert_youtube_target(
             interaction.guild_id,
@@ -7376,6 +8525,55 @@ class NewsCog(commands.Cog):
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
+    async def _resolve_youtube_live_send_channel(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None,
+        settings: GuildSettings,
+        youtube_target: GuildYoutubeTarget | None,
+    ) -> discord.TextChannel | None:
+        if channel is not None:
+            return channel
+        if settings.channel_id is not None:
+            resolved = await self._resolve_target_channel(None, settings.channel_id)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        if youtube_target is not None:
+            resolved = await self._resolve_youtube_target_channel(youtube_target)
+            text_channel = self._as_text_channel(resolved)
+            if text_channel is not None:
+                return text_channel
+        return self._as_text_channel(interaction.channel)
+
+    async def _send_manual_youtube_live_message(
+        self,
+        interaction: discord.Interaction,
+        target_channel: discord.TextChannel,
+        live: YoutubeLive,
+        role_id: int | None,
+    ) -> discord.Message | None:
+        try:
+            return await self._send_youtube_live_to_channel(
+                target_channel,
+                live,
+                role_id=role_id,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "지정한 채널에 유튜브 방송을 보낼 권한이 없어요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException:
+            LOGGER.exception("유튜브 라이브 수동 전송 실패.")
+            await interaction.followup.send(
+                "유튜브 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        return None
+
     async def send_youtube_live(
         self,
         interaction: discord.Interaction,
@@ -7419,19 +8617,12 @@ class NewsCog(commands.Cog):
             return
 
         settings = self.storage.get_settings(interaction.guild_id)
-        target_channel = channel
-        if target_channel is None and settings.channel_id is not None:
-            resolved = await self._resolve_target_channel(None, settings.channel_id)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None and youtube_target is not None:
-            resolved = await self._resolve_youtube_target_channel(youtube_target)
-            target_channel = resolved if isinstance(resolved, discord.TextChannel) else None
-        if target_channel is None:
-            target_channel = (
-                interaction.channel
-                if isinstance(interaction.channel, discord.TextChannel)
-                else None
-            )
+        target_channel = await self._resolve_youtube_live_send_channel(
+            interaction,
+            channel,
+            settings,
+            youtube_target,
+        )
         if target_channel is None:
             await interaction.followup.send(
                 "유튜브 방송을 보낼 채널을 찾지 못했어요. 채널을 직접 골라 다시 실행해주세요.",
@@ -7441,26 +8632,13 @@ class NewsCog(commands.Cog):
             return
 
         role_id = role.id if role else settings.role_id
-        try:
-            message = await self._send_youtube_live_to_channel(
-                target_channel,
-                live,
-                role_id=role_id,
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                "지정한 채널에 유튜브 방송을 보낼 권한이 없어요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        except discord.HTTPException:
-            LOGGER.exception("유튜브 라이브 수동 전송 실패.")
-            await interaction.followup.send(
-                "유튜브 방송 전송에 실패했어요. 채널 권한을 확인해주세요.",
-                ephemeral=True,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+        message = await self._send_manual_youtube_live_message(
+            interaction,
+            target_channel,
+            live,
+            role_id,
+        )
+        if message is None:
             return
 
         await self._track_manual_message(interaction.guild_id, target_channel.id, message)
