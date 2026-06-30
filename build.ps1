@@ -144,8 +144,7 @@ try {
     }
     $addDataArgs += @(
         "--add-data", "$root\logo.ico;.",
-        "--add-data", "$root\img;img",
-        "--add-data", "$root\ego_gifts.csv;."
+        "--add-data", "$root\img;img"
     )
     Write-BuildProgress -Percent 32 -Status "Data files prepared" -LogLine
 
@@ -170,11 +169,13 @@ try {
         "--hidden-import=src.clients.steam_client",
         "--hidden-import=src.clients.x_client",
         "--hidden-import=src.clients.youtube_client",
+        "--hidden-import=ego",
         "--hidden-import=discord",
         "--hidden-import=discord.ext.commands",
         "--hidden-import=discord.ext.tasks",
         "--hidden-import=discord.app_commands",
         "--hidden-import=aiohttp",
+        "--hidden-import=playwright",
         "--hidden-import=dotenv",
         "--hidden-import=pystray._win32",
         "--hidden-import=PIL",
@@ -188,6 +189,7 @@ try {
         "--exclude-module=pystray._util.notify_dbus",
         "--collect-submodules=discord",
         "--collect-submodules=aiohttp",
+        "--collect-submodules=playwright",
         "--collect-submodules=src"
     )
     $pyInstallerArgs += $addDataArgs

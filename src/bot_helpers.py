@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import csv
 import ctypes
 import io
+import json
 import logging
 import os
 import re
@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
@@ -30,7 +31,7 @@ from .bot_constants import (
     BROADCAST_SOURCE_YOUTUBE,
     CHZZK_LIVE_ANNOUNCE_MAX_AGE,
     CHZZK_LIVE_END_ANNOUNCE_MAX_AGE,
-    EGO_GIFT_CSV_PATH,
+    EGO_GIFT_STORE_PATH,
     EMBED_DESCRIPTION_LIMIT,
     ES_CONTINUOUS,
     ES_SYSTEM_REQUIRED,
@@ -111,48 +112,98 @@ class EgoGift:
     image_url: str
 
 
+_EGO_GIFT_STORE_PATH: Path | None = None
+
+
+def set_ego_gift_store_path(path: Path) -> None:
+    global _EGO_GIFT_STORE_PATH
+    resolved = path.resolve()
+    if _EGO_GIFT_STORE_PATH == resolved:
+        return
+    _EGO_GIFT_STORE_PATH = resolved
+    _load_ego_gifts.cache_clear()
+
+
+def clear_ego_gift_cache() -> None:
+    _load_ego_gifts.cache_clear()
+
+
+def _ego_gift_store_path() -> Path:
+    return _EGO_GIFT_STORE_PATH or Path(EGO_GIFT_STORE_PATH)
+
+
 def _normalize_search_text(value: str) -> str:
     return re.sub(r"\s+", "", value).casefold()
 
 
 @lru_cache(maxsize=1)
 def _load_ego_gifts() -> tuple[EgoGift, ...]:
-    path = _resource_path(EGO_GIFT_CSV_PATH)
+    path = _ego_gift_store_path()
     if not path.exists():
-        LOGGER.warning("에고 기프트 CSV 파일을 찾지 못했습니다: %s", path)
+        LOGGER.warning("에고 기프트 데이터 파일을 찾지 못했습니다: %s", path)
         return ()
 
     gifts: list[EgoGift] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            name, grade = _split_ego_gift_name_and_grade(
-                (row.get("이름") or "").strip(),
-                (row.get("등급") or "").strip(),
-            )
-            if not name:
-                continue
-            gifts.append(
-                EgoGift(
-                    name=name,
-                    grade=grade,
-                    keyword=(row.get("키워드") or "").strip(),
-                    category=(row.get("카테고리") or "").strip(),
-                    related=(row.get("연관") or "").strip(),
-                    first_seen=(row.get("첫_등장") or "").strip(),
-                    upgradeable=(row.get("강화_가능") or "").strip(),
-                    sale_price=(row.get("판매_가격") or "").strip(),
-                    purchasable=(row.get("구매_가능") or "").strip(),
-                    synthesis=(row.get("합성_기프트") or "").strip(),
-                    hard_only=(row.get("하드_한정") or "").strip(),
-                    extreme_only=(row.get("익스트림_한정") or "").strip(),
-                    theme_pack_only=(row.get("테마팩_한정") or "").strip(),
-                    recipe=(row.get("조합식") or "").strip(),
-                    effect=(row.get("효과") or "").strip(),
-                    image_url=(row.get("이미지_URL") or "").strip(),
-                )
-            )
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            payload = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("에고 기프트 데이터 파일을 읽지 못했습니다: %s", path, exc_info=True)
+        return ()
+
+    for row in _ego_gift_store_rows(payload):
+        gift = _ego_gift_from_row(row)
+        if gift is not None:
+            gifts.append(gift)
     return tuple(sorted(gifts, key=_ego_gift_sort_key))
+
+
+def _ego_gift_store_rows(payload: object) -> list[object]:
+    if isinstance(payload, dict):
+        rows = payload.get("gifts", [])
+    else:
+        rows = payload
+    if isinstance(rows, list):
+        return rows
+    LOGGER.warning("에고 기프트 데이터 파일의 gifts 항목이 목록이 아닙니다.")
+    return []
+
+
+def _row_text(row: Mapping[str, object], key: str) -> str:
+    value = row.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _ego_gift_from_row(row: object) -> EgoGift | None:
+    if not isinstance(row, Mapping):
+        return None
+
+    name, grade = _split_ego_gift_name_and_grade(
+        _row_text(row, "이름"),
+        _row_text(row, "등급"),
+    )
+    if not name:
+        return None
+    return EgoGift(
+        name=name,
+        grade=grade,
+        keyword=_row_text(row, "키워드"),
+        category=_row_text(row, "카테고리"),
+        related=_row_text(row, "연관"),
+        first_seen=_row_text(row, "첫_등장"),
+        upgradeable=_row_text(row, "강화_가능"),
+        sale_price=_row_text(row, "판매_가격"),
+        purchasable=_row_text(row, "구매_가능"),
+        synthesis=_row_text(row, "합성_기프트"),
+        hard_only=_row_text(row, "하드_한정"),
+        extreme_only=_row_text(row, "익스트림_한정"),
+        theme_pack_only=_row_text(row, "테마팩_한정"),
+        recipe=_row_text(row, "조합식"),
+        effect=_row_text(row, "효과"),
+        image_url=_row_text(row, "이미지_URL"),
+    )
 
 
 def _find_ego_gifts(query: str) -> list[EgoGift]:
@@ -2624,6 +2675,8 @@ def _build_aiohttp_connector() -> aiohttp.TCPConnector:
 
 __all__ = [
     "EgoGift",
+    "set_ego_gift_store_path",
+    "clear_ego_gift_cache",
     "_normalize_search_text",
     "_load_ego_gifts",
     "_find_ego_gifts",

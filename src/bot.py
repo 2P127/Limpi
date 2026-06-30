@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import asyncio
-import csv
 import ctypes
 import gc
 import io
@@ -16,7 +15,7 @@ import sys
 import re
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from html.parser import HTMLParser
 from pathlib import Path
@@ -93,6 +92,10 @@ from .bot_constants import (
     EGO_GIFT_IMAGE_PROCESS_CONCURRENCY,
     EGO_GIFT_IMAGE_WARMUP_CONCURRENCY,
     EGO_GIFT_IMAGE_WARMUP_LIMIT,
+    EGO_GIFT_STORE_PATH,
+    EGO_GIFT_UPDATE_HOUR_KST,
+    EGO_GIFT_UPDATE_WEEKDAY,
+    HAMPANG_AUTO_POLL_INTERVAL_SECONDS,
     HAMPANG_SOURCE_BOTH,
     HAMPANG_SOURCE_CHOICES,
     HAMPANG_SOURCE_X,
@@ -133,6 +136,10 @@ from .bot_constants import (
     TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS,
     TWITTER_POLL_TICK_SECONDS,
     TWITTER_POST_LIMIT,
+    TWITTER_PRIORITY_POLL_INTERVAL_SECONDS,
+    TWITTER_PRIORITY_POLL_PREP_SECONDS,
+    TWITTER_PRIORITY_POLL_TIMES_KST,
+    TWITTER_PRIORITY_POLL_WINDOW_SECONDS,
     TWITTER_STEAM_PREFERENCE_GRACE_SECONDS,
     USER_COMMAND_COOLDOWN_SECONDS,
     YOUTUBE_LIVE_ANNOUNCE_MAX_AGE,
@@ -157,6 +164,7 @@ from .bot_helpers import (
     _brighten_image_bytes,
     _build_aiohttp_connector,
     _build_layout_view_for_post,
+    clear_ego_gift_cache,
     _chzzk_live_view,
     _choice_bool,
     _content_image_urls,
@@ -217,6 +225,7 @@ from .bot_helpers import (
     _resource_path,
     _restore_windows_sleep,
     _safe_zip_filename,
+    set_ego_gift_store_path,
     _sort_posts_newest_first,
     _sort_twitter_posts_newest_first,
     _sort_youtube_uploads_newest_first,
@@ -426,6 +435,53 @@ def _ego_gift_fallback_payload(text: str) -> dict[str, object] | None:
 
 def _ego_gift_fallback_key(name: str) -> str:
     return re.sub(r"\s+", "", name).casefold()
+
+
+def _ego_gift_store_path(database_path: Path) -> Path:
+    return database_path.with_name(EGO_GIFT_STORE_PATH.name)
+
+
+def _is_ego_gift_update_window(now: datetime) -> bool:
+    return (
+        now.weekday() == EGO_GIFT_UPDATE_WEEKDAY
+        and now.hour == EGO_GIFT_UPDATE_HOUR_KST
+    )
+
+
+def _seconds_since_midnight(now: datetime) -> int:
+    local_now = now.astimezone(KST)
+    return local_now.hour * 3600 + local_now.minute * 60 + local_now.second
+
+
+def _twitter_priority_start_seconds() -> tuple[int, ...]:
+    return tuple(
+        hour * 3600 + minute * 60
+        for hour, minute in TWITTER_PRIORITY_POLL_TIMES_KST
+    )
+
+
+def _is_twitter_priority_poll_window(now: datetime) -> bool:
+    current_second = _seconds_since_midnight(now)
+    return any(
+        0 <= current_second - start < TWITTER_PRIORITY_POLL_WINDOW_SECONDS
+        for start in _twitter_priority_start_seconds()
+    )
+
+
+def _seconds_until_twitter_priority_poll(now: datetime) -> int:
+    current_second = _seconds_since_midnight(now)
+    day_seconds = 24 * 60 * 60
+    return min(
+        (start - current_second) % day_seconds
+        for start in _twitter_priority_start_seconds()
+    )
+
+
+def _is_twitter_priority_prep_window(now: datetime) -> bool:
+    if _is_twitter_priority_poll_window(now):
+        return False
+    seconds_until = _seconds_until_twitter_priority_poll(now)
+    return 0 < seconds_until <= TWITTER_PRIORITY_POLL_PREP_SECONDS
 
 
 def _is_subcommand_option(option: dict[str, object]) -> bool:
@@ -806,6 +862,8 @@ class NewsCog(commands.Cog):
         self.session = session
         self.test_mode = test_mode
         self._x_probe_active = test_mode and config.x_news_probe
+        self._ego_gift_store_path = _ego_gift_store_path(config.database_path)
+        set_ego_gift_store_path(self._ego_gift_store_path)
         self.chzzk_client = ChzzkClient(session)
         self.youtube_client = YoutubeClient(session)
         self._poll_lock = asyncio.Lock()
@@ -836,8 +894,12 @@ class NewsCog(commands.Cog):
         # 동일 기프트를 동시에 조회할 때 빌드를 한 번만 수행하도록 in-flight 태스크 공유.
         self._ego_gift_image_tasks: dict[str, asyncio.Task[bytes | None]] = {}
         self._ego_gift_image_semaphore = asyncio.Semaphore(EGO_GIFT_IMAGE_PROCESS_CONCURRENCY)
+        self._ego_gift_update_lock = asyncio.Lock()
+        self._ego_gift_startup_task: asyncio.Task[None] | None = None
+        self._last_ego_gift_update_check_date: date | None = None
         self._last_poll_at: datetime | None = None
         self._last_twitter_poll_at: datetime | None = None
+        self._last_hampang_poll_at: datetime | None = None
         self._startup_synced = False
         self._news_recovery_baseline_pending = False
         self._twitter_recovery_baseline_pending = False
@@ -862,6 +924,9 @@ class NewsCog(commands.Cog):
         self.poll_chzzk_live.start()
         self.poll_youtube_live.start()
         self.poll_youtube_uploads.start()
+        self.refresh_ego_gifts.start()
+        self._ego_gift_startup_task = asyncio.create_task(self._ensure_ego_gift_data())
+        self._ego_gift_startup_task.add_done_callback(self._log_background_task_result)
 
         if self.news_source is None and self.x_source is None:
             LOGGER.warning("뉴스 소스가 설정되지 않아 뉴스 폴링을 비활성화합니다.")
@@ -882,6 +947,10 @@ class NewsCog(commands.Cog):
             self.poll_youtube_live.cancel()
         if self.poll_youtube_uploads.is_running():
             self.poll_youtube_uploads.cancel()
+        if self.refresh_ego_gifts.is_running():
+            self.refresh_ego_gifts.cancel()
+        if self._ego_gift_startup_task is not None:
+            self._ego_gift_startup_task.cancel()
         self.maintenance_notifications.cancel()
         self.cleanup_messages.cancel()
         for task in self._brighten_tasks.values():
@@ -1122,14 +1191,26 @@ class NewsCog(commands.Cog):
                 if not self.bot.is_ready():
                     self._twitter_recovery_baseline_pending = True
                     return
-                if not self._should_poll_twitter_now(now):
+                should_poll_twitter = self._should_poll_twitter_now(now)
+                should_poll_hampang = self._should_poll_hampang_now(now)
+                if not should_poll_twitter and not should_poll_hampang:
                     return
-                self._last_twitter_poll_at = now
-                twitter_result, hampang_result = await asyncio.gather(
-                    self._poll_twitter_once(),
-                    self._poll_hampang_news_once(),
+
+                poll_tasks: dict[str, asyncio.Task[int]] = {}
+                if should_poll_twitter:
+                    self._last_twitter_poll_at = now
+                    poll_tasks["twitter"] = asyncio.create_task(self._poll_twitter_once())
+                if should_poll_hampang:
+                    self._last_hampang_poll_at = now
+                    poll_tasks["hampang"] = asyncio.create_task(self._poll_hampang_news_once())
+
+                results = await asyncio.gather(
+                    *poll_tasks.values(),
                     return_exceptions=True,
                 )
+                result_by_name = dict(zip(poll_tasks, results))
+                twitter_result = result_by_name.get("twitter")
+                hampang_result = result_by_name.get("hampang")
                 if isinstance(twitter_result, Exception):
                     raise twitter_result
                 if isinstance(hampang_result, Exception):
@@ -1209,6 +1290,73 @@ class NewsCog(commands.Cog):
     @poll_youtube_uploads.before_loop
     async def before_poll_youtube_uploads(self) -> None:
         await self._wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def refresh_ego_gifts(self) -> None:
+        try:
+            now = datetime.now(KST)
+            if not _is_ego_gift_update_window(now):
+                return
+            if self._last_ego_gift_update_check_date == now.date():
+                return
+            await self._refresh_ego_gift_data(source="schedule")
+            self._last_ego_gift_update_check_date = now.date()
+        except Exception:
+            LOGGER.exception("에고 기프트 자동 갱신 실패.")
+
+    @refresh_ego_gifts.before_loop
+    async def before_refresh_ego_gifts(self) -> None:
+        await self._wait_until_ready()
+
+    async def _ensure_ego_gift_data(self) -> None:
+        await self._wait_until_ready()
+        try:
+            if self._current_ego_gift_store_hash() is not None:
+                return
+            await self._refresh_ego_gift_data(source="startup")
+        except Exception:
+            LOGGER.exception("에고 기프트 초기 데이터 준비 실패.")
+
+    def _current_ego_gift_store_hash(self) -> str | None:
+        try:
+            with self._ego_gift_store_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("content_hash")
+        return value if isinstance(value, str) and value else None
+
+    async def _refresh_ego_gift_data(self, *, source: str) -> None:
+        async with self._ego_gift_update_lock:
+            try:
+                from ego import crawl_ego_gifts, ego_gift_rows_hash, write_ego_gift_store
+            except ImportError:
+                LOGGER.warning("에고 기프트 자동 갱신을 건너뜁니다: Playwright 의존성을 찾지 못했습니다.")
+                return
+
+            previous_hash = self._current_ego_gift_store_hash()
+            rows = await crawl_ego_gifts(verbose=False)
+            if not rows:
+                LOGGER.warning("에고 기프트 자동 갱신 결과가 비어 있어 기존 데이터를 유지합니다.")
+                return
+
+            content_hash = ego_gift_rows_hash(rows)
+            if content_hash == previous_hash:
+                LOGGER.info("에고 기프트 자동 확인 완료: 변경 없음 (%s개).", len(rows))
+                return
+
+            payload = write_ego_gift_store(self._ego_gift_store_path, rows)
+            clear_ego_gift_cache()
+            self._ego_gift_image_cache.clear()
+            self._ego_gift_image_cache_bytes = 0
+            LOGGER.info(
+                "에고 기프트 데이터 갱신 완료: source=%s count=%s hash=%s",
+                source,
+                payload.get("count"),
+                payload.get("content_hash"),
+            )
 
     @tasks.loop(seconds=60)
     async def maintenance_notifications(self) -> None:
@@ -1635,7 +1783,9 @@ class NewsCog(commands.Cog):
         now = datetime.now(timezone.utc)
         news_task = asyncio.create_task(self._sync_global_news_cache())
         if self._is_twitter_tracking_window(now):
-            twitter_task = asyncio.create_task(self._sync_twitter_posts())
+            twitter_task = asyncio.create_task(
+                self._sync_twitter_posts(cache_ttl=self._twitter_fetch_cache_ttl(now))
+            )
             news_result, twitter_result = await asyncio.gather(
                 news_task,
                 twitter_task,
@@ -1643,7 +1793,10 @@ class NewsCog(commands.Cog):
             )
         else:
             news_result = await news_task
-            twitter_result = (0, [])
+            twitter_result = (
+                0,
+                self.storage.search_twitter_posts("", limit=TWITTER_POST_LIMIT),
+            )
         posts_by_language, changed, steam_had_failure = self._handle_combined_steam_result(
             news_result
         )
@@ -1786,6 +1939,8 @@ class NewsCog(commands.Cog):
 
     def _defer_linked_twitter_for_steam(self, post: NewsPost) -> bool:
         if not _is_twitter_news_post(post) or not _steam_news_link_keys_for_news_post(post):
+            return False
+        if _is_twitter_priority_poll_window(datetime.now(timezone.utc)):
             return False
 
         if self._twitter_steam_retry_count.get(post.post_id, 0) >= 2:
@@ -2504,7 +2659,19 @@ class NewsCog(commands.Cog):
         elapsed = (now - self._last_twitter_poll_at).total_seconds()
         return elapsed >= interval
 
+    def _should_poll_hampang_now(self, now: datetime) -> bool:
+        if not self._is_twitter_tracking_window(now):
+            return False
+        if _is_twitter_priority_prep_window(now) or _is_twitter_priority_poll_window(now):
+            return False
+        if self._last_hampang_poll_at is None:
+            return True
+        elapsed = (now - self._last_hampang_poll_at).total_seconds()
+        return elapsed >= HAMPANG_AUTO_POLL_INTERVAL_SECONDS
+
     def _current_twitter_poll_interval_seconds(self, now: datetime) -> int:
+        if _is_twitter_priority_poll_window(now):
+            return TWITTER_PRIORITY_POLL_INTERVAL_SECONDS
         return max(
             self.config.twitter_poll_interval_seconds,
             self.config.twitter_min_poll_interval_seconds,
@@ -2589,6 +2756,8 @@ class NewsCog(commands.Cog):
         return filtered
 
     def _current_poll_interval_seconds(self, now: datetime) -> int:
+        if _is_twitter_priority_poll_window(now):
+            return TWITTER_PRIORITY_POLL_INTERVAL_SECONDS
         if self._is_high_frequency_window(now):
             return self.config.high_frequency_poll_interval_seconds
         return self.config.poll_interval_seconds
@@ -4925,7 +5094,10 @@ class NewsCog(commands.Cog):
         error: str | None = None
         posts: list[TwitterPost] = []
         try:
-            posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+            posts = await self.x_source.fetch_recent_posts(
+                limit=TWITTER_POST_LIMIT,
+                ignore_rate_limit_backoff=True,
+            )
         except XClientError as exc:
             error = f"{type(exc).__name__}: {exc}"
         fetch_ms = (loop.time() - t0) * 1000
@@ -5001,8 +5173,21 @@ class NewsCog(commands.Cog):
             sum(len(t["would_announce"]) for t in targets_info),
         )
 
-    async def _sync_twitter_posts(self) -> tuple[int, list[TwitterPost]]:
-        posts = await self.x_source.fetch_recent_posts(limit=TWITTER_POST_LIMIT)
+    def _twitter_fetch_cache_ttl(self, now: datetime) -> timedelta | None:
+        if _is_twitter_priority_poll_window(now):
+            return timedelta(seconds=1)
+        return None
+
+    async def _sync_twitter_posts(
+        self,
+        *,
+        cache_ttl: timedelta | None = None,
+    ) -> tuple[int, list[TwitterPost]]:
+        posts = await self.x_source.fetch_recent_posts(
+            limit=TWITTER_POST_LIMIT,
+            cache_ttl=cache_ttl,
+            ignore_rate_limit_backoff=True,
+        )
         saved = self.storage.save_twitter_posts(posts)
         return saved, posts
 
@@ -5238,7 +5423,8 @@ class NewsCog(commands.Cog):
             await self._x_news_probe_observe(targets)
             return 0
 
-        _, posts = await self._sync_twitter_posts()
+        now = datetime.now(timezone.utc)
+        _, posts = await self._sync_twitter_posts(cache_ttl=self._twitter_fetch_cache_ttl(now))
         if not posts:
             self._twitter_recovery_baseline_pending = False
             return 0
@@ -6112,7 +6298,7 @@ class NewsCog(commands.Cog):
                 LOGGER.warning("햄햄팡팡 공식 X 확인 실패: %s", x_result)
         else:
             x_posts = _sort_twitter_posts_newest_first(x_result)
-            x_failed = self.hampang_x_source.last_fetch_had_upstream_failure
+            x_failed = self.hampang_x_source.last_fetch_had_upstream_failure and not x_posts
 
         if isinstance(youtube_result, Exception):
             youtube_failed = True

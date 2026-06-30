@@ -17,7 +17,7 @@ from ..core.config import AppConfig
 from ..core.models import TwitterPost
 
 LOGGER = logging.getLogger(__name__)
-X_POST_CACHE_TTL = timedelta(seconds=5)
+X_POST_CACHE_TTL = timedelta(seconds=20)
 X_RATE_LIMIT_BACKOFF = timedelta(minutes=1)
 X_RATE_LIMIT_BACKOFF_MAX = timedelta(minutes=10)
 X_RATE_LIMIT_RESET_CAP = timedelta(minutes=20)
@@ -203,7 +203,13 @@ class LimbusXClient:
         LOGGER.debug("Twitter API: 유저 ID 조회 완료 %s → %s", username, user_id)
         return user_id
 
-    async def fetch_recent_posts(self, *, limit: int = 20) -> list[TwitterPost]:
+    async def fetch_recent_posts(
+        self,
+        *,
+        limit: int = 20,
+        cache_ttl: timedelta | None = None,
+        ignore_rate_limit_backoff: bool = False,
+    ) -> list[TwitterPost]:
         if not self._has_twitter_auth():
             raise XClientError(
                 "X_AUTH_TOKEN 또는 X_CT0가 설정되지 않아 Twitter 게시물을 가져올 수 없습니다."
@@ -211,10 +217,19 @@ class LimbusXClient:
         async with self._fetch_lock:
             self.last_fetch_had_upstream_failure = False
             now = datetime.now(timezone.utc)
-            if self._cached_posts and self._cached_at and now - self._cached_at < X_POST_CACHE_TTL:
+            effective_cache_ttl = cache_ttl if cache_ttl is not None else X_POST_CACHE_TTL
+            if (
+                self._cached_posts
+                and self._cached_at
+                and now - self._cached_at < effective_cache_ttl
+            ):
                 return self._cached_posts[:limit]
             backoff_until = self._active_rate_limited_until()
-            if backoff_until and now < backoff_until:
+            if (
+                backoff_until
+                and now < backoff_until
+                and not ignore_rate_limit_backoff
+            ):
                 self._rate_limited_until = backoff_until
                 self.last_fetch_had_upstream_failure = True
                 if self._cached_posts:
@@ -347,12 +362,13 @@ class LimbusXClient:
         self._rate_limit_failures += 1
         LOGGER.warning(
             "X API 429 레이트리밋. consecutive_429=%s backoff_seconds=%.0f "
-            "next_allowed_poll_at=%s rate_limit_remaining=%s rate_limit_reset_at=%s",
+            "next_allowed_poll_at=%s rate_limit_remaining=%s rate_limit_reset_at=%s account=%s",
             self._rate_limit_failures,
             seconds,
             _format_kst_datetime(self._rate_limited_until),
             remaining if remaining is not None else "unknown",
             _format_kst_datetime(reset_at),
+            self.account_username,
         )
 
     def _log_backoff_active(self) -> None:
@@ -361,14 +377,16 @@ class LimbusXClient:
             return
         if self._last_backoff_log_until == until:
             LOGGER.debug(
-                "X API 백오프 중입니다 (해제 예상: %s). 캐시를 사용합니다.",
+                "X API 백오프 중입니다 (해제 예상: %s, account=%s). 캐시를 사용합니다.",
                 _format_kst_datetime(until),
+                self.account_username,
             )
             return
         self._last_backoff_log_until = until
         LOGGER.warning(
-            "X API 백오프 중이라 캐시된 게시물을 사용합니다. 다시 시도 가능 예상 시간: %s",
+            "X API 백오프 중이라 캐시된 게시물을 사용합니다. 다시 시도 가능 예상 시간: %s account=%s",
             _format_kst_datetime(until),
+            self.account_username,
         )
 
     async def _fetch_via_twitter_api(self, *, limit: int) -> list[TwitterPost]:
