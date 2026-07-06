@@ -8,6 +8,7 @@ import os
 import re
 import socket
 import sys
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1782,7 +1783,9 @@ def _matching_steam_posts_for_twitter(
 ) -> list[NewsPost]:
     link_urls = _raw_link_urls(post.raw)
     link_keys = _steam_news_link_keys_for_twitter(post)
-    twitter_candidates = _news_body_match_candidates(post.text)
+    link_keys.update(_steam_news_link_keys_from_text(post.text))
+    twitter_candidates = _news_body_match_candidates(post.title)
+    twitter_candidates.update(_news_body_match_candidates(post.text))
     matched: list[NewsPost] = []
     seen: set[str] = set()
     for steam_post in steam_posts:
@@ -1807,21 +1810,16 @@ def _twitter_matches_steam_news(
     twitter_candidates: set[str],
 ) -> bool:
     steam_key = _steam_news_url_key(steam_post.url)
-    link_matches = steam_post.url in link_urls or (
-        steam_key is not None and steam_key in link_keys
-    )
     if steam_key is not None and steam_key in link_keys:
         return True
     if steam_post.url in link_urls:
         return True
-    content_matches = _news_match_candidates_overlap(
+    steam_candidates = _news_body_match_candidates(steam_post.title)
+    steam_candidates.update(_news_body_match_candidates(steam_post.text))
+    return _news_match_candidates_overlap(
         twitter_candidates,
-        {
-            *_news_body_match_candidates(steam_post.title),
-            *_news_body_match_candidates(steam_post.text),
-        },
+        steam_candidates,
     )
-    return link_matches and content_matches
 
 
 def _raw_link_urls(raw: dict) -> list[str]:
@@ -1831,7 +1829,82 @@ def _raw_link_urls(raw: dict) -> list[str]:
     return [str(url) for url in link_urls if url]
 
 
+def _steam_news_link_keys_from_text(text: str) -> set[str]:
+    return {
+        key
+        for key in (_steam_news_url_key(url) for url in re.findall(r"https?://\S+", text))
+        if key is not None
+    }
+
+
+_NEWS_BRACKET_PAIRS = (
+    ("[", "]"),
+    ("(", ")"),
+    ("{", "}"),
+    ("【", "】"),
+    ("「", "」"),
+    ("『", "』"),
+    ("〈", "〉"),
+    ("《", "》"),
+    ("〔", "〕"),
+    ("〖", "〗"),
+)
+
+
+def _news_text_match_variants(value: str) -> set[str]:
+    variants = {unicodedata.normalize("NFKC", value)}
+    for opening, closing in _NEWS_BRACKET_PAIRS:
+        pattern = re.compile(
+            rf"{re.escape(opening)}\s*(.*?)\s*{re.escape(closing)}"
+        )
+        next_variants = set(variants)
+        for variant in variants:
+            next_variants.add(pattern.sub(r" \1 ", variant))
+            next_variants.add(pattern.sub(" ", variant))
+        variants = next_variants
+    return variants
+
+
+def _normalize_news_match_text_normalized(value: str) -> str:
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"#\S+", " ", value)
+    value = "".join(
+        character if character.isalnum() or character == "_" else " "
+        for character in value.casefold()
+    )
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _news_body_match_candidates_normalized(text: str) -> set[str]:
+    values: list[str] = []
+    line_count = 0
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        cleaned = line.strip()
+        lowered = cleaned.lower()
+        if (
+            not cleaned
+            or cleaned.startswith("#")
+            or lowered.startswith("http://")
+            or lowered.startswith("https://")
+        ):
+            continue
+        values.extend(_news_text_match_variants(cleaned))
+        line_count += 1
+        if line_count >= 4:
+            break
+
+    candidates: set[str] = set()
+    for value in values:
+        for variant in _news_text_match_variants(value):
+            normalized = _normalize_news_match_text_normalized(variant)
+            if len(normalized.replace(" ", "")) >= 10:
+                candidates.add(normalized)
+    return candidates
+
+
 def _news_body_match_candidates(text: str) -> set[str]:
+    return _news_body_match_candidates_normalized(text)
     values: list[str] = []
     line_count = 0
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
@@ -1863,6 +1936,7 @@ def _news_body_match_candidates(text: str) -> set[str]:
 
 
 def _normalize_news_match_text(value: str) -> str:
+    return _normalize_news_match_text_normalized(value)
     value = re.sub(r"https?://\S+", " ", value)
     value = re.sub(r"#\S+", " ", value)
     value = re.sub(r"[\[【「『](.*?)[\]】」』]", r" \1 ", value)

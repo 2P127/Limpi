@@ -27,7 +27,7 @@ import aiohttp
 import cv2
 import discord
 import numpy as np
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -4233,47 +4233,164 @@ class NewsCog(commands.Cog):
             name = _unique_zip_name(used_names, index, url, content_type, native=True)
             zip_items.append((name, image_bytes))
 
-        buffers: list[io.BytesIO] = []
-        current_items: list[tuple[str, bytes]] = []
-        current_buffer: io.BytesIO | None = None
-        count = 0
-        skipped = 0
+        if not zip_items:
+            return [], 0, 0
 
-        for item in zip_items:
-            candidate_items = [*current_items, item]
-            candidate_buffer = self._zip_buffer_for_items(candidate_items)
-            if candidate_buffer.getbuffer().nbytes <= max_part_bytes:
-                current_items = candidate_items
-                current_buffer = candidate_buffer
-                continue
+        native_buffer = self._zip_buffer_for_items(zip_items)
+        if native_buffer.getbuffer().nbytes <= max_part_bytes:
+            return [native_buffer], len(zip_items), 0
 
-            if current_buffer is not None:
-                buffers.append(current_buffer)
-                count += len(current_items)
+        optimized_buffer = await asyncio.to_thread(
+            self._optimized_zip_buffer_for_items,
+            zip_items,
+            max_part_bytes,
+        )
+        if optimized_buffer is not None:
+            LOGGER.info(
+                "이미지 ZIP을 단일 파일로 보내기 위해 이미지를 압축했습니다 "
+                "(post_id=%s, images=%s, original_bytes=%s, compressed_bytes=%s, limit=%s).",
+                post.post_id,
+                len(zip_items),
+                native_buffer.getbuffer().nbytes,
+                optimized_buffer.getbuffer().nbytes,
+                max_part_bytes,
+            )
+            return [optimized_buffer], len(zip_items), 0
 
-            single_buffer = self._zip_buffer_for_items([item])
-            if single_buffer.getbuffer().nbytes <= max_part_bytes:
-                current_items = [item]
-                current_buffer = single_buffer
-            else:
-                current_items = []
-                current_buffer = None
-                skipped += 1
-
-        if current_buffer is not None:
-            buffers.append(current_buffer)
-            count += len(current_items)
-
-        return buffers, count, skipped
+        return [native_buffer], len(zip_items), 0
 
     @staticmethod
-    def _zip_buffer_for_items(items: list[tuple[str, bytes]]) -> io.BytesIO:
+    def _zip_buffer_for_items(
+        items: list[tuple[str, bytes]],
+        *,
+        compression: int = zipfile.ZIP_STORED,
+    ) -> io.BytesIO:
         buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        with zipfile.ZipFile(buffer, mode="w", compression=compression) as archive:
             for name, image_bytes in items:
                 archive.writestr(name, image_bytes)
         buffer.seek(0)
         return buffer
+
+    @staticmethod
+    def _optimized_zip_buffer_for_items(
+        items: list[tuple[str, bytes]],
+        max_bytes: int,
+    ) -> io.BytesIO | None:
+        attempts = (
+            (None, 88),
+            (1920, 84),
+            (1600, 80),
+            (1280, 76),
+            (1024, 72),
+            (900, 68),
+            (800, 64),
+            (720, 60),
+            (640, 56),
+            (540, 50),
+            (480, 45),
+            (384, 40),
+            (320, 36),
+            (256, 32),
+            (192, 30),
+            (160, 28),
+        )
+        best: io.BytesIO | None = None
+        best_size: int | None = None
+        for max_edge, quality in attempts:
+            optimized_items = NewsCog._optimized_zip_items(
+                items,
+                max_edge=max_edge,
+                quality=quality,
+            )
+            if optimized_items is None:
+                continue
+            buffer = NewsCog._zip_buffer_for_items(optimized_items)
+            size = buffer.getbuffer().nbytes
+            if best_size is None or size < best_size:
+                best = buffer
+                best_size = size
+            if size <= max_bytes:
+                return buffer
+        if best is not None and best_size is not None and best_size <= max_bytes:
+            return best
+        return None
+
+    @staticmethod
+    def _optimized_zip_items(
+        items: list[tuple[str, bytes]],
+        *,
+        max_edge: int | None,
+        quality: int,
+    ) -> list[tuple[str, bytes]] | None:
+        optimized: list[tuple[str, bytes]] = []
+        used_names: set[str] = set()
+        for name, image_bytes in items:
+            converted = NewsCog._image_bytes_as_zip_jpeg(
+                image_bytes,
+                max_edge=max_edge,
+                quality=quality,
+            )
+            if converted is None:
+                return None
+            optimized.append((NewsCog._optimized_zip_image_name(name, used_names), converted))
+        return optimized
+
+    @staticmethod
+    def _optimized_zip_image_name(name: str, used_names: set[str]) -> str:
+        stem = name.rsplit(".", 1)[0] if "." in name else name
+        candidate = f"{stem}.jpg"
+        counter = 2
+        while candidate in used_names:
+            candidate = f"{stem}_{counter}.jpg"
+            counter += 1
+        used_names.add(candidate)
+        return candidate
+
+    @staticmethod
+    def _image_bytes_as_zip_jpeg(
+        data: bytes,
+        *,
+        max_edge: int | None,
+        quality: int,
+    ) -> bytes | None:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.load()
+                image = ImageOps.exif_transpose(image)
+                if max_edge is not None:
+                    width, height = image.size
+                    longest = max(width, height)
+                    if longest > max_edge:
+                        scale = max_edge / longest
+                        image = image.resize(
+                            (
+                                max(1, round(width * scale)),
+                                max(1, round(height * scale)),
+                            ),
+                            Image.LANCZOS,
+                        )
+                if image.mode in {"RGBA", "LA"} or (
+                    image.mode == "P" and "transparency" in image.info
+                ):
+                    background = Image.new("RGB", image.size, (255, 255, 255))
+                    alpha = image.convert("RGBA").getchannel("A")
+                    background.paste(image.convert("RGB"), mask=alpha)
+                    image = background
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
+                buffer = io.BytesIO()
+                image.save(
+                    buffer,
+                    format="JPEG",
+                    quality=quality,
+                    optimize=True,
+                    progressive=True,
+                )
+                return buffer.getvalue()
+        except (UnidentifiedImageError, OSError):
+            LOGGER.warning("이미지를 단일 ZIP용 JPEG로 압축하지 못했습니다.")
+            return None
 
     async def _prepare_zip_image(
         self, semaphore: asyncio.Semaphore, index: int, url: str, *, convert_png: bool = True
