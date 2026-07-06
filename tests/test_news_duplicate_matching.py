@@ -118,6 +118,45 @@ class NewsDuplicateMatchingTests(unittest.TestCase):
 
         self.assertEqual(_matching_steam_posts_for_twitter(tweet, [steam]), [])
 
+    def test_reply_update_is_suppressed_when_steam_already_contains_fix(self) -> None:
+        steam = steam_post(
+            title="2026.07.09 (KST) 제9회 발푸르기스의 밤 신규 인격 & E.G.O 정보 안내",
+            text=(
+                "2026.07.09 (KST) 제9회 발푸르기스의 밤 신규 인격 & E.G.O 정보 안내\n\n"
+                "(한국어) 새벽 사무소 대표 그레고르의 스킬3, 스킬3-2의 오탈자를 수정했습니다."
+            ),
+        )
+        tweet = twitter_post(
+            title="(한국어) 새벽 사무소 대표 그레고르의 스킬3, 스킬3-2의 오탈자를 수정했습니다.",
+            text=(
+                "(한국어) 새벽 사무소 대표 그레고르의 스킬3, 스킬3-2의 오탈자를 수정했습니다.\n"
+                "(KR Only) Fixed typos in Dawn Office Rep Gregor's Skill 3 and Skill 3-2."
+            ),
+            raw={
+                "in_reply_to_status_id_str": "1900000000000000001",
+                "in_reply_to_screen_name": "LimbusCompany_B",
+            },
+            created_at=datetime(2026, 7, 6, 10, 29, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(_matching_steam_posts_for_twitter(tweet, [steam]), [steam])
+
+    def test_reply_update_without_steam_fix_is_not_suppressed(self) -> None:
+        steam = steam_post(
+            title="2026.07.09 (KST) 제9회 발푸르기스의 밤 신규 인격 & E.G.O 정보 안내",
+            text="새벽 사무소 대표 그레고르 인격 안내",
+        )
+        tweet = twitter_post(
+            title="(한국어) 새벽 사무소 대표 그레고르의 스킬3, 스킬3-2의 오탈자를 수정했습니다.",
+            text="(한국어) 새벽 사무소 대표 그레고르의 스킬3, 스킬3-2의 오탈자를 수정했습니다.",
+            raw={
+                "in_reply_to_status_id_str": "1900000000000000001",
+                "in_reply_to_screen_name": "LimbusCompany_B",
+            },
+        )
+
+        self.assertEqual(_matching_steam_posts_for_twitter(tweet, [steam]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

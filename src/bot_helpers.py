@@ -1802,6 +1802,42 @@ def _matching_steam_posts_for_twitter(
             continue
         seen.add(steam_post.post_id)
         matched.append(steam_post)
+    if matched:
+        return matched
+    return _matching_steam_update_posts_for_twitter_reply(post, steam_posts)
+
+
+_TWITTER_UPDATE_REPLY_KEYWORDS = (
+    "수정",
+    "오탈자",
+    "오류",
+    "fixed",
+    "fix",
+    "typo",
+    "typos",
+    "corrected",
+    "correction",
+    "修正",
+    "誤字",
+    "誤脱字",
+)
+
+
+def _matching_steam_update_posts_for_twitter_reply(
+    post: TwitterPost,
+    steam_posts: list[NewsPost],
+) -> list[NewsPost]:
+    if not _is_twitter_reply_update_post(post):
+        return []
+
+    candidates = _twitter_reply_update_match_candidates(post)
+    if not candidates:
+        return []
+
+    matched: list[NewsPost] = []
+    for steam_post in steam_posts:
+        if _steam_post_contains_update_candidates(steam_post, candidates):
+            matched.append(steam_post)
     return matched
 
 
@@ -1825,6 +1861,59 @@ def _twitter_matches_steam_news(
         twitter_candidates,
         steam_candidates,
     )
+
+
+def _is_twitter_reply_update_post(post: TwitterPost) -> bool:
+    if post.raw.get("retweeted_tweet_id"):
+        return False
+    if not (
+        post.raw.get("in_reply_to_status_id_str")
+        or post.raw.get("in_reply_to_screen_name")
+    ):
+        return False
+    text = f"{post.title}\n{post.text}"
+    return _looks_like_update_reply_text(text)
+
+
+def _looks_like_update_reply_text(text: str) -> bool:
+    normalized = _normalize_news_match_text(text)
+    compact = normalized.replace(" ", "")
+    return any(keyword.casefold().replace(" ", "") in compact for keyword in _TWITTER_UPDATE_REPLY_KEYWORDS)
+
+
+def _twitter_reply_update_match_candidates(post: TwitterPost) -> set[str]:
+    candidates: set[str] = set()
+    for text in (post.title, post.text):
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = _clean_twitter_update_reply_line(line)
+            if not line or not _looks_like_update_reply_text(line):
+                continue
+            normalized = _normalize_news_match_text(line)
+            if len(normalized.replace(" ", "")) >= 12:
+                candidates.add(normalized)
+    return candidates
+
+
+def _clean_twitter_update_reply_line(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^\s*\[[^\]]*(?:x|twitter|트위터)[^\]]*\]\s*", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"^\s*@\w+\s*", "", line)
+    line = re.sub(
+        r"^\s*[\[(（【]?\s*(?:한국어|韓国語|KR\s*Only|Korean|Japanese|English|EN|JP|KR)\s*[\])）】]?\s*[:：\-]?\s*",
+        "",
+        line,
+        flags=re.IGNORECASE,
+    )
+    return line.strip()
+
+
+def _steam_post_contains_update_candidates(
+    steam_post: NewsPost,
+    candidates: set[str],
+) -> bool:
+    haystack = _normalize_news_match_text(f"{steam_post.title}\n{steam_post.text}")
+    compact_haystack = haystack.replace(" ", "")
+    return any(candidate.replace(" ", "") in compact_haystack for candidate in candidates)
 
 
 def _news_posts_within_duplicate_window(

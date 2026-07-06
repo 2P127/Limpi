@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-BOT_VERSION = "0.3.8"
+BOT_VERSION = "0.3.8-fixed"
 
 SUPPORTED_STEAM_LANGUAGES = {"koreana", "english", "japanese"}
 SUPPORTED_COMMAND_SYNC_MODES = {"global", "guild"}
