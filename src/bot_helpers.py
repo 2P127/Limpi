@@ -61,6 +61,7 @@ from .bot_constants import (
     TCP_KEEPALIVE_IDLE_SECONDS,
     TCP_KEEPALIVE_INTERVAL_SECONDS,
     TCP_KEEPALIVE_PROBES,
+    TWITTER_STEAM_DUPLICATE_WINDOW_SECONDS,
     WINDOWS_KEEPALIVE_INTERVAL_MS,
     WINDOWS_KEEPALIVE_TIME_MS,
     YOUTUBE_LIVE_ANNOUNCE_MAX_AGE,
@@ -1791,6 +1792,7 @@ def _matching_steam_posts_for_twitter(
     for steam_post in steam_posts:
         if not _twitter_matches_steam_news(
             steam_post,
+            post.created_at,
             link_urls,
             link_keys,
             twitter_candidates,
@@ -1805,10 +1807,13 @@ def _matching_steam_posts_for_twitter(
 
 def _twitter_matches_steam_news(
     steam_post: NewsPost,
+    twitter_created_at: datetime | None,
     link_urls: list[str],
     link_keys: set[str],
     twitter_candidates: set[str],
 ) -> bool:
+    if not _news_posts_within_duplicate_window(twitter_created_at, steam_post.created_at):
+        return False
     steam_key = _steam_news_url_key(steam_post.url)
     if steam_key is not None and steam_key in link_keys:
         return True
@@ -1822,6 +1827,20 @@ def _twitter_matches_steam_news(
     )
 
 
+def _news_posts_within_duplicate_window(
+    left: datetime | None,
+    right: datetime | None,
+) -> bool:
+    left_at = _as_utc_datetime(left)
+    right_at = _as_utc_datetime(right)
+    if left_at is None or right_at is None:
+        return True
+    return (
+        abs((left_at - right_at).total_seconds())
+        <= TWITTER_STEAM_DUPLICATE_WINDOW_SECONDS
+    )
+
+
 def _raw_link_urls(raw: dict) -> list[str]:
     link_urls = raw.get("link_urls")
     if not isinstance(link_urls, list):
@@ -1832,9 +1851,16 @@ def _raw_link_urls(raw: dict) -> list[str]:
 def _steam_news_link_keys_from_text(text: str) -> set[str]:
     return {
         key
-        for key in (_steam_news_url_key(url) for url in re.findall(r"https?://\S+", text))
+        for key in (_steam_news_url_key(url) for url in _steam_news_urls_from_text(text))
         if key is not None
     }
+
+
+def _steam_news_urls_from_text(text: str) -> list[str]:
+    return [
+        token.rstrip(").,>]}\"'")
+        for token in re.findall(r"https?://\S+", text)
+    ]
 
 
 _NEWS_BRACKET_PAIRS = (
@@ -1964,11 +1990,14 @@ def _news_match_candidates_overlap(left: set[str], right: set[str]) -> bool:
 
 
 def _steam_news_link_keys_for_twitter(post: TwitterPost) -> set[str]:
-    return {
+    raw_keys = {
         key
         for key in (_steam_news_url_key(url) for url in _raw_link_urls(post.raw))
         if key is not None
     }
+    raw_keys.update(_steam_news_link_keys_from_text(post.title))
+    raw_keys.update(_steam_news_link_keys_from_text(post.text))
+    return raw_keys
 
 
 def _steam_news_post_id_from_url(url: str) -> str | None:
@@ -1989,10 +2018,10 @@ def _steam_news_post_ids_for_twitter_posts(posts: list[TwitterPost]) -> list[str
     post_ids: list[str] = []
     seen: set[str] = set()
     for post in posts:
-        raw_links = post.raw.get("link_urls")
-        if not isinstance(raw_links, list):
-            continue
-        for url in raw_links:
+        urls = _raw_link_urls(post.raw)
+        urls.extend(_steam_news_urls_from_text(post.title))
+        urls.extend(_steam_news_urls_from_text(post.text))
+        for url in urls:
             post_id = _steam_news_post_id_from_url(str(url))
             if post_id is None or post_id in seen:
                 continue
@@ -2113,13 +2142,15 @@ def _twitter_news_without_duplicate_steam_links(posts: list[NewsPost]) -> list[N
 
 def _steam_news_link_keys_for_news_post(post: NewsPost) -> set[str]:
     raw_links = post.raw.get("link_urls")
-    if not isinstance(raw_links, list):
-        return set()
-    return {
+    links = [str(url) for url in raw_links if url] if isinstance(raw_links, list) else []
+    keys = {
         key
-        for key in (_steam_news_url_key(str(url)) for url in raw_links if url)
+        for key in (_steam_news_url_key(str(url)) for url in links)
         if key is not None
     }
+    keys.update(_steam_news_link_keys_from_text(post.title))
+    keys.update(_steam_news_link_keys_from_text(post.text))
+    return keys
 
 
 def _news_post_is_earlier(left: NewsPost, right: NewsPost) -> bool:

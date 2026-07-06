@@ -875,6 +875,7 @@ class NewsCog(commands.Cog):
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._twitter_steam_defer_logged_post_ids: set[str] = set()
         self._twitter_steam_retry_count: dict[str, int] = {}
+        self._twitter_steam_defer_expired_post_ids: set[str] = set()
         self._zip_cache: dict[str, tuple[list[bytes], int, int, int]] = {}
         self._image_cache: dict[str, tuple[bytes, str | None]] = {}
         self._image_cache_bytes: int = 0
@@ -1928,38 +1929,70 @@ class NewsCog(commands.Cog):
         selected: list[NewsPost] = []
         for post in posts:
             if _twitter_news_prefers_available_steam(post, posts):
-                self._twitter_steam_grace_started_at.pop(post.post_id, None)
-                self._twitter_steam_defer_logged_post_ids.discard(post.post_id)
-                self._twitter_steam_retry_count.pop(post.post_id, None)
+                self._clear_twitter_steam_defer_state(post.post_id)
                 continue
             if defer_linked_twitter and self._defer_linked_twitter_for_steam(post):
                 continue
             selected.append(post)
         return selected
 
+    def _clear_twitter_steam_defer_state(self, post_id: str) -> None:
+        self._twitter_steam_grace_started_at.pop(post_id, None)
+        self._twitter_steam_defer_logged_post_ids.discard(post_id)
+        self._twitter_steam_retry_count.pop(post_id, None)
+        self._twitter_steam_defer_expired_post_ids.discard(post_id)
+
     def _defer_linked_twitter_for_steam(self, post: NewsPost) -> bool:
         if not _is_twitter_news_post(post) or not _steam_news_link_keys_for_news_post(post):
             return False
-        if _is_twitter_priority_poll_window(datetime.now(timezone.utc)):
+        return self._defer_twitter_steam_link(
+            post.post_id,
+            post.created_at,
+            "X 소식",
+        )
+
+    def _defer_linked_twitter_post_for_steam(self, post: TwitterPost) -> bool:
+        if not _steam_news_link_keys_for_twitter(post):
+            return False
+        return self._defer_twitter_steam_link(
+            f"twitter:{post.post_id}",
+            post.created_at,
+            "X 게시물",
+        )
+
+    def _defer_twitter_steam_link(
+        self,
+        post_id: str,
+        created_at: datetime | None,
+        label: str,
+    ) -> bool:
+        if post_id in self._twitter_steam_defer_expired_post_ids:
             return False
 
-        if self._twitter_steam_retry_count.get(post.post_id, 0) >= 2:
-            return False
+        now_datetime = datetime.now(timezone.utc)
+        created = _as_utc_datetime(created_at)
+        if created is not None:
+            elapsed_since_created = (now_datetime - created).total_seconds()
+            if elapsed_since_created >= TWITTER_STEAM_PREFERENCE_GRACE_SECONDS:
+                self._clear_twitter_steam_defer_state(post_id)
+                self._twitter_steam_defer_expired_post_ids.add(post_id)
+                return False
 
         now = perf_counter()
-        started_at = self._twitter_steam_grace_started_at.setdefault(post.post_id, now)
+        started_at = self._twitter_steam_grace_started_at.setdefault(post_id, now)
         elapsed = now - started_at
         if elapsed >= TWITTER_STEAM_PREFERENCE_GRACE_SECONDS:
-            self._twitter_steam_retry_count[post.post_id] = self._twitter_steam_retry_count.get(post.post_id, 0) + 1
-            self._twitter_steam_grace_started_at[post.post_id] = now
-            if post.post_id not in self._twitter_steam_defer_logged_post_ids:
-                self._twitter_steam_defer_logged_post_ids.add(post.post_id)
-        if post.post_id not in self._twitter_steam_defer_logged_post_ids:
-            self._twitter_steam_defer_logged_post_ids.add(post.post_id)
+            self._clear_twitter_steam_defer_state(post_id)
+            self._twitter_steam_defer_expired_post_ids.add(post_id)
+            return False
+
+        if post_id not in self._twitter_steam_defer_logged_post_ids:
+            self._twitter_steam_defer_logged_post_ids.add(post_id)
             LOGGER.info(
-                "Steam 링크가 있는 X 소식을 잠시 보류합니다. 다른 소식 전송은 계속 진행합니다 "
+                "Steam 링크가 있는 %s을(를) 보류합니다. 30분 동안 Steam 중복 소식을 계속 확인합니다 "
                 "(post_id=%s, grace=%s초).",
-                post.post_id,
+                label,
+                post_id,
                 TWITTER_STEAM_PREFERENCE_GRACE_SECONDS,
             )
         return True
@@ -5473,6 +5506,11 @@ class NewsCog(commands.Cog):
             if matching_steam_posts:
                 self._skip_twitter_post_for_steam_duplicate(target, post, matching_steam_posts)
                 continue
+            if (
+                prefer_steam_duplicates
+                and self._defer_linked_twitter_post_for_steam(post)
+            ):
+                continue
             sent = await self._send_twitter_post_for_target(
                 target,
                 channel,
@@ -5498,6 +5536,7 @@ class NewsCog(commands.Cog):
         post: TwitterPost,
         matching_steam_posts: list[NewsPost],
     ) -> None:
+        self._clear_twitter_steam_defer_state(f"twitter:{post.post_id}")
         self.storage.mark_twitter_target_seen(target.guild_id, post.post_id)
         LOGGER.info(
             "X 게시물 자동 전송 생략: 같은 Steam 소식을 우선합니다 "
