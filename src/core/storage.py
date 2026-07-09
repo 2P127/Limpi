@@ -38,10 +38,19 @@ MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 7
 
 NEWS_UPDATE_MAX_AGE_SECONDS = 24 * 60 * 60
+STEAM_MARKDOWN_CONTENT_HASH_VERSION = "steam-markdown-v2"
 
 
 def _post_content_hash(post: "NewsPost") -> str:
-    raw = f"{post.title}\x00{post.text}\x00{json.dumps(post.image_urls, sort_keys=True)}"
+    version = (
+        STEAM_MARKDOWN_CONTENT_HASH_VERSION
+        if _post_source(post.raw).startswith("steam_")
+        else "default"
+    )
+    raw = (
+        f"{version}\x00{post.title}\x00{post.text}\x00"
+        f"{json.dumps(post.image_urls, sort_keys=True)}"
+    )
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 

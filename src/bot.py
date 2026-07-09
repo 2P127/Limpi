@@ -3595,7 +3595,16 @@ class NewsCog(commands.Cog):
             )
             return
 
-        await message.edit(view=updated_view)
+        edit_attachments: list[discord.Attachment | discord.File] = []
+        if banner_file is not None:
+            edit_attachments.append(banner_file)
+        await message.edit(
+            content=None,
+            embed=None,
+            attachments=edit_attachments,
+            view=updated_view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
         if settings.image_delivery == IMAGE_DELIVERY_FILES:
             await self._replace_news_post_image_messages(channel, target, post)
 

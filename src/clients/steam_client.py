@@ -61,6 +61,60 @@ ACCEPT_LANGUAGE_HEADERS = {
     "english": "en-US,en;q=0.9",
     "japanese": "ja-JP,ja;q=0.9,en;q=0.7",
 }
+_STRIPPABLE_HTML_TAGS = {
+    "a",
+    "article",
+    "b",
+    "blockquote",
+    "br",
+    "center",
+    "code",
+    "dd",
+    "del",
+    "div",
+    "dl",
+    "dt",
+    "em",
+    "figcaption",
+    "figure",
+    "font",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "i",
+    "iframe",
+    "img",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "s",
+    "script",
+    "section",
+    "span",
+    "strike",
+    "strong",
+    "style",
+    "sub",
+    "sup",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "tr",
+    "u",
+    "ul",
+}
+_HTML_TAG_RE = re.compile(
+    r"</?\s*([A-Za-z][A-Za-z0-9:-]*)\b[^<>]*?/?>",
+    flags=re.IGNORECASE,
+)
 
 
 class NewsSource(Protocol):
@@ -517,7 +571,7 @@ def _html_to_discord_markdown(value: str) -> str:
     value = re.sub(r"<(?:p|div|section|article|blockquote)\b[^>]*>", "\n", value, flags=re.IGNORECASE)
     value = re.sub(
         r"<h[1-6]\b[^>]*>(.*?)</h[1-6]\s*>",
-        lambda match: f"\n\n**{_strip_html_tags(match.group(1)).strip()}**\n\n",
+        lambda match: f"\n\n{_discord_heading_markdown(match.group(0), match.group(1))}\n\n",
         value,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -542,12 +596,19 @@ def _html_to_discord_markdown(value: str) -> str:
         value,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    value = re.sub(r"<[^>]+>", "", value)
-    return value
+    return _strip_html_tags(value)
 
 
 def _strip_html_tags(value: str) -> str:
-    return re.sub(r"<[^>]+>", "", html.unescape(value))
+    value = html.unescape(value)
+
+    def replace(match: re.Match[str]) -> str:
+        tag_name = match.group(1).casefold()
+        if tag_name in _STRIPPABLE_HTML_TAGS:
+            return ""
+        return match.group(0)
+
+    return _HTML_TAG_RE.sub(replace, value)
 
 
 def _extract_html_image_urls(value: str | None) -> list[str]:
@@ -592,6 +653,18 @@ def _steam_bbcode_to_discord_markdown(value: str) -> str:
         flags=re.IGNORECASE,
     )
     value = re.sub(
+        r"\[h([1-6])\](.*?)\[/h[1-6]\]",
+        lambda match: f"\n\n{_discord_heading_markdown(match.group(1), match.group(2))}\n\n",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[quote(?:=[^\]]*)?\](.*?)\[/quote\]",
+        lambda match: _quote_markdown(match.group(1)),
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
         r"\[url=([^\]]+)\](.*?)\[/url\]",
         r"\2 (\1)",
         value,
@@ -604,19 +677,25 @@ def _steam_bbcode_to_discord_markdown(value: str) -> str:
         flags=re.IGNORECASE | re.DOTALL,
     )
     value = re.sub(
-        r"\[h[1-6]\](.*?)\[/h[1-6]\]",
-        lambda match: f"\n\n**{match.group(1).strip()}**\n\n",
-        value,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    value = re.sub(
         r"\[i\](.*?)\[/i\]",
         r"*\1*",
         value,
         flags=re.IGNORECASE | re.DOTALL,
     )
     value = re.sub(
-        r"\[/?(?:list|olist|quote|table)(?:=[^\]]*)?\]",
+        r"\[u\](.*?)\[/u\]",
+        r"__\1__",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[(?:strike|s)\](.*?)\[/(?:strike|s)\]",
+        r"~~\1~~",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"\[/?(?:list|olist|table)(?:=[^\]]*)?\]",
         "\n",
         value,
         flags=re.IGNORECASE,
@@ -625,12 +704,29 @@ def _steam_bbcode_to_discord_markdown(value: str) -> str:
     value = re.sub(r"\[hr\]", "\n\n", value, flags=re.IGNORECASE)
     value = re.sub(r"\[\*\]", "\n- ", value)
     value = re.sub(
-        r"\[/?(?:u|code|strike|spoiler|noparse|center|left|right|indent|url)(?:=[^\]]*)?\]",
+        r"\[/?(?:code|spoiler|noparse|center|left|right|indent|url)(?:=[^\]]*)?\]",
         "",
         value,
         flags=re.IGNORECASE,
     )
     return value
+
+
+def _discord_heading_markdown(level_value: str, text: str) -> str:
+    level_match = re.search(r"h?([1-6])", level_value, flags=re.IGNORECASE)
+    level = int(level_match.group(1)) if level_match else 3
+    marker = "#" * min(max(level, 1), 3)
+    heading = _strip_html_tags(text).strip()
+    heading = re.sub(r"\s+", " ", heading)
+    if not heading:
+        return ""
+    return f"{marker} **{heading}**"
+
+
+def _quote_markdown(text: str) -> str:
+    lines = _normalize_discord_markdown(text).splitlines()
+    quoted = [f"> {line}" if line else ">" for line in lines]
+    return "\n".join(quoted)
 
 
 def _normalize_discord_markdown(value: str) -> str:
