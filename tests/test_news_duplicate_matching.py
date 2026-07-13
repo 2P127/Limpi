@@ -112,11 +112,24 @@ class NewsDuplicateMatchingTests(unittest.TestCase):
         )
         tweet = twitter_post(
             title="2026.07.09 (KST) 제9회 발푸르기스의 밤 신규 인격 & E.G.O 정보 안내",
-            text=f"{STEAM_URL}",
+            text="Steam link is not included in this post.",
             created_at=tweet_created_at,
         )
 
         self.assertEqual(_matching_steam_posts_for_twitter(tweet, [steam]), [])
+
+    def test_exact_steam_link_matches_even_after_thirty_minutes(self) -> None:
+        steam = steam_post(
+            title="7/9 정기 업데이트 이후 발생한 이슈 추가 안내 및 동시접속자 갱신 기념 보상 안내",
+            created_at=datetime(2026, 7, 9, 9, 6, tzinfo=timezone.utc),
+        )
+        tweet = twitter_post(
+            title="[X(트위터)] 7/9 정기 업데이트 이후 발생한 이슈 추가 안내 및 동시접속자 갱신 기념 보상 안내",
+            text=f"자세한 내용은 Steam 공지를 확인해주세요.\n{STEAM_URL}",
+            created_at=datetime(2026, 7, 10, 2, 43, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(_matching_steam_posts_for_twitter(tweet, [steam]), [steam])
 
     def test_reply_update_is_suppressed_when_steam_already_contains_fix(self) -> None:
         steam = steam_post(

@@ -1848,13 +1848,15 @@ def _twitter_matches_steam_news(
     link_keys: set[str],
     twitter_candidates: set[str],
 ) -> bool:
-    if not _news_posts_within_duplicate_window(twitter_created_at, steam_post.created_at):
-        return False
     steam_key = _steam_news_url_key(steam_post.url)
     if steam_key is not None and steam_key in link_keys:
         return True
     if steam_post.url in link_urls:
         return True
+    # A Steam news URL identifies the exact announcement even when X links it
+    # well after the fuzzy title/body duplicate window has elapsed.
+    if not _news_posts_within_duplicate_window(twitter_created_at, steam_post.created_at):
+        return False
     steam_candidates = _news_body_match_candidates(steam_post.title)
     steam_candidates.update(_news_body_match_candidates(steam_post.text))
     return _news_match_candidates_overlap(
