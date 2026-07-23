@@ -97,7 +97,11 @@ def _internet_error_detail(exc: BaseException) -> tuple[str, str] | None:
         if isinstance(item, (aiohttp.ServerTimeoutError, asyncio.TimeoutError, TimeoutError)):
             return "요청 시간 초과", type(item).__name__
         if isinstance(item, aiohttp.ClientResponseError):
-            return "HTTP 응답 오류", type(item).__name__
+            reason = f"HTTP {item.status}" if item.status else "HTTP 응답 오류"
+            message = str(item.message or "").strip()
+            if message:
+                reason = f"{reason} {message}"
+            return reason, type(item).__name__
         if isinstance(item, aiohttp.ClientConnectorError):
             return "서버 연결 실패", type(item).__name__
         if isinstance(item, aiohttp.ClientConnectionError):

@@ -1590,12 +1590,24 @@ class NewsCog(commands.Cog):
         if not targets_by_language:
             return 0
 
-        posts_by_language, changed_post_ids, had_upstream_failure = await self._combined_posts_by_language()
+        (
+            posts_by_language,
+            changed_post_ids,
+            failed_steam_languages,
+            twitter_had_failure,
+        ) = await self._combined_posts_by_language()
+        failed_target_languages = sorted(
+            failed_steam_languages.intersection(targets_by_language)
+        )
+        had_upstream_failure = bool(failed_target_languages) or twitter_had_failure
         if had_upstream_failure:
             self._news_recovery_baseline_pending = True
             LOGGER.info(
                 "뉴스 업스트림 확인 실패가 있어 이번 자동 전송은 건너뜁니다. "
-                "다음 정상 확인에서 기준선을 갱신합니다."
+                "다음 정상 확인에서 기준선을 갱신합니다 "
+                "(failed_target_languages=%s, twitter_failed=%s).",
+                ",".join(failed_target_languages) or "none",
+                twitter_had_failure,
             )
             return 0
 
@@ -1655,15 +1667,17 @@ class NewsCog(commands.Cog):
             newest_new_posts.append((language, posts[0]))
         fetched_posts.extend(posts[:NEWS_POST_LIMIT])
 
-    async def _sync_global_news_cache(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
+    async def _sync_global_news_cache(
+        self,
+    ) -> tuple[dict[str, list[NewsPost]], list[str], set[str]]:
         if self.news_source is None:
-            return {}, [], False
+            return {}, [], set()
 
         posts_by_language: dict[str, list[NewsPost]] = {}
         fetched_posts: list[NewsPost] = []
         newest_new_posts: list[tuple[str, NewsPost]] = []
         changed: list[str] = []
-        had_fetch_failure = False
+        failed_languages: set[str] = set()
         results = await asyncio.gather(
             *(
                 self.news_source.fetch_recent_posts(language, limit=NEWS_POST_LIMIT)
@@ -1673,7 +1687,7 @@ class NewsCog(commands.Cog):
         )
         for language, result in zip(SYNC_LANGUAGES, results):
             if isinstance(result, Exception):
-                had_fetch_failure = True
+                failed_languages.add(language)
                 posts = self._cached_posts_after_steam_sync_failure(language, result)
             else:
                 posts = result
@@ -1696,15 +1710,15 @@ class NewsCog(commands.Cog):
                     post.url,
                 )
             self._schedule_image_cache_warmup(fetched_posts)
-        return posts_by_language, changed, had_fetch_failure
+        return posts_by_language, changed, failed_languages
 
     def _handle_combined_steam_result(
         self,
-        result: tuple[dict[str, list[NewsPost]], list[str], bool] | BaseException,
-    ) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
+        result: tuple[dict[str, list[NewsPost]], list[str], set[str]] | BaseException,
+    ) -> tuple[dict[str, list[NewsPost]], list[str], set[str]]:
         if not isinstance(result, Exception):
-            posts_by_language, changed, steam_had_failure = result
-            return posts_by_language, changed, steam_had_failure
+            posts_by_language, changed, failed_languages = result
+            return posts_by_language, changed, failed_languages
 
         if _is_internet_exception(result):
             _log_internet_exception(
@@ -1716,7 +1730,7 @@ class NewsCog(commands.Cog):
                 "Steam 뉴스 자동 확인 실패. 저장된 Steam 소식으로 X 링크 비교를 계속합니다.",
                 exc_info=(type(result), result, result.__traceback__),
             )
-        return self._cached_posts_by_language(), [], True
+        return self._cached_posts_by_language(), [], set(SYNC_LANGUAGES)
 
     def _handle_combined_twitter_result(
         self,
@@ -1780,7 +1794,9 @@ class NewsCog(commands.Cog):
             posts_by_language[language] = _sort_posts_newest_first(combined)[:NEWS_POST_LIMIT]
         return posts_by_language
 
-    async def _combined_posts_by_language(self) -> tuple[dict[str, list[NewsPost]], list[str], bool]:
+    async def _combined_posts_by_language(
+        self,
+    ) -> tuple[dict[str, list[NewsPost]], list[str], set[str], bool]:
         now = datetime.now(timezone.utc)
         news_task = asyncio.create_task(self._sync_global_news_cache())
         if self._is_twitter_tracking_window(now):
@@ -1798,16 +1814,15 @@ class NewsCog(commands.Cog):
                 0,
                 self.storage.search_twitter_posts("", limit=TWITTER_POST_LIMIT),
             )
-        posts_by_language, changed, steam_had_failure = self._handle_combined_steam_result(
+        posts_by_language, changed, failed_steam_languages = self._handle_combined_steam_result(
             news_result
         )
         twitter_posts, twitter_had_failure = self._handle_combined_twitter_result(twitter_result)
-        had_upstream_failure = steam_had_failure or twitter_had_failure
         posts_by_language = self._combine_steam_and_twitter_news(
             posts_by_language,
             twitter_posts,
         )
-        return posts_by_language, changed, had_upstream_failure
+        return posts_by_language, changed, failed_steam_languages, twitter_had_failure
 
     def _mark_news_targets_recovery_baseline(
         self,
