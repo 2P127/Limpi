@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-BOT_VERSION = "0.4"
+BOT_VERSION = "0.5.2"
 
 SUPPORTED_STEAM_LANGUAGES = {"koreana", "english", "japanese"}
 SUPPORTED_COMMAND_SYNC_MODES = {"global", "guild"}
@@ -40,18 +41,33 @@ WEEKDAY_ALIASES = {
 }
 
 
+def runtime_base_dir() -> Path:
+    """exe/프로젝트 루트. 로그·기본 DB 경로의 기준."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_database_path(raw: str | None = None) -> Path:
+    """상대 경로는 cwd가 아니라 runtime_base_dir() 기준으로 둔다."""
+    value = (raw if raw is not None else "").strip() or "limpi.sqlite3"
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = runtime_base_dir() / path
+    return path.resolve()
+
+
 def _load_dotenv_if_available() -> None:
     try:
         from dotenv import load_dotenv
     except ImportError:
         return
 
-    import sys as _sys
-    if getattr(_sys, "frozen", False):
-        exe_dir = os.path.dirname(_sys.executable)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
         env_path = os.path.join(exe_dir, ".env")
         if not os.path.exists(env_path):
-            env_path = os.path.join(getattr(_sys, "_MEIPASS", exe_dir), ".env")
+            env_path = os.path.join(getattr(sys, "_MEIPASS", exe_dir), ".env")
         load_dotenv(dotenv_path=env_path)
     else:
         load_dotenv()
@@ -276,7 +292,7 @@ class AppConfig:
         )
         return cls(
             discord_token=discord_token,
-            database_path=Path(os.getenv("DATABASE_PATH", "limpi.sqlite3")),
+            database_path=resolve_database_path(os.getenv("DATABASE_PATH")),
             steam_app_id=_get_int("STEAM_APP_ID", 1973530, minimum=1),
             steam_language=_get_steam_language("STEAM_LANGUAGE", "koreana"),
             steam_country=os.getenv("STEAM_COUNTRY", "KR").strip() or "KR",
