@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
@@ -479,7 +480,8 @@ class LimbusXClient:
                 raw["video_variant_groups"] = groups
                 raw["video_urls"] = [group[0] for group in groups if group]
                 raw["video_fallback_url"] = raw["video_urls"][0]
-            enriched.append(replace(post, text=text, image_urls=image_urls, raw=raw))
+            title = _title_from_text(text) or post.title
+            enriched.append(replace(post, text=text, title=title, image_urls=image_urls, raw=raw))
         return enriched
 
     async def _fetch_fx_tweet_payload(self, post: TwitterPost) -> dict[str, Any] | None:
@@ -825,15 +827,20 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
         text = f"RT @{content_username}: {text}" if text else f"RT @{content_username}"
     if text in {"고정된 게시물", "Pinned", "Pinned Tweet"}:
         return None
-    title = _title_from_text(text) or f"X 게시물 {tweet_id}"
-    if content_tweet is not tweet:
-        title = f"RT @{content_username}"
-    created_at = _parse_twitter_datetime(legacy.get("created_at"))
     video_variant_groups = _video_variant_groups(content_tweet)
     video_urls = [group[0] for group in video_variant_groups if group]
     image_urls = _photo_urls(content_tweet)
     if video_urls and len(image_urls) == 1:
         image_urls = []
+    title = _title_from_text(text)
+    if not title:
+        if video_urls:
+            title = "영상"
+        elif image_urls:
+            title = "사진"
+        else:
+            title = f"X 게시물 {tweet_id}"
+    created_at = _parse_twitter_datetime(legacy.get("created_at"))
     youtube_urls = _youtube_urls(content_legacy)
     raw: dict[str, Any] = {
         "source": "x",
@@ -944,6 +951,7 @@ def _expand_note_tweet_urls(text: str, tweet: dict[str, Any]) -> str:
 
 
 def _clean_tweet_text(text: str) -> str:
+    text = html.unescape(html.unescape(text or ""))
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [re.sub(r"[ \t　]+", " ", line).strip() for line in text.split("\n")]
     cleaned = "\n".join(lines).strip()
@@ -952,7 +960,7 @@ def _clean_tweet_text(text: str) -> str:
 
 
 def _title_from_text(text: str) -> str:
-    for line in text.splitlines():
+    for line in html.unescape(html.unescape(text or "")).splitlines():
         cleaned = line.strip()
         if cleaned:
             return cleaned[:80]

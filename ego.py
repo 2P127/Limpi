@@ -3,6 +3,7 @@ import hashlib
 import json
 import re
 import random
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -362,6 +363,26 @@ async def crawl_ego_gifts(*, verbose=True):
     gifts = normalize_ego_gift_rows(all_gifts)
     _log_ego_gift_summary(gifts, verbose=verbose)
     return gifts
+
+
+def crawl_ego_gifts_sync(*, verbose=True):
+    """Run the Playwright crawl on a subprocess-capable event loop.
+
+    The Discord bot uses WindowsSelectorEventLoopPolicy, which cannot spawn
+    Playwright's browser process. A dedicated Proactor loop in this thread
+    keeps those two runtimes apart.
+    """
+    if sys.platform == "win32":
+        loop = asyncio.ProactorEventLoop()
+        try:
+            return loop.run_until_complete(crawl_ego_gifts(verbose=verbose))
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            loop.close()
+    return asyncio.run(crawl_ego_gifts(verbose=verbose))
 
 
 async def crawl(output_path=DEFAULT_EGO_GIFT_STORE_PATH, *, verbose=True):

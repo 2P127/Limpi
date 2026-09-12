@@ -151,7 +151,13 @@ class SteamNewsSource:
                     _short_exception(exc),
                 )
             else:
-                raise RuntimeError("Steam RSS feed returned no usable posts.") from exc
+                LOGGER.warning(
+                    "Steam event and RSS feeds returned no usable posts "
+                    "(language=%s, reason=%s).",
+                    language,
+                    _short_exception(exc),
+                )
+                raise RuntimeError("Steam RSS feed returned no usable posts.") from None
         posts = _dedupe_posts_by_id(posts)
         return _sort_newest_first(posts)[:limit]
 
@@ -502,6 +508,8 @@ def _html_title(value: str) -> str:
 
 
 def _title_from_text(text: str, fallback: str) -> str:
+    text = html.unescape(html.unescape(text or ""))
+    fallback = html.unescape(html.unescape(fallback or ""))
     for line in text.splitlines():
         line = line.strip()
         if line:
@@ -641,7 +649,7 @@ def _xml_child_text(item: ET.Element, tag: str) -> str:
     child = item.find(tag)
     if child is None or child.text is None:
         return ""
-    return child.text.strip()
+    return html.unescape(html.unescape(child.text)).strip()
 
 
 def _steam_bbcode_to_discord_markdown(value: str) -> str:
