@@ -5,7 +5,7 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -276,6 +276,23 @@ class SQLiteStorage:
                 batch_index INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (target_id, post_id, batch_index)
+            )
+        """,
+        "hampang_post_messages": """
+            CREATE TABLE IF NOT EXISTS hampang_post_messages (
+                guild_id INTEGER NOT NULL,
+                post_id TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, post_id)
+            )
+        """,
+        "bot_flags": """
+            CREATE TABLE IF NOT EXISTS bot_flags (
+                name TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
         """,
         "tracked_messages": """
@@ -1040,6 +1057,18 @@ class SQLiteStorage:
 
         return self._row_to_news_target(row) if row is not None else None
 
+    def get_news_target_by_id(self, target_id: int) -> GuildNewsTarget | None:
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT target_id, guild_id, channel_id, language, created_at, updated_at
+                FROM guild_news_targets
+                WHERE target_id = ?
+                """,
+                (target_id,),
+            ).fetchone()
+        return self._row_to_news_target(row) if row is not None else None
+
     def get_news_target(
         self,
         guild_id: int,
@@ -1118,6 +1147,10 @@ class SQLiteStorage:
 
     def delete_hampang_target(self, guild_id: int) -> bool:
         with self._lock:
+            self._connection.execute(
+                "DELETE FROM hampang_post_messages WHERE guild_id = ?",
+                (guild_id,),
+            )
             cursor = self._connection.execute(
                 "DELETE FROM guild_hampang_targets WHERE guild_id = ?",
                 (guild_id,),
@@ -1503,18 +1536,61 @@ class SQLiteStorage:
             ).fetchone()
         return self._row_to_hampang_target(row) if row is not None else None
 
-    def list_hampang_targets(self) -> list[GuildHampangTarget]:
+    def list_hampang_targets(self, *, enabled_only: bool = True) -> list[GuildHampangTarget]:
+        query = """
+            SELECT guild_id, channel_id, enabled, last_x_post_id,
+                   last_youtube_video_id, created_at, updated_at
+            FROM guild_hampang_targets
+        """
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY guild_id"
+        with self._lock:
+            rows = self._connection.execute(query).fetchall()
+        return [self._row_to_hampang_target(row) for row in rows]
+
+    def record_hampang_post_message(
+        self,
+        guild_id: int,
+        post_id: str,
+        channel_id: int,
+        message_id: int,
+    ) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO hampang_post_messages (
+                    guild_id, post_id, channel_id, message_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, post_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    message_id = excluded.message_id,
+                    created_at = excluded.created_at
+                """,
+                (guild_id, post_id, channel_id, message_id, now),
+            )
+            self._connection.commit()
+
+    def list_hampang_post_messages(self) -> list[tuple[int, str, int, int]]:
         with self._lock:
             rows = self._connection.execute(
                 """
-                SELECT guild_id, channel_id, enabled, last_x_post_id,
-                       last_youtube_video_id, created_at, updated_at
-                FROM guild_hampang_targets
-                WHERE enabled = 1
-                ORDER BY guild_id
+                SELECT guild_id, post_id, channel_id, message_id
+                FROM hampang_post_messages
+                ORDER BY created_at DESC
                 """
             ).fetchall()
-        return [self._row_to_hampang_target(row) for row in rows]
+        return [
+            (
+                int(row["guild_id"]),
+                str(row["post_id"]),
+                int(row["channel_id"]),
+                int(row["message_id"]),
+            )
+            for row in rows
+        ]
 
     def upsert_hampang_target(
         self,
@@ -2215,6 +2291,47 @@ class SQLiteStorage:
             return None
         return int(row["channel_id"]), int(row["message_id"]), row["last_notified_at"]
 
+    def list_news_post_messages(
+        self,
+        *,
+        max_age_days: int | None = None,
+    ) -> list[tuple[int, str, int, int]]:
+        query = """
+            SELECT target_id, post_id, channel_id, message_id, created_at
+            FROM news_post_messages
+            ORDER BY created_at DESC
+        """
+        with self._lock:
+            rows = self._connection.execute(query).fetchall()
+        results: list[tuple[int, str, int, int]] = []
+        cutoff = None
+        if max_age_days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        for row in rows:
+            created_at = _datetime_from_iso(row["created_at"])
+            if cutoff is not None and (created_at is None or created_at < cutoff):
+                continue
+            results.append(
+                (
+                    int(row["target_id"]),
+                    str(row["post_id"]),
+                    int(row["channel_id"]),
+                    int(row["message_id"]),
+                )
+            )
+        return results
+
+    def list_twitter_news_post_messages(
+        self,
+        *,
+        max_age_days: int | None = None,
+    ) -> list[tuple[int, str, int, int]]:
+        return [
+            record
+            for record in self.list_news_post_messages(max_age_days=max_age_days)
+            if str(record[1]).startswith("twitter:")
+        ]
+
     def mark_news_post_message_notified(self, target_id: int, post_id: str) -> None:
         now = _now_iso()
         with self._lock:
@@ -2636,6 +2753,31 @@ class SQLiteStorage:
             rows = self._connection.execute(sql, params).fetchall()
         return [self._row_to_twitter_post(row) for row in rows]
 
+    def get_bot_flag(self, name: str) -> str | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT value FROM bot_flags WHERE name = ?",
+                (name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["value"])
+
+    def set_bot_flag(self, name: str, value: str) -> None:
+        now = _now_iso()
+        with self._lock:
+            self._connection.execute(
+                """
+                INSERT INTO bot_flags (name, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (name, value, now),
+            )
+            self._connection.commit()
+
     def add_tracked_message(
         self, guild_id: int, channel_id: int, message_id: int
     ) -> None:
@@ -2743,6 +2885,9 @@ class SQLiteStorage:
             )
             self._connection.execute(
                 "DELETE FROM guild_youtube_upload_targets WHERE guild_id = ?", (guild_id,)
+            )
+            self._connection.execute(
+                "DELETE FROM hampang_post_messages WHERE guild_id = ?", (guild_id,)
             )
             self._connection.execute(
                 "DELETE FROM guild_hampang_targets WHERE guild_id = ?", (guild_id,)
