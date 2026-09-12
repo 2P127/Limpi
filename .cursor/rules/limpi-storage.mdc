@@ -1,0 +1,27 @@
+---
+description: SQLite 저장소, 설정, post_id, 마이그레이션
+globs: src/core/**/*.py
+alwaysApply: false
+---
+
+# Config / Storage
+
+## Config
+
+- `AppConfig`는 frozen dataclass. 값은 `from_env()`만.
+- 테스트 모드 토큰은 `DISCORD_TOKEN_TEST`. 일반은 `DISCORD_TOKEN`.
+- bool은 `1/true/yes/on`. 잘못된 int는 기본값으로 떨어뜨리는 `_get_int_or_default` 패턴을 따른다.
+- frozen exe는 exe 옆 `.env`를 읽는다. `.env`는 커밋하지 않는다.
+
+## SQLite
+
+- `SQLiteStorage`: `threading.RLock`, `check_same_thread=False`, `schema_migrations`로만 스키마 변경.
+- 길드 퇴장 시 `delete_guild_data(guild.id)`.
+- post_id: Steam `steam:{lang}:{gid}`, 트위터 뉴스 뷰 `twitter:{id}`.
+- 내용 변경 감지는 `_post_content_hash`. Steam은 `steam-markdown-v2` 접두를 유지한다.
+- 모델은 frozen dataclass. DB row ↔ 모델 변환은 storage 안에 둔다.
+
+## 파일 저장
+
+ego JSON은 DB와 **같은 디렉터리**의 `ego_gifts.json`. 쓰기는 `.tmp` 후 `replace` (atomic). 해시가 바뀌면 캐시를 비운다.
+---

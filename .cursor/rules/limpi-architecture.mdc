@@ -1,0 +1,28 @@
+---
+description: Limpi 봇 구조, 파일 배치, 새 기능 넣는 위치
+alwaysApply: true
+---
+
+# Limpi 아키텍처
+
+림버스 컴퍼니 Discord 봇. Python 3.11, discord.py 2.x, aiohttp. 실행은 `python -m src.bot` 또는 `src/launcher.py`(Windows 트레이 콘솔). 테스트 봇은 `--test` + `DISCORD_TOKEN_TEST`.
+
+## 파일 역할
+
+- `src/bot.py`: `LimpiBot`, `LoggingCommandTree`, **유일한 Cog `NewsCog`**, 폴링, 슬래시 명령, 전송
+- `src/bot_views.py`: Discord UI만. 비즈니스는 `interaction.client.get_cog("NewsCog")`로 위임
+- `src/bot_helpers.py`: 포맷·매칭·이미지·LayoutView 빌더 (순수/준순수)
+- `src/bot_constants.py`: 간격, Choice, `NEWS_UI_TEXT` 등 매직 넘버/카피
+- `src/bot_runtime.py`: Windows asyncio, 네트워크 예외 분류
+- `src/core/`: `AppConfig`, frozen dataclass, `SQLiteStorage`
+- `src/clients/`: Steam / X / YouTube / CHZZK. session은 `main()`에서 주입
+- `ego.py`: 나무위키 E.G.O 크롤러 → `ego_gifts.json`
+
+## 새 기능 넣을 때
+
+- 새 Cog/패키지를 만들지 않는다. `NewsCog`에 붙이고, UI는 views, 재사용 로직은 helpers, 상수는 constants.
+- env는 `AppConfig.from_env()`만. 비밀은 `.env`, 문서는 `.env.example`.
+- 식별자/로그 키는 영어, 유저 메시지·슬래시 이름은 한국어(~해요).
+- `from __future__ import annotations`, frozen `@dataclass`, `X | Y` 타입.
+- CPU 이미지 처리는 `asyncio.to_thread` + semaphore. 폴링은 `@tasks.loop` + `before_loop`에서 ready 대기.
+---

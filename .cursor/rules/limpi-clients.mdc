@@ -1,0 +1,26 @@
+---
+description: Steam/X/YouTube/CHZZK 클라이언트 작성 규칙
+globs: src/clients/**/*.py
+alwaysApply: false
+---
+
+# 외부 API 클라이언트
+
+`main()`이 만든 `aiohttp.ClientSession`을 생성자에 주입한다. 클라이언트 안에서 세션을 새로 열지 않는다.
+
+## 공통
+
+- `from __future__ import annotations`, 모듈 `LOGGER = logging.getLogger(__name__)`.
+- timeout/retry/backoff은 파일 상단 상수. User-Agent를 붙인다.
+- 네트워크 실패는 캐시가 있으면 캐시, 없으면 로그. 사용자 메시지는 `bot_runtime._log_internet_exception` 경로를 탄다.
+- 반환 모델은 `src/core/models.py`의 frozen dataclass (`NewsPost`, `TwitterPost` 등).
+
+## 소스별
+
+- **Steam** (`NewsSource` Protocol): 이벤트 허브 우선, 실패 시 RSS. `raw["source"]`는 `steam_initial_events` / `steam_rss`. Discord용 본문은 `format_steam_news_for_discord`.
+- **X** (`LimbusXClient`): GraphQL + `X_AUTH_TOKEN`/`X_CT0`. `XClientError` / rate limit backoff. 쿠키·QID는 env, 하드코딩 비밀을 늘리지 않는다.
+- **YouTube**: HTML + innertube, 짧은 TTL 메모리 캐시. 햄팡은 제목 마커 `hamhampangpang`.
+- **CHZZK**: live-detail API로 시작/종료 판별.
+
+새 HTTP 래퍼가 필요하면 `src/clients/`에 두고 Cog에 주입한다. `bot.py`에 URL 호출을 직접 넣지 않는다.
+---

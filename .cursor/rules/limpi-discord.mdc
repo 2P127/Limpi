@@ -1,0 +1,47 @@
+---
+description: 슬래시 명령, interaction defer, View/DynamicItem, 멘션 규칙
+globs: src/bot.py,src/bot_views.py
+alwaysApply: false
+---
+
+# Discord 패턴
+
+슬래시만 사용한다. prefix 명령은 추가하지 않는다.
+
+## 명령 등록
+
+```python
+@app_commands.command(name="서버설정", description="서버의 공통 봇 설정을 변경합니다.")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.rename(language="언어")
+@app_commands.describe(language="서버에서 기본으로 사용할 소식 언어입니다.")
+@app_commands.choices(language=LANGUAGE_CHOICES)
+```
+
+- 서버 관리 명령: `users=False`, guild only, `manage_guild` 또는 `administrator`.
+- Choice/카피는 `bot_constants.py`. 유저 설치가 필요한 명령만 `users=True`.
+- 글로벌 `tree.sync()` 후 연결 길드의 **길드 스코프 명령을 clear**한다. 이 중복 방지 패턴을 깨지 말 것.
+
+## Interaction
+
+- 3초를 넘길 작업은 먼저 `defer`(필요하면 `thinking=True`) → `followup.send` 또는 `edit_original_response`.
+- 이미 ack됐으면 `interaction.response.is_done()`으로 분기.
+- 기본 `allowed_mentions=discord.AllowedMentions.none()`. 역할 핑은 LayoutView leading text + `NEWS_ROLE_MENTION_COOLDOWN_SECONDS`.
+- 에러/권한 안내는 짧게, ephemeral, ~해요체.
+
+## Views
+
+- Persistent 버튼은 `discord.ui.DynamicItem`, custom_id는 `limpi:` prefix (`ZIP_CUSTOM_ID_PREFIX`, `BRIGHTEN_CUSTOM_ID_PREFIX`, `limpi:ego-gift:*`).
+- View는 UI만. Cog 메서드 없으면 `_has_news_cog_method`로 가드.
+- `interaction_check`로 최초 누른 유저만 허용.
+- 자동 소식 전송은 `_build_layout_view_for_post` (Components v2). 레거시 embed-only는 fallback만.
+
+## Steam vs X
+
+X 글에 Steam 링크가 있으면 `_defer_linked_twitter_for_steam`으로 **30분** 보류하고 Steam 소식을 우선한다. 이 정책과 `prefer_steam_*` raw 필드를 바꾸면 관련 테스트를 같이 고친다.
+
+Steam 링크 없이 YouTube/트윗 ID/본문이 같은 소식은 `_news_posts_without_later_content_duplicates`로 **먼저 올라온 글만** 자동 전송한다. `youtu.be`와 `watch?v=`는 같은 영상으로 본다.
+---

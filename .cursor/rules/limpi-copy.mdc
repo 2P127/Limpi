@@ -1,0 +1,15 @@
+---
+description: 한국어 UX 카피, 다국어 문자열, 로그 톤
+globs: src/bot.py,src/bot_views.py,src/bot_helpers.py,src/bot_constants.py
+alwaysApply: false
+---
+
+# 카피 / i18n
+
+- 슬래시 이름·설명, ephemeral 안내, 임베드 제목은 **한국어 ~해요체**. 딱딱한 번역투나 영어 UI를 기본으로 쓰지 않는다.
+- 다국어 버튼/본문 조각은 `NEWS_UI_TEXT` (`koreana` / `english` / `japanese`). 키를 추가하면 세 언어를 같이 채운다.
+- Choice 라벨도 한국어 (`허용`/`비허용`, `치지직 & 유튜브`). 값은 영어 코드 (`true`, `both`, `koreana`).
+- 성공 embed 톤: `설정이 완료되었어요~!`처럼 기존 말투를 따른다.
+- 로그는 한국어로 상황을 쓰고 식별자는 영어 (`post_id=%s`, `guild_id=%s`). traceback은 exception 로그에만.
+- 시간대 기준은 **KST**. 점검 알림은 목 10시 시작 / 12시 업데이트 카피를 `bot_constants`에서 재사용한다.
+---
