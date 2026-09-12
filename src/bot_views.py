@@ -9,6 +9,7 @@ from .bot_constants import (
     EGO_GIFT_SELECT_PAGE_SIZE,
     HAMPANG_SOURCE_X,
     NEWS_SELECT_PAGE_SIZE,
+    X_SOURCE_DISPLAY_NAME,
     ZIP_CUSTOM_ID_PREFIX,
 )
 from .bot_helpers import (
@@ -443,7 +444,7 @@ class HampangNewsSelectView(discord.ui.View):
         youtube_count = len(self.items) - x_count
         description = (
             f"{self.page + 1} / {self.max_page + 1} 페이지"
-            f"\nX(트위터) {x_count}개 · YouTube {youtube_count}개"
+            f"\n{X_SOURCE_DISPLAY_NAME} {x_count}개 · YouTube {youtube_count}개"
         )
         return discord.Embed(
             title=title,

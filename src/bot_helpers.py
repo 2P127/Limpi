@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import html
 import io
 import json
 import logging
@@ -14,7 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Mapping
+from typing import Iterable, Mapping
 from urllib.parse import parse_qs, quote, urlparse
 
 import aiohttp
@@ -40,6 +41,7 @@ from .bot_constants import (
     HAMPANG_SOURCE_X,
     HAMPANG_SOURCE_YOUTUBE,
     HAMPANG_YOUTUBE_TITLE_MARKER,
+    IMAGE_DELIVERY_EMBEDS,
     IMAGE_DELIVERY_FILES,
     IMAGE_ONLY_EMBEDS_PER_MESSAGE,
     KST,
@@ -57,6 +59,8 @@ from .bot_constants import (
     NEWS_SOURCE_STEAM,
     NEWS_SOURCE_TWITTER,
     NEWS_UI_TEXT,
+    LEGACY_X_SOURCE_DISPLAY_NAME,
+    X_SOURCE_DISPLAY_NAME,
     SYNC_LANGUAGES,
     TCP_KEEPALIVE_IDLE_SECONDS,
     TCP_KEEPALIVE_INTERVAL_SECONDS,
@@ -624,7 +628,7 @@ def _embed_groups_for_post(post: NewsPost) -> list[list[discord.Embed]]:
         color=_post_embed_color(post),
     )
     if _is_twitter_news_post(post):
-        footer = "출처: X(트위터)"
+        footer = f"출처: {X_SOURCE_DISPLAY_NAME}"
         if post.created_at is not None:
             footer = f"{footer} · 작성일: {_format_kst(post.created_at)}"
         fallback.set_footer(text=footer)
@@ -673,22 +677,210 @@ def _twitter_video_fallback_url_from_raw(raw: dict[str, object]) -> str | None:
 
 
 def _select_twitter_video_url(urls: list[str]) -> str | None:
+    candidates = _twitter_video_upload_candidates(urls)
+    return candidates[0] if candidates else None
+
+
+def _twitter_video_upload_candidates(urls: list[str]) -> list[str]:
     if not urls:
+        return []
+    unique_urls = list(dict.fromkeys(url for url in urls if url))
+    parsed = [(_twitter_video_resolution(url), url) for url in unique_urls]
+    with_resolution = [
+        (resolution, url) for resolution, url in parsed if resolution is not None
+    ]
+    without_resolution = [url for resolution, url in parsed if resolution is None]
+    if not with_resolution:
+        return unique_urls
+
+    def _sort_key(item: tuple[tuple[int, int], str]) -> tuple[int, int, int]:
+        resolution, _url = item
+        is_1080 = 1 if resolution == (1920, 1080) else 0
+        at_most_1080 = 1 if resolution[1] <= 1080 else 0
+        return (is_1080, at_most_1080, resolution[0] * resolution[1])
+
+    ordered = [url for _resolution, url in sorted(with_resolution, key=_sort_key, reverse=True)]
+    ordered.extend(without_resolution)
+    return ordered
+
+
+def _response_content_length(response: aiohttp.ClientResponse) -> int | None:
+    content_range = response.headers.get("Content-Range")
+    if content_range:
+        match = re.search(r"/(\d+)\s*$", content_range)
+        if match:
+            return int(match.group(1))
+    content_length = response.headers.get("Content-Length")
+    if not content_length:
         return None
-    parsed = [(_twitter_video_resolution(url), url) for url in urls]
-    for resolution, url in parsed:
-        if resolution == (1920, 1080):
-            return url
-    with_resolution = [(resolution, url) for resolution, url in parsed if resolution is not None]
-    if with_resolution:
-        below_1080 = [
-            (resolution, url)
-            for resolution, url in with_resolution
-            if resolution[1] <= 1080
-        ]
-        candidates = below_1080 or with_resolution
-        return max(candidates, key=lambda item: item[0][0] * item[0][1])[1]
-    return urls[0]
+    try:
+        return int(content_length)
+    except ValueError:
+        return None
+
+
+def _unescape_html_text(value: str) -> str:
+    return html.unescape(html.unescape(value or ""))
+
+
+_TWITTER_STATUS_ID_RE = re.compile(
+    r"(?:x\.com|twitter\.com)/[^/\s]+/status/(\d+)",
+    flags=re.IGNORECASE,
+)
+
+
+def _twitter_status_id_from_url(url: str) -> str | None:
+    match = _TWITTER_STATUS_ID_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def _refresh_legacy_x_display_text(value: str) -> str:
+    text = _unescape_html_text(value)
+    return text.replace(LEGACY_X_SOURCE_DISPLAY_NAME, X_SOURCE_DISPLAY_NAME)
+
+
+def _message_plain_text(message: discord.Message) -> str:
+    parts = [message.content or ""]
+    for embed in message.embeds:
+        parts.append(embed.title or "")
+        parts.append(embed.description or "")
+        parts.append(embed.url or "")
+        if embed.author:
+            parts.append(embed.author.name or "")
+            parts.append(embed.author.url or "")
+        if embed.footer:
+            parts.append(embed.footer.text or "")
+        for field in embed.fields:
+            parts.append(field.name or "")
+            parts.append(field.value or "")
+    for component in message.components:
+        parts.extend(_iter_component_text(component))
+    return "\n".join(parts)
+
+
+def _iter_component_text(component: object) -> list[str]:
+    texts: list[str] = []
+    content = getattr(component, "content", None)
+    if isinstance(content, str) and content:
+        texts.append(content)
+    for attr in ("children", "items", "components"):
+        nested = getattr(component, attr, None)
+        if not nested:
+            continue
+        for child in nested:
+            texts.extend(_iter_component_text(child))
+    return texts
+
+
+def _twitter_status_id_from_message(message: discord.Message) -> str | None:
+    for embed in message.embeds:
+        for candidate in (embed.url, getattr(embed.author, "url", None)):
+            status_id = _twitter_status_id_from_url(str(candidate or ""))
+            if status_id:
+                return status_id
+        for field in embed.fields:
+            status_id = _twitter_status_id_from_url(str(field.value or ""))
+            if status_id:
+                return status_id
+    return _twitter_status_id_from_url(_message_plain_text(message))
+
+
+_NEWS_LEGACY_EMBED_TITLE_PREFIXES = (
+    "[Steam]",
+    f"[{LEGACY_X_SOURCE_DISPLAY_NAME}]",
+    f"[{X_SOURCE_DISPLAY_NAME}]",
+)
+_NEWS_BANNER_TEXT_MARKER = "림피가 소식을"
+
+
+def _message_looks_like_legacy_news_embed(message: discord.Message) -> bool:
+    if not message.embeds or message.components:
+        return False
+    for embed in message.embeds:
+        title = embed.title or ""
+        if any(title.startswith(prefix) for prefix in _NEWS_LEGACY_EMBED_TITLE_PREFIXES):
+            return True
+    return _NEWS_BANNER_TEXT_MARKER in _message_plain_text(message)
+
+
+def _message_looks_like_news_announcement(message: discord.Message) -> bool:
+    if _message_looks_like_legacy_news_embed(message):
+        return True
+    text = _message_plain_text(message)
+    if _NEWS_BANNER_TEXT_MARKER in text:
+        return True
+    return any(prefix in text for prefix in _NEWS_LEGACY_EMBED_TITLE_PREFIXES)
+
+
+def _legacy_x_display_needs_rewrite(
+    text: str,
+    *,
+    has_embed_image: bool = False,
+    has_attachments: bool = False,
+    image_delivery: str = IMAGE_DELIVERY_EMBEDS,
+) -> bool:
+    if LEGACY_X_SOURCE_DISPLAY_NAME in text and X_SOURCE_DISPLAY_NAME not in text:
+        return True
+    if "&lt;" in text or "&gt;" in text:
+        return True
+    if image_delivery == IMAGE_DELIVERY_EMBEDS and has_attachments:
+        return True
+    if image_delivery == IMAGE_DELIVERY_FILES and has_embed_image:
+        return True
+    return False
+
+
+def _rewrite_legacy_x_embed(embed: discord.Embed) -> discord.Embed:
+    payload = embed.to_dict()
+    for key in ("title", "description"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            payload[key] = _refresh_legacy_x_display_text(value)
+    footer = payload.get("footer")
+    if isinstance(footer, dict):
+        footer_text = footer.get("text")
+        if isinstance(footer_text, str):
+            footer["text"] = _refresh_legacy_x_display_text(footer_text)
+    author = payload.get("author")
+    if isinstance(author, dict):
+        author_name = author.get("name")
+        if isinstance(author_name, str):
+            author["name"] = _refresh_legacy_x_display_text(author_name)
+    fields = payload.get("fields")
+    if isinstance(fields, list):
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            for key in ("name", "value"):
+                value = field.get(key)
+                if isinstance(value, str):
+                    field[key] = _refresh_legacy_x_display_text(value)
+    return discord.Embed.from_dict(payload)
+
+
+def _first_line_title(value: str, *, limit: int = 80) -> str:
+    for line in _unescape_html_text(value).splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned[:limit]
+    return ""
+
+
+def _twitter_status_title(
+    title: str,
+    text: str = "",
+    *,
+    retweeted_username: str = "",
+) -> str:
+    raw = _first_line_title(title, limit=120) or _first_line_title(text, limit=120)
+    username = (retweeted_username or "").strip()
+    if not username:
+        return raw
+    prefix = f"RT @{username}"
+    rest = re.sub(rf"^{re.escape(prefix)}:\s*", "", raw).strip()
+    if rest and rest != prefix:
+        return f"{prefix}: {rest[:80]}"
+    return prefix
 
 
 def _twitter_video_resolution(url: str) -> tuple[int, int] | None:
@@ -710,6 +902,20 @@ def _twitter_image_urls(post: TwitterPost) -> list[str]:
         for url in post.image_urls
         if not _is_twitter_video_thumbnail_url(url)
     ]
+
+
+def _twitter_image_urls_for_delivery(
+    post: TwitterPost,
+    *,
+    attach_photos: bool,
+    image_delivery: str,
+) -> tuple[list[str], list[str]]:
+    urls = _twitter_image_urls(post) if attach_photos else []
+    if not urls:
+        return [], []
+    if image_delivery == IMAGE_DELIVERY_FILES:
+        return [], urls
+    return urls, []
 
 
 def _twitter_original_image_url(url: str) -> str:
@@ -824,7 +1030,8 @@ def _embed_for_twitter_post(
     *,
     image_url: str | None = None,
 ) -> discord.Embed:
-    description, tag_block = _split_trailing_hashtag_block((post.text or post.url).strip())
+    raw_text = _unescape_html_text(post.text or post.url).strip()
+    description, tag_block = _split_trailing_hashtag_block(raw_text)
     description = _strip_twitter_post_context_prefix(post, description)
     context_line = _twitter_post_context_line(post)
     if context_line:
@@ -847,9 +1054,9 @@ def _embed_for_twitter_post(
     )
     if post.created_at is not None:
         embed.timestamp = post.created_at
-        embed.set_footer(text="출처: X(트위터)")
+        embed.set_footer(text=f"출처: {X_SOURCE_DISPLAY_NAME}")
     else:
-        embed.set_footer(text="출처: X(트위터)")
+        embed.set_footer(text=f"출처: {X_SOURCE_DISPLAY_NAME}")
     embed.set_author(name=f"@{post.author_username}", url=f"https://x.com/{post.author_username}")
     if image_url:
         embed.set_image(url=image_url)
@@ -878,12 +1085,12 @@ def _embeds_for_twitter_post(
 
 def _display_title_for_twitter_post(post: TwitterPost) -> str:
     retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-    if retweeted_username:
-        return f"RT @{retweeted_username}"
-    match = re.match(r"^RT @([^:\s]+):", post.title or post.text or "")
-    if match:
-        return f"RT @{match.group(1)}"
-    return post.title.strip() or post.post_id
+    title = _twitter_status_title(
+        post.title,
+        post.text,
+        retweeted_username=retweeted_username,
+    )
+    return title or post.post_id
 
 
 def _twitter_post_context_line(post: TwitterPost) -> str:
@@ -1442,7 +1649,7 @@ def _hampang_choice_name(
     source: str,
     item: TwitterPost | YoutubeUpload,
 ) -> str:
-    source_label = "X" if source == HAMPANG_SOURCE_X else "YouTube"
+    source_label = X_SOURCE_DISPLAY_NAME if source == HAMPANG_SOURCE_X else "YouTube"
     title = item.title.strip() or (
         item.post_id if isinstance(item, TwitterPost) else item.video_id
     )
@@ -1543,29 +1750,205 @@ def _youtube_urls_for_post(post: NewsPost) -> list[str]:
     return [str(url) for url in value if url]
 
 
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_VIDEO_ID_IN_TEXT_RE = re.compile(
+    r"(?:youtube(?:-nocookie)?\.com/(?:watch\S*?[?&]v=|embed/|shorts/|live/)|youtu\.be/|\[previewyoutube=)([A-Za-z0-9_-]{11})",
+    flags=re.IGNORECASE,
+)
+_YOUTUBE_HOST_SUFFIXES = (
+    "youtube.com",
+    "youtube-nocookie.com",
+    "youtu.be",
+)
+
+
+def _is_youtube_video_id(value: str) -> bool:
+    return bool(_YOUTUBE_VIDEO_ID_RE.fullmatch(value))
+
+
+def _youtube_host_name(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+    if host.startswith("music."):
+        host = host[6:]
+    return host
+
+
+def _is_youtube_host(host: str) -> bool:
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in _YOUTUBE_HOST_SUFFIXES)
+
+
+def _youtube_video_id_from_url(url: str) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url.strip())
+    host = _youtube_host_name(url)
+    if not _is_youtube_host(host):
+        return None
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        video_id = parsed.path.lstrip("/").split("/", 1)[0]
+        return video_id if _is_youtube_video_id(video_id) else None
+    query_id = (parse_qs(parsed.query).get("v") or [None])[0]
+    if query_id and _is_youtube_video_id(query_id):
+        return query_id
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0].lower() in {"embed", "shorts", "live", "v"}:
+        return parts[1] if _is_youtube_video_id(parts[1]) else None
+    return None
+
+
+def _youtube_video_ids_from_text(text: str) -> set[str]:
+    if not text:
+        return set()
+    return {
+        video_id
+        for video_id in _YOUTUBE_VIDEO_ID_IN_TEXT_RE.findall(text)
+        if _is_youtube_video_id(video_id)
+    }
+
+
+def _youtube_video_ids_from_urls(urls: Iterable[object]) -> set[str]:
+    video_ids: set[str] = set()
+    for url in urls:
+        video_id = _youtube_video_id_from_url(str(url))
+        if video_id:
+            video_ids.add(video_id)
+        video_ids.update(_youtube_video_ids_from_text(str(url)))
+    return video_ids
+
+
+def _youtube_video_ids_for_news_post(post: NewsPost) -> set[str]:
+    urls = list(_youtube_urls_for_post(post))
+    raw_links = post.raw.get("link_urls")
+    if isinstance(raw_links, list):
+        urls.extend(str(url) for url in raw_links if url)
+    if post.url:
+        urls.append(post.url)
+    video_ids = _youtube_video_ids_from_urls(urls)
+    video_ids.update(_youtube_video_ids_from_text(post.title))
+    video_ids.update(_youtube_video_ids_from_text(post.text))
+    return video_ids
+
+
+def _youtube_video_ids_for_twitter(post: TwitterPost) -> set[str]:
+    urls = list(_twitter_youtube_urls(post))
+    urls.extend(_raw_link_urls(post.raw))
+    if post.url:
+        urls.append(post.url)
+    video_ids = _youtube_video_ids_from_urls(urls)
+    video_ids.update(_youtube_video_ids_from_text(post.title))
+    video_ids.update(_youtube_video_ids_from_text(post.text))
+    return video_ids
+
+
+def _twitter_status_ids_for_news_post(post: NewsPost) -> set[str]:
+    status_ids: set[str] = set()
+    post_id = str(post.post_id or "")
+    if post_id.startswith("twitter:"):
+        status_id = post_id.split(":", 1)[1]
+        if status_id:
+            status_ids.add(status_id)
+    retweeted = post.raw.get("retweeted_tweet_id")
+    if retweeted:
+        status_ids.add(str(retweeted))
+    status_from_url = _twitter_status_id_from_url(post.url)
+    if status_from_url:
+        status_ids.add(status_from_url)
+    return status_ids
+
+
+def _news_content_match_keys(post: NewsPost) -> set[str]:
+    keys = {f"yt:{video_id}" for video_id in _youtube_video_ids_for_news_post(post)}
+    keys.update(f"tweet:{status_id}" for status_id in _twitter_status_ids_for_news_post(post))
+    steam_key = _steam_news_url_key(post.url)
+    if steam_key is not None:
+        keys.add(f"steam:{steam_key}")
+    keys.update(f"steam:{link_key}" for link_key in _steam_news_link_keys_for_news_post(post))
+    language_independent_id = _post_language_independent_id(post)
+    if language_independent_id:
+        keys.add(f"steam-id:{language_independent_id}")
+    return keys
+
+
+def _news_title_match_candidates(post: NewsPost) -> set[str]:
+    candidates = _news_body_match_candidates(post.title)
+    candidates.update(_news_body_match_candidates(post.text))
+    return candidates
+
+
+def _news_posts_share_content(left: NewsPost, right: NewsPost) -> bool:
+    if left.post_id == right.post_id:
+        return True
+    left_keys = _news_content_match_keys(left)
+    right_keys = _news_content_match_keys(right)
+    if left_keys and right_keys and left_keys & right_keys:
+        return True
+    if not _news_posts_within_duplicate_window(left.created_at, right.created_at):
+        return False
+    return _news_match_candidates_overlap(
+        _news_title_match_candidates(left),
+        _news_title_match_candidates(right),
+    )
+
+
+def _news_post_content_duplicate_sort_key(post: NewsPost) -> tuple[datetime, str]:
+    created = _as_utc_datetime(post.created_at)
+    if created is None:
+        created = datetime.max.replace(tzinfo=timezone.utc)
+    return (created, post.post_id)
+
+
+def _news_posts_without_later_content_duplicates(
+    posts: list[NewsPost],
+    announced_posts: list[NewsPost],
+) -> tuple[list[NewsPost], list[NewsPost]]:
+    if not posts:
+        return [], []
+
+    kept_representatives = list(announced_posts)
+    selected_ids: set[str] = set()
+    skipped: list[NewsPost] = []
+    for post in sorted(posts, key=_news_post_content_duplicate_sort_key):
+        if any(
+            _news_posts_share_content(post, announced)
+            for announced in kept_representatives
+        ):
+            skipped.append(post)
+            continue
+        selected_ids.add(post.post_id)
+        kept_representatives.append(post)
+
+    return (
+        [post for post in posts if post.post_id in selected_ids],
+        skipped,
+    )
+
+
 def _is_twitter_news_post(post: NewsPost) -> bool:
     return str(post.raw.get("source_type") or "").lower() == NEWS_SOURCE_TWITTER
 
 
 def _post_source_label(post: NewsPost) -> str:
-    return "X(트위터)" if _is_twitter_news_post(post) else "Steam"
+    return X_SOURCE_DISPLAY_NAME if _is_twitter_news_post(post) else "Steam"
 
 
 def _display_title_for_post(post: NewsPost) -> str:
-    title = post.title.strip() or post.post_id
+    title = _unescape_html_text(post.title).strip() or post.post_id
     if _is_twitter_news_post(post):
         retweeted_username = str(post.raw.get("retweeted_username") or "").strip()
-        if retweeted_username:
-            title = f"RT @{retweeted_username}"
-        else:
-            match = re.match(r"^RT @([^:\s]+):", title or post.text)
-            if match:
-                title = f"RT @{match.group(1)}"
+        title = _twitter_status_title(
+            post.title,
+            post.text,
+            retweeted_username=retweeted_username,
+        ) or title
     return f"[{_post_source_label(post)}] {title}"
 
 
 def _display_body_and_trailing_tags(post: NewsPost) -> tuple[str, str]:
-    body = (post.text or post.url).strip()
+    body = _unescape_html_text(post.text or post.url).strip()
     if not _is_twitter_news_post(post):
         return body, ""
     body, tag_block = _split_trailing_hashtag_block(body)
@@ -1652,7 +2035,7 @@ def _news_source_mode_label(mode: str | None) -> str:
     if mode == NEWS_SOURCE_STEAM:
         return "Steam"
     if mode == NEWS_SOURCE_TWITTER:
-        return "X(트위터)"
+        return X_SOURCE_DISPLAY_NAME
     return "둘 다"
 
 
@@ -1787,6 +2170,7 @@ def _matching_steam_posts_for_twitter(
     link_keys.update(_steam_news_link_keys_from_text(post.text))
     twitter_candidates = _news_body_match_candidates(post.title)
     twitter_candidates.update(_news_body_match_candidates(post.text))
+    twitter_youtube_ids = _youtube_video_ids_for_twitter(post)
     matched: list[NewsPost] = []
     seen: set[str] = set()
     for steam_post in steam_posts:
@@ -1796,6 +2180,7 @@ def _matching_steam_posts_for_twitter(
             link_urls,
             link_keys,
             twitter_candidates,
+            twitter_youtube_ids,
         ):
             continue
         if steam_post.post_id in seen:
@@ -1841,20 +2226,31 @@ def _matching_steam_update_posts_for_twitter_reply(
     return matched
 
 
+def _twitter_matches_steam_news_url(
+    steam_post: NewsPost,
+    link_urls: list[str],
+    link_keys: set[str],
+) -> bool:
+    steam_key = _steam_news_url_key(steam_post.url)
+    if steam_key is not None and steam_key in link_keys:
+        return True
+    return steam_post.url in link_urls
+
+
 def _twitter_matches_steam_news(
     steam_post: NewsPost,
     twitter_created_at: datetime | None,
     link_urls: list[str],
     link_keys: set[str],
     twitter_candidates: set[str],
+    twitter_youtube_ids: set[str] | None = None,
 ) -> bool:
-    steam_key = _steam_news_url_key(steam_post.url)
-    if steam_key is not None and steam_key in link_keys:
+    if _twitter_matches_steam_news_url(steam_post, link_urls, link_keys):
         return True
-    if steam_post.url in link_urls:
+    # A Steam news URL or shared YouTube video identifies the exact
+    # announcement even when titles differ or the duplicate window has elapsed.
+    if twitter_youtube_ids and twitter_youtube_ids & _youtube_video_ids_for_news_post(steam_post):
         return True
-    # A Steam news URL identifies the exact announcement even when X links it
-    # well after the fuzzy title/body duplicate window has elapsed.
     if not _news_posts_within_duplicate_window(twitter_created_at, steam_post.created_at):
         return False
     steam_candidates = _news_body_match_candidates(steam_post.title)
@@ -2162,26 +2558,37 @@ def _twitter_posts_as_news_posts(
     for post in posts:
         raw = dict(post.raw)
         matching_steam_posts = _matching_steam_posts_for_twitter(post, steam_posts)
-        if matching_steam_posts:
+        prefer_steam_posts = [
+            steam_post
+            for steam_post in matching_steam_posts
+            if _twitter_matches_steam_news_url(
+                steam_post,
+                _raw_link_urls(post.raw),
+                _steam_news_link_keys_for_twitter(post) | _steam_news_link_keys_from_text(post.text),
+            )
+        ]
+        if not prefer_steam_posts and _is_twitter_reply_update_post(post):
+            prefer_steam_posts = list(matching_steam_posts)
+        if prefer_steam_posts:
             raw["overlap_steam_post_ids"] = [
-                steam_post.post_id for steam_post in matching_steam_posts
+                steam_post.post_id for steam_post in prefer_steam_posts
             ]
             raw["overlap_steam_post_keys"] = [
                 post_key
                 for post_key in (
                     _post_language_independent_id(steam_post)
-                    for steam_post in matching_steam_posts
+                    for steam_post in prefer_steam_posts
                 )
                 if post_key is not None
             ]
             raw["prefer_steam_post_ids"] = [
-                steam_post.post_id for steam_post in matching_steam_posts
+                steam_post.post_id for steam_post in prefer_steam_posts
             ]
             raw["prefer_steam_post_keys"] = [
                 post_key
                 for post_key in (
                     _post_language_independent_id(steam_post)
-                    for steam_post in matching_steam_posts
+                    for steam_post in prefer_steam_posts
                 )
                 if post_key is not None
             ]
@@ -2193,7 +2600,7 @@ def _twitter_posts_as_news_posts(
                 source_user=post.author_username,
                 url=post.url,
                 text=post.text,
-                title=post.title,
+                title=_unescape_html_text(post.title) or post.title,
                 created_at=post.created_at,
                 image_urls=_twitter_image_urls(post),
                 raw=raw,
@@ -2361,7 +2768,11 @@ def _choice_name(
     include_language: bool = False,
     include_source: bool = True,
 ) -> str:
-    title = _display_title_for_post(post) if include_source else (post.title.strip() or post.post_id)
+    title = (
+        _display_title_for_post(post)
+        if include_source
+        else (_unescape_html_text(post.title).strip() or post.post_id)
+    )
     prefix = ""
     if post.created_at:
         prefix = f"[{_format_kst(post.created_at)}] "
@@ -2380,7 +2791,7 @@ def _choice_name(
 
 
 def _twitter_choice_name(post: TwitterPost) -> str:
-    title = post.title.strip() or post.post_id
+    title = _display_title_for_twitter_post(post)
     if post.created_at:
         prefix = f"[{_format_kst(post.created_at)}] "
     else:
@@ -2914,9 +3325,23 @@ __all__ = [
     "_twitter_video_fallback_url",
     "_twitter_video_fallback_url_from_raw",
     "_select_twitter_video_url",
+    "_twitter_video_upload_candidates",
+    "_response_content_length",
+    "_unescape_html_text",
+    "_twitter_status_id_from_url",
+    "_twitter_status_id_from_message",
+    "_refresh_legacy_x_display_text",
+    "_message_plain_text",
+    "_legacy_x_display_needs_rewrite",
+    "_message_looks_like_legacy_news_embed",
+    "_message_looks_like_news_announcement",
+    "_rewrite_legacy_x_embed",
+    "_first_line_title",
+    "_twitter_status_title",
     "_twitter_video_resolution",
     "_is_payload_too_large",
     "_twitter_image_urls",
+    "_twitter_image_urls_for_delivery",
     "_twitter_original_image_url",
     "_steam_original_image_url",
     "_original_image_download_candidates",
@@ -2977,6 +3402,12 @@ __all__ = [
     "_image_delivery_label",
     "_youtube_links_content",
     "_youtube_urls_for_post",
+    "_youtube_video_id_from_url",
+    "_youtube_video_ids_for_news_post",
+    "_youtube_video_ids_for_twitter",
+    "_news_content_match_keys",
+    "_news_posts_share_content",
+    "_news_posts_without_later_content_duplicates",
     "_is_twitter_news_post",
     "_post_source_label",
     "_display_title_for_post",
@@ -3011,6 +3442,7 @@ __all__ = [
     "_news_match_candidates_overlap",
     "_steam_news_link_keys_for_twitter",
     "_steam_news_post_id_from_url",
+    "_steam_news_urls_from_text",
     "_steam_news_post_ids_for_twitter_posts",
     "_steam_posts_without_fast_twitter_duplicates",
     "_twitter_posts_as_news_posts",
