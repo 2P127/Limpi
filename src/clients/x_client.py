@@ -19,6 +19,8 @@ from ..core.models import TwitterPost
 
 LOGGER = logging.getLogger(__name__)
 X_POST_CACHE_TTL = timedelta(seconds=20)
+X_TRANSLATE_CACHE_TTL = timedelta(minutes=10)
+X_TRANSLATE_FAILURE_TTL = timedelta(minutes=5)
 X_RATE_LIMIT_BACKOFF = timedelta(minutes=1)
 X_RATE_LIMIT_BACKOFF_MAX = timedelta(minutes=10)
 X_RATE_LIMIT_RESET_CAP = timedelta(minutes=20)
@@ -152,6 +154,9 @@ class LimbusXClient:
         self._server_error_failures: int = 0
         self._last_backoff_log_until: datetime | None = None
         self.last_fetch_had_upstream_failure: bool = False
+        self._translate_cache: dict[tuple[str, str], tuple[str, datetime]] = {}
+        self._translate_lock = Lock()
+        self._translate_retry_at: datetime | None = None
 
     def _has_twitter_auth(self) -> bool:
         cfg = self.config
@@ -172,6 +177,102 @@ class LimbusXClient:
             "x-twitter-auth-type": "OAuth2Session",
             "x-twitter-client-language": "ko",
         }
+
+    async def translate_tweet(
+        self,
+        tweet_id: str,
+        *,
+        destination_language: str = "ko",
+    ) -> str | None:
+        # Serialize startup/manual/poll translations so a failed endpoint cannot
+        # consume the account's request budget in parallel.
+        if not hasattr(self, "_translate_lock"):
+            self._translate_lock = Lock()
+        async with self._translate_lock:
+            return await self._translate_tweet(tweet_id, destination_language=destination_language)
+
+    async def _translate_tweet(
+        self,
+        tweet_id: str,
+        *,
+        destination_language: str = "ko",
+    ) -> str | None:
+        cleaned_id = str(tweet_id or "").strip()
+        language = (destination_language or "ko").strip() or "ko"
+        if not cleaned_id.isdecimal() or not re.fullmatch(r"[a-zA-Z-]{2,16}", language) or not self._has_twitter_auth():
+            return None
+
+        cache_key = (cleaned_id, language)
+        now = datetime.now(timezone.utc)
+        cached = self._translate_cache.get(cache_key)
+        if cached is not None:
+            text, cached_at = cached
+            if now - cached_at < X_TRANSLATE_CACHE_TTL:
+                return text
+
+        backoff_until = self._active_rate_limited_until()
+        if backoff_until and now < backoff_until:
+            return None
+        retry_at = getattr(self, "_translate_retry_at", None)
+        if retry_at and now < retry_at:
+            return None
+
+        path = (
+            f"tweetId={cleaned_id},"
+            "destinationLanguage=None,"
+            "translationSource=Some(Google),"
+            "feature=None,timeout=None,onlyCached=None"
+            "/translation/service/translateTweet"
+        )
+        url = f"https://x.com/i/api/1.1/strato/column/None/{path}"
+        headers = self._twitter_api_headers()
+        headers["x-twitter-client-language"] = language
+        headers["accept-language"] = language
+        # Clear this only after a valid translation. Includes malformed/empty 200s.
+        self._translate_retry_at = now + X_TRANSLATE_FAILURE_TTL
+        try:
+            async with self.session.get(
+                url,
+                headers=headers,
+                timeout=30,
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    error = _build_x_http_error("translateTweet", resp, body)
+                    if isinstance(error, XRateLimitError):
+                        self._handle_rate_limit(error)
+                    LOGGER.warning(
+                        "translateTweet 실패 status=%s tweet_id=%s: %s",
+                        resp.status,
+                        cleaned_id,
+                        error,
+                    )
+                    return None
+                payload = await resp.json(content_type=None)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+            LOGGER.warning(
+                "translateTweet 네트워크 오류 tweet_id=%s: %s",
+                cleaned_id,
+                type(exc).__name__,
+            )
+            return None
+        except Exception:
+            LOGGER.exception("translateTweet 파싱 실패 tweet_id=%s", cleaned_id)
+            return None
+
+        translation = _translation_text_from_payload(payload)
+        if isinstance(payload, dict):
+            if payload.get("translationState") not in (None, "Success"):
+                translation = None
+            if payload.get("destinationLanguage") not in (None, language):
+                translation = None
+        if not translation:
+            LOGGER.warning("translateTweet 빈 응답 tweet_id=%s", cleaned_id)
+            return None
+
+        self._translate_cache[cache_key] = (translation, now)
+        self._translate_retry_at = None
+        return translation
 
     async def _fetch_user_id(self, username: str) -> str:
         if self._x_user_id:
@@ -845,6 +946,7 @@ def _tweet_to_post(tweet: dict[str, Any], username: str) -> TwitterPost | None:
     raw: dict[str, Any] = {
         "source": "x",
         "language": "koreana",
+        "source_language": content_legacy.get("lang"),
         "tweet_id": tweet_id,
         "username": username,
         "created_at": legacy.get("created_at"),
@@ -957,6 +1059,20 @@ def _clean_tweet_text(text: str) -> str:
     cleaned = "\n".join(lines).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
+
+
+def _translation_text_from_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("translation", "text", "translated_text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return _clean_tweet_text(value)
+        if isinstance(value, dict):
+            nested = value.get("text") or value.get("translation")
+            if isinstance(nested, str) and nested.strip():
+                return _clean_tweet_text(nested)
+    return None
 
 
 def _title_from_text(text: str) -> str:

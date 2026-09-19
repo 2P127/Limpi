@@ -11,7 +11,7 @@ import socket
 import sys
 import unicodedata
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -763,6 +763,13 @@ def _iter_component_text(component: object) -> list[str]:
     content = getattr(component, "content", None)
     if isinstance(content, str) and content:
         texts.append(content)
+    url = getattr(component, "url", None)
+    if isinstance(url, str) and url:
+        texts.append(url)
+    media = getattr(component, "media", None)
+    media_url = getattr(media, "url", None)
+    if isinstance(media_url, str) and media_url:
+        texts.append(media_url)
     for attr in ("children", "items", "components"):
         nested = getattr(component, attr, None)
         if not nested:
@@ -1006,6 +1013,157 @@ def _twitter_post_needs_refresh(post: TwitterPost) -> bool:
 def _looks_truncated_post_text(text: str) -> bool:
     cleaned = (text or "").rstrip()
     return cleaned.endswith("+...") or cleaned.endswith("…") or cleaned.endswith("...")
+
+
+_HANGUL_RE = re.compile(r"[가-힣]")
+_KANA_RE = re.compile(r"[\u3040-\u30ff]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+_TWEET_SECTION_SEPARATOR_RE = re.compile(r"^[\-―—–ㅡ=‧・*]{1,}$")
+_TWEET_SECTION_HEADER_RE = re.compile(
+    r"^(?:<[^>\n]{2,}>|「[^」\n]{2,}」|Notice\s+Regarding\b.+)$",
+    re.IGNORECASE,
+)
+_RT_PREFIX_RE = re.compile(r"^(RT @[^:\s]+:\s*)", re.IGNORECASE)
+
+
+def _hangul_char_count(text: str) -> int:
+    return len(_HANGUL_RE.findall(text or ""))
+
+
+def _script_letter_count(text: str) -> int:
+    value = text or ""
+    return (
+        _hangul_char_count(value)
+        + len(_KANA_RE.findall(value))
+        + len(_LATIN_RE.findall(value))
+    )
+
+
+def _hangul_ratio(text: str) -> float:
+    letters = _script_letter_count(text)
+    if letters <= 0:
+        return 0.0
+    return _hangul_char_count(text) / letters
+
+
+def _tweet_text_has_korean(text: str) -> bool:
+    hangul = _hangul_char_count(text)
+    if hangul >= 5:
+        return True
+    return hangul > 0 and _hangul_ratio(text) >= 0.2
+
+
+def _tweet_text_needs_korean_translation(text: str) -> bool:
+    body = _strip_rt_prefix(text)[1]
+    hangul = _hangul_char_count(body)
+    if hangul <= 0:
+        return _script_letter_count(body) > 0
+    return _hangul_ratio(body) < 0.08 and hangul < 5
+
+
+def _strip_rt_prefix(text: str) -> tuple[str, str]:
+    match = _RT_PREFIX_RE.match(text or "")
+    if match is None:
+        return "", text or ""
+    return match.group(1), (text or "")[match.end() :]
+
+
+def _is_tweet_section_separator(line: str) -> bool:
+    cleaned = (line or "").strip()
+    if not cleaned:
+        return True
+    return bool(_TWEET_SECTION_SEPARATOR_RE.match(cleaned))
+
+
+def _is_tweet_section_header(line: str) -> bool:
+    cleaned = (line or "").strip()
+    if not cleaned:
+        return False
+    if _TWEET_SECTION_HEADER_RE.match(cleaned):
+        return True
+    if cleaned.startswith("<") and cleaned.endswith(">") and len(cleaned) >= 5:
+        return True
+    if cleaned.startswith("「") and cleaned.endswith("」") and len(cleaned) >= 4:
+        return True
+    return False
+
+
+def _split_tweet_language_sections(text: str) -> list[str]:
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    sections: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        nonlocal current
+        block = "\n".join(current).strip()
+        current = []
+        if block:
+            sections.append(block)
+
+    for line in normalized.split("\n"):
+        stripped = line.strip()
+        if _is_tweet_section_separator(stripped):
+            flush()
+            continue
+        if current and _is_tweet_section_header(stripped):
+            flush()
+        current.append(stripped if stripped else "")
+    flush()
+    return sections
+
+
+def _extract_korean_only_tweet_text(text: str) -> str:
+    prefix, body = _strip_rt_prefix(text)
+    sections = _split_tweet_language_sections(body)
+    if len(sections) <= 1:
+        return text
+
+    korean_sections = [
+        section for section in sections if _tweet_text_has_korean(section)
+    ]
+    if not korean_sections:
+        return text
+
+    extracted = "\n\n".join(korean_sections).strip()
+    if not extracted:
+        return text
+    return f"{prefix}{extracted}" if prefix else extracted
+
+
+def _twitter_status_id_for_translation(post: TwitterPost) -> str:
+    for key in ("retweeted_tweet_id", "tweet_id"):
+        value = str(post.raw.get(key) or "").strip()
+        if value:
+            return value
+    post_id = (post.post_id or "").strip()
+    if post_id.startswith("x:"):
+        return post_id[2:]
+    if post_id.startswith("twitter:x:"):
+        return post_id.removeprefix("twitter:x:")
+    return post_id
+
+
+def _with_localized_twitter_text(
+    post: TwitterPost,
+    text: str,
+    *,
+    translated_from: str | None = None,
+    translation_source: str | None = None,
+) -> TwitterPost:
+    raw = dict(post.raw)
+    raw.setdefault("full_text", post.text)
+    raw["korean_localized"] = True
+    raw["localized_language"] = "ko"
+    if translated_from:
+        raw["translated_from"] = translated_from
+    if translation_source:
+        raw["translation_source"] = translation_source
+    title_source = _strip_rt_prefix(text)[1]
+    title = _first_line_title(title_source) or post.title
+    return replace(post, text=text, title=title, raw=raw)
 
 
 def _is_steam_news_url(url: str) -> bool:
@@ -1886,6 +2044,11 @@ def _news_posts_share_content(left: NewsPost, right: NewsPost) -> bool:
     right_keys = _news_content_match_keys(right)
     if left_keys and right_keys and left_keys & right_keys:
         return True
+    # Soft title/body overlap is only for Steam↔X same-story matching.
+    # Same-source peers (two Steam posts, two tweets) often share boilerplate and
+    # publish at the same second; collapsing those drops distinct announcements.
+    if _is_twitter_news_post(left) == _is_twitter_news_post(right):
+        return False
     if not _news_posts_within_duplicate_window(left.created_at, right.created_at):
         return False
     return _news_match_candidates_overlap(
@@ -3350,6 +3513,13 @@ __all__ = [
     "_twitter_link_urls",
     "_twitter_post_needs_refresh",
     "_looks_truncated_post_text",
+    "_hangul_char_count",
+    "_hangul_ratio",
+    "_tweet_text_has_korean",
+    "_tweet_text_needs_korean_translation",
+    "_extract_korean_only_tweet_text",
+    "_twitter_status_id_for_translation",
+    "_with_localized_twitter_text",
     "_is_steam_news_url",
     "_steam_news_url_key",
     "_embed_for_twitter_post",

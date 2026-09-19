@@ -14,7 +14,7 @@ import socket
 import sys
 import re
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from html.parser import HTMLParser
@@ -139,6 +139,8 @@ from .bot_constants import (
     STALE_NEWS_LOG_CACHE_MAX_ITEMS,
     STEAM_SYNC_FAILURE_LOG_COOLDOWN_SECONDS,
     SYNC_LANGUAGES,
+    TEST_MODE_CHANNEL_ID,
+    TEST_MODE_GUILD_ID,
     TWITTER_NEWS_DEFAULT_MAX_AGE_SECONDS,
     TWITTER_POLL_TICK_SECONDS,
     TWITTER_POST_LIMIT,
@@ -259,7 +261,11 @@ from .bot_helpers import (
     _twitter_post_delay_seconds,
     _twitter_post_needs_refresh,
     _twitter_posts_as_news_posts,
+    _twitter_status_id_for_translation,
     _twitter_status_id_from_message,
+    _tweet_text_needs_korean_translation,
+    _extract_korean_only_tweet_text,
+    _with_localized_twitter_text,
     _twitter_video_fallback_url,
     _twitter_video_fallback_url_from_raw,
     _twitter_video_url_groups,
@@ -300,6 +306,63 @@ _NEWS_SEND_RETRY = "retry"
 _IMAGE_DOWNLOAD_RETRY = object()
 _NEWS_AUTO_ANNOUNCE_MAX_AGE_SECONDS = 24 * 60 * 60
 _LEGACY_MESSAGE_FORMAT_REWRITE_FLAG = "legacy_message_format_rewrite_v2"
+
+
+def _configure_test_mode_notifications(storage: SQLiteStorage) -> None:
+    """Route every automatic notification for the test guild to one channel."""
+    storage.update_settings(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        enabled=True,
+        language="koreana",
+        maintenance_notifications_enabled=True,
+        news_source_mode=DEFAULT_NEWS_SOURCE_MODE,
+    )
+
+    for target in storage.list_news_targets(TEST_MODE_GUILD_ID):
+        if target.channel_id == TEST_MODE_CHANNEL_ID and target.language == "koreana":
+            continue
+        storage.delete_news_target(
+            TEST_MODE_GUILD_ID,
+            channel_id=target.channel_id,
+            language=target.language,
+        )
+    storage.upsert_news_target(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        language="koreana",
+    )
+
+    storage.upsert_chzzk_target(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        enabled=True,
+    )
+    storage.upsert_youtube_target(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        enabled=True,
+    )
+    storage.upsert_youtube_upload_target(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        enabled=True,
+    )
+    storage.upsert_hampang_target(
+        TEST_MODE_GUILD_ID,
+        channel_id=TEST_MODE_CHANNEL_ID,
+        enabled=True,
+    )
+
+    # This table is retained for older X-only setups. Do not create a second X
+    # destination (the news target already receives X), but keep an existing one
+    # from leaking test notifications to another channel.
+    if storage.get_twitter_target(TEST_MODE_GUILD_ID) is not None:
+        storage.upsert_twitter_target(
+            TEST_MODE_GUILD_ID,
+            channel_id=TEST_MODE_CHANNEL_ID,
+            enabled=True,
+        )
 
 
 def _maintenance_notice_embed(notice_type: str) -> discord.Embed:
@@ -876,6 +939,7 @@ class NewsCog(commands.Cog):
         self._chzzk_poll_lock = asyncio.Lock()
         self._youtube_poll_lock = asyncio.Lock()
         self._youtube_upload_poll_lock = asyncio.Lock()
+        self._message_repair_lock = asyncio.Lock()
         self._news_role_mention_times: dict[int, float] = {}
         self._twitter_steam_grace_started_at: dict[str, float] = {}
         self._twitter_steam_defer_logged_post_ids: set[str] = set()
@@ -936,6 +1000,7 @@ class NewsCog(commands.Cog):
         self.poll_youtube_live.start()
         self.poll_youtube_uploads.start()
         self.refresh_ego_gifts.start()
+        self.repair_recent_korean_messages.start()
         self._ego_gift_startup_task = asyncio.create_task(self._ensure_ego_gift_data())
         self._ego_gift_startup_task.add_done_callback(self._log_background_task_result)
 
@@ -946,6 +1011,7 @@ class NewsCog(commands.Cog):
         self.poll_news.start()
 
     async def cog_unload(self) -> None:
+        self.repair_recent_korean_messages.cancel()
         if self.presence_status.is_running():
             self.presence_status.cancel()
         if self.poll_news.is_running():
@@ -1574,9 +1640,10 @@ class NewsCog(commands.Cog):
             settings.channel_id,
         )
         try:
-            role = discord.Object(id=settings.role_id) if settings.role_id else None
+            role_id = self._notification_role(settings.guild_id, "maintenance", settings.channel_id)
+            role = discord.Object(id=role_id) if role_id else None
             await channel.send(
-                content=f"<@&{settings.role_id}>" if settings.role_id else None,
+                content=f"<@&{role_id}>" if role_id else None,
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions(
                     everyone=False,
@@ -2276,7 +2343,7 @@ class NewsCog(commands.Cog):
                 await self._broadcast_post(
                     target,
                     target_post,
-                    role_to_send if mention_role else None,
+                    (role_to_send if role_to_send is not None else self._notification_role(settings.guild_id, "news", resolved_channel_id)) if mention_role else None,
                     banner_filename=settings.notification_banner,
                     image_delivery=settings.image_delivery,
                 )
@@ -2349,7 +2416,7 @@ class NewsCog(commands.Cog):
         if delivery_targets is None:
             return
 
-        role_to_send = role_id if role_id is not None else settings.role_id
+        role_to_send = role_id
         result = await self._send_manual_news_to_targets(
             post,
             settings,
@@ -2538,6 +2605,27 @@ class NewsCog(commands.Cog):
             self._remember_interaction_user(interaction)
             return self.storage.get_user_settings(interaction.user.id).language
         return self.storage.get_settings(interaction.guild_id).language
+
+    def _notification_role(self, guild_id: int, kind: str, channel_id: int) -> int | None:
+        prefs = self.storage.get_notification_preferences(guild_id, kind, channel_id)
+        return prefs["role_id"] if prefs is not None else self.storage.get_settings(guild_id).role_id
+
+    def _notification_language(self, guild_id: int, kind: str, channel_id: int) -> str:
+        if kind == "news":
+            target = self.storage.get_news_target_by_channel(guild_id, channel_id=channel_id)
+            if target is not None:
+                return target.language
+        prefs = self.storage.get_notification_preferences(guild_id, kind, channel_id)
+        return (prefs or {}).get("language") or self.storage.get_settings(guild_id).language
+
+    async def _localize_news_post(self, post: NewsPost, language: str) -> NewsPost:
+        if not _is_twitter_news_post(post):
+            return post
+        twitter = TwitterPost(post.post_id.removeprefix("twitter:"), post.source_user,
+                              post.url, post.text, post.title, post.created_at, post.image_urls, post.raw)
+        localized = await self._localize_twitter_post(twitter, language=language)
+        return replace(post, text=localized.text, title=localized.title,
+                       raw={**localized.raw, "language": language})
 
     def _interaction_image_delivery(self, interaction: discord.Interaction) -> str:
         if interaction.guild_id is None or self._interaction_uses_user_install(interaction):
@@ -3244,12 +3332,23 @@ class NewsCog(commands.Cog):
             settings.guild_id,
             fetched_post_ids,
         )
-        seen_post_ids = set(seen_post_statuses)
-        if seen_post_ids:
+        announced_post_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if announced
+        }
+        seen_unannounced_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if not announced
+        }
+        if announced_post_ids:
             return _recent_auto_posts([
                 post
                 for post in reversed(posts_newest_first)
-                if post.post_id not in seen_post_ids
+                if post.post_id not in announced_post_ids
+            ])
+        if seen_unannounced_ids:
+            return _recent_auto_posts([
+                post
+                for post in reversed(posts_newest_first)
+                if post.post_id not in seen_unannounced_ids
             ])
 
         if not has_seen_baseline and not self.config.announce_existing_on_first_run:
@@ -3300,20 +3399,36 @@ class NewsCog(commands.Cog):
             target.target_id,
             fetched_post_ids,
         )
-        seen_post_ids = set(seen_post_statuses)
-        if seen_post_ids:
-            created_after = _as_utc_datetime(target.created_at)
+        announced_post_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if announced
+        }
+        seen_unannounced_ids = {
+            post_id for post_id, announced in seen_post_statuses.items() if not announced
+        }
+        created_after = _as_utc_datetime(target.created_at)
+
+        def _after_target_created(post: NewsPost) -> bool:
+            if created_after is None:
+                return True
+            created = _as_utc_datetime(post.created_at)
+            return created is not None and created > created_after
+
+        if announced_post_ids:
+            # Already announced posts stay suppressed. Seen-but-not-announced posts
+            # are retried so a false content-duplicate skip can still be delivered.
             return _recent_auto_posts([
                 post
                 for post in reversed(posts_newest_first)
-                if post.post_id not in seen_post_ids
-                and (
-                    created_after is None
-                    or (
-                        post.created_at is not None
-                        and _as_utc_datetime(post.created_at) > created_after
-                    )
-                )
+                if post.post_id not in announced_post_ids and _after_target_created(post)
+            ])
+
+        if seen_unannounced_ids:
+            # First-run baseline: everything was marked seen without announcing.
+            # Keep that baseline, but still pick up brand-new unseen posts.
+            return _recent_auto_posts([
+                post
+                for post in reversed(posts_newest_first)
+                if post.post_id not in seen_unannounced_ids and _after_target_created(post)
             ])
 
         if not has_seen_baseline and not self.config.announce_existing_on_first_run:
@@ -3358,7 +3473,7 @@ class NewsCog(commands.Cog):
         channel_id = getattr(channel, "id", settings.channel_id)
         role_id = self._automatic_news_role_mention_id(
             channel_id,
-            settings.role_id,
+            self._notification_role(settings.guild_id, "news", channel_id),
             requested=mention_role,
         )
         try:
@@ -3436,7 +3551,7 @@ class NewsCog(commands.Cog):
         channel_id = getattr(channel, "id", target.channel_id)
         role_id = self._automatic_news_role_mention_id(
             channel_id,
-            settings.role_id,
+            self._notification_role(target.guild_id, "news", channel_id),
             requested=mention_role,
         )
         try:
@@ -3631,6 +3746,7 @@ class NewsCog(commands.Cog):
         notify: bool = True,
         repair_followup_images: bool = True,
     ) -> None:
+        post = await self._localize_news_post(post, target.language)
         recorded = self.storage.get_news_post_message(target.target_id, post.post_id)
         if recorded is None:
             LOGGER.info(
@@ -3866,6 +3982,11 @@ class NewsCog(commands.Cog):
         image_delivery: str = IMAGE_DELIVERY_EMBEDS,
         news_target_id: int | None = None,
     ) -> discord.Message | None:
+        language = _post_language(post)
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            language = self._notification_language(guild.id, "news", channel.id)
+        post = await self._localize_news_post(post, language)
         mention = f"<@&{role_id}>" if role_id else None
 
         banner_file = _news_banner_file(banner_filename)
@@ -3906,6 +4027,7 @@ class NewsCog(commands.Cog):
         private: bool,
         attach_photos: bool = True,
     ) -> list[discord.Message | None]:
+        post = await self._localize_news_post(post, self._interaction_language(interaction))
         sent_messages: list[discord.Message | None] = []
         image_delivery = self._interaction_image_delivery(interaction)
         standalone_urls = _standalone_image_urls(post, attach_images=attach_photos)
@@ -5312,10 +5434,151 @@ class NewsCog(commands.Cog):
                 else:
                     LOGGER.exception("시작 시 새 소식 자동 전송 확인 실패.")
 
+    @tasks.loop(minutes=10)
+    async def repair_recent_korean_messages(self) -> None:
+        try:
+            await self._repair_recent_korean_messages()
+        except Exception:
+            LOGGER.exception("최근 3일 X 소식 한국어 수정 실패. 다음 주기에 재시도합니다.")
+
+    @repair_recent_korean_messages.before_loop
+    async def before_repair_recent_korean_messages(self) -> None:
+        await self._wait_until_ready()
+
+    async def _repair_recent_korean_messages(self) -> None:
+        if not hasattr(self, "_message_repair_lock"):
+            self._message_repair_lock = asyncio.Lock()
+        if self._message_repair_lock.locked():
+            LOGGER.info("다른 메시지 정리 작업이 진행 중이라 최근 3일 수정을 다음 주기로 미룹니다.")
+            return
+        async with self._message_repair_lock:
+            await self._repair_recent_korean_messages_unlocked()
+
+    async def _repair_recent_korean_messages_unlocked(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=3)
+        channels: dict[int, int] = {}
+        records: dict[tuple[int, int], str] = {}
+        for target in self.storage.list_all_news_targets():
+            channels[target.channel_id] = target.guild_id
+        for target in self.storage.list_hampang_targets(enabled_only=False):
+            channels[target.channel_id] = target.guild_id
+        for target_id, post_id, channel_id, message_id in self.storage.list_news_post_messages(max_age_days=3):
+            target = self.storage.get_news_target_by_id(target_id)
+            if target is not None and post_id.startswith("twitter:"):
+                channels[channel_id] = target.guild_id
+                records[channel_id, message_id] = post_id.removeprefix("twitter:")
+        for guild_id, post_id, channel_id, message_id in self.storage.list_hampang_post_messages():
+            if discord.utils.snowflake_time(message_id) >= cutoff:
+                channels[channel_id] = guild_id
+                records[channel_id, message_id] = post_id
+        channel_priority: dict[int, int] = {}
+        for channel_id, message_id in ((key[0], key[1]) for key in records):
+            channel_priority[channel_id] = max(channel_priority.get(channel_id, 0), message_id)
+        rewritten = 0
+        scanned = 0
+        ordered_channels = sorted(
+            channels.items(),
+            key=lambda item: channel_priority.get(item[0], 0),
+            reverse=True,
+        )
+        LOGGER.info("최근 3일 X 소식 수정 시작: channels=%s, recorded_messages=%s.", len(ordered_channels), len(records))
+        for channel_id, guild_id in ordered_channels:
+            if self.bot.get_guild(guild_id) is None:
+                continue
+            channel_rewritten = 0
+            try:
+                channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+                if not hasattr(channel, "history") or getattr(getattr(channel, "guild", None), "id", None) != guild_id:
+                    continue
+                # No count limit: older busy channels must still cover all 72 hours.
+                async for message in channel.history(limit=None, after=cutoff, oldest_first=False):
+                    scanned += 1
+                    try:
+                        if await self._repair_korean_message(
+                            message, cutoff, records.get((channel_id, message.id)), guild_id=guild_id
+                        ):
+                            rewritten += 1
+                            channel_rewritten += 1
+                            await asyncio.sleep(LEGACY_X_DISPLAY_REWRITE_SLEEP_SECONDS)
+                    except (discord.Forbidden, discord.NotFound):
+                        continue
+                    except Exception:
+                        LOGGER.exception("한국어 메시지 수정 실패 (channel_id=%s, message_id=%s).", channel_id, message.id)
+            except (discord.Forbidden, discord.NotFound):
+                LOGGER.warning("한국어 수정용 채널 기록을 읽을 수 없습니다 (channel_id=%s).", channel_id)
+            if channel_rewritten:
+                LOGGER.info(
+                    "최근 X 소식 채널 수정 완료 (guild_id=%s, channel_id=%s, rewritten=%s).",
+                    guild_id,
+                    channel_id,
+                    channel_rewritten,
+                )
+        LOGGER.info("최근 3일 X 소식 수정 확인 완료: scanned=%s, rewritten=%s.", scanned, rewritten)
+
+    async def _repair_korean_message(
+        self, message: discord.Message, cutoff: datetime, post_id: str | None = None,
+        *, guild_id: int | None = None,
+    ) -> bool:
+        if self.bot.user is None or message.author.id != self.bot.user.id or message.created_at < cutoff:
+            return False
+        status_id = post_id or _twitter_status_id_from_message(message)
+        if not status_id:
+            return False
+        post = self._twitter_post_from_stored_id(status_id)
+        if post is None:
+            # Do not reconstruct tweet bodies from embeds that may be truncated.
+            return False
+        if post.created_at is None or _as_utc_datetime(post.created_at) < cutoff:
+            return False
+        if post.author_username.lower() not in {
+            self.config.x_account_username.lower(), HAMPANG_X_USERNAME.lower(),
+        }:
+            return False
+        # Older releases marked untranslated fallbacks as localized; retry those.
+        if _tweet_text_needs_korean_translation(post.text) and not post.raw.get("translation_source"):
+            post = replace(post, raw={**post.raw, "korean_localized": False})
+        client = self.hampang_x_source if post.author_username.lower() == HAMPANG_X_USERNAME.lower() else self.x_source
+        kind = "hampang" if post.author_username.lower() == HAMPANG_X_USERNAME.lower() else "news"
+        language = self._notification_language(guild_id, kind, message.channel.id) if guild_id else "koreana"
+        localized = await self._localize_twitter_post(post, client=client, language=language)
+        if not localized.raw.get("korean_localized") and not localized.raw.get("localized_language"):
+            return False
+        edited = False
+        if message.components and message.flags.components_v2:
+            view = discord.ui.LayoutView.from_message(message, timeout=None)
+            converted = _twitter_posts_as_news_posts([localized], [])[0]
+            converted = replace(converted, raw={**converted.raw, "language": language})
+            rendered = _build_layout_view_for_post(converted, include_zip_button=False, include_banner=False)
+            body = next(item.content for item in rendered.walk_children() if isinstance(item, discord.ui.TextDisplay) and item.content.startswith("## "))
+            items = [item for item in view.walk_children() if isinstance(item, discord.ui.TextDisplay) and item.content.startswith("## ")]
+            if len(items) != 1:
+                return False
+            if items[0].content != body:
+                items[0].content = body
+                await message.edit(view=view, allowed_mentions=discord.AllowedMentions.none())
+                edited = True
+        elif message.embeds and message.embeds[0].description:
+            embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in message.embeds]
+            translated_embed = _embeds_for_twitter_post(localized, image_urls=[])[0]
+            if embeds[0].description != translated_embed.description or embeds[0].title != translated_embed.title:
+                embeds[0].description = translated_embed.description
+                embeds[0].title = translated_embed.title
+                await message.edit(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+                edited = True
+        else:
+            return False
+        return edited
+
     async def _rewrite_legacy_x_display_messages(self) -> None:
         await self._wait_until_ready()
         if self.storage.get_bot_flag(_LEGACY_MESSAGE_FORMAT_REWRITE_FLAG) == "done":
             return
+        if not hasattr(self, "_message_repair_lock"):
+            self._message_repair_lock = asyncio.Lock()
+        async with self._message_repair_lock:
+            await self._rewrite_legacy_x_display_messages_unlocked()
+
+    async def _rewrite_legacy_x_display_messages_unlocked(self) -> None:
         LOGGER.info("서버 설정의 소식/햄팡 메시지를 새 형식으로 맞춥니다.")
         rewritten = 0
         rewritten += await self._rewrite_recorded_news_messages()
@@ -5690,6 +5953,12 @@ class NewsCog(commands.Cog):
                 )
             return False
         if post is not None:
+            language = self._notification_language(guild_id, "hampang", channel_id)
+            post = await self._localize_twitter_post(
+                post,
+                client=self.hampang_x_source,
+                language=language,
+            )
             embed_urls, _file_urls = _twitter_image_urls_for_delivery(
                 post,
                 attach_photos=True,
@@ -5918,6 +6187,95 @@ class NewsCog(commands.Cog):
         saved = self.storage.save_twitter_posts(posts)
         return saved, posts
 
+    async def _localize_twitter_posts(
+        self,
+        posts: list[TwitterPost],
+        *,
+        client: LimbusXClient | None = None,
+    ) -> list[TwitterPost]:
+        if not posts:
+            return posts
+        x_client = client or self.x_source
+        localized: list[TwitterPost] = []
+        for post in posts:
+            localized.append(await self._localize_twitter_post(post, client=x_client))
+        return localized
+
+    async def _localize_twitter_post(
+        self,
+        post: TwitterPost,
+        *,
+        client: LimbusXClient | None = None,
+        language: str = "koreana",
+    ) -> TwitterPost:
+        destination = {"koreana": "ko", "english": "en", "japanese": "ja"}.get(language, "ko")
+        if destination != "ko":
+            if post.raw.get("localized_language") == destination:
+                return post
+            original = str(post.raw.get("full_text") or post.text)
+            raw = {**post.raw, "korean_localized": False}
+            raw.pop("translation_source", None)
+            raw.pop("localized_language", None)
+            original_post = replace(post, text=original, title=original.splitlines()[0][:200] if original else post.title, raw=raw)
+            source_language = str(post.raw.get("lang") or post.raw.get("source_language") or "")
+            if source_language == destination:
+                return replace(original_post, raw={**raw, "localized_language": destination})
+            x_client = client or self.x_source
+            tweet_id = _twitter_status_id_for_translation(original_post)
+            translated = await x_client.translate_tweet(tweet_id, destination_language=destination) if tweet_id else None
+            if not translated:
+                return original_post
+            localized = _with_localized_twitter_text(original_post, translated, translated_from=source_language,
+                                                    translation_source="x_translate")
+            return replace(localized, raw={**localized.raw, "korean_localized": False, "localized_language": destination})
+        if post.raw.get("localized_language") in {"en", "ja"}:
+            raw = {**post.raw, "korean_localized": False}
+            raw.pop("localized_language", None)
+            raw.pop("translation_source", None)
+            post = replace(post, text=str(post.raw.get("full_text") or post.text),
+                           raw=raw)
+        if bool(post.raw.get("korean_localized")):
+            return post
+
+        x_client = client or self.x_source
+        filtered = _extract_korean_only_tweet_text(post.text)
+        if filtered != post.text:
+            return _with_localized_twitter_text(post, filtered)
+
+        if not _tweet_text_needs_korean_translation(filtered):
+            return _with_localized_twitter_text(post, filtered)
+
+        tweet_id = _twitter_status_id_for_translation(post)
+        translated = await x_client.translate_tweet(tweet_id) if tweet_id else None
+        if not translated:
+            LOGGER.debug(
+                "X 번역 보기 실패로 원문을 유지합니다 (post_id=%s, tweet_id=%s).",
+                post.post_id,
+                tweet_id or "unknown",
+            )
+            # A temporary failure must not persist as a successful localization.
+            return post
+
+        prefix = ""
+        body = translated
+        if post.text.startswith("RT @") and "retweeted_username" in post.raw:
+            username = str(post.raw.get("retweeted_username") or "").strip()
+            if username:
+                prefix = f"RT @{username}: "
+                body = translated
+        localized_text = f"{prefix}{body}" if prefix else body
+        source_language = str(
+            post.raw.get("source_language")
+            or post.raw.get("lang")
+            or "unknown"
+        )
+        return _with_localized_twitter_text(
+            post,
+            localized_text,
+            translated_from=source_language,
+            translation_source="x_translate",
+        )
+
     def _mark_twitter_recovery_baseline(
         self,
         targets: list[GuildTwitterTarget],
@@ -6143,6 +6501,7 @@ class NewsCog(commands.Cog):
             await self._send_twitter_post_to_channel(
                 channel,
                 post,
+                role_id=self._notification_role(target.guild_id, "news", target.channel_id),
                 batch_tasks=batch_tasks,
                 image_delivery=image_delivery,
             )
@@ -6397,7 +6756,7 @@ class NewsCog(commands.Cog):
     ) -> int:
         announced = 0
         for source, item in items:
-            role_id = settings.role_id if announced == 0 else None
+            role_id = self._notification_role(target.guild_id, "hampang", target.channel_id) if announced == 0 else None
             try:
                 message = await self._send_hampang_item_to_channel(
                     target,
@@ -6733,7 +7092,7 @@ class NewsCog(commands.Cog):
             message = await self._send_chzzk_live_to_channel(
                 channel,
                 live,
-                role_id=settings.role_id,
+                role_id=self._notification_role(target.guild_id, "chzzk", target.channel_id),
                 include_youtube_button=not (
                     youtube_target is not None and youtube_target.enabled
                 ),
@@ -6852,7 +7211,7 @@ class NewsCog(commands.Cog):
             message = await self._send_youtube_live_to_channel(
                 channel,
                 live,
-                role_id=settings.role_id,
+                role_id=self._notification_role(target.guild_id, "youtube", target.channel_id),
                 include_chzzk_button=not (
                     chzzk_target is not None and chzzk_target.enabled
                 ),
@@ -6962,7 +7321,7 @@ class NewsCog(commands.Cog):
                 message = await self._send_youtube_upload_to_channel(
                     channel,
                     upload,
-                    role_id=settings.role_id if announced == 0 else None,
+                    role_id=self._notification_role(target.guild_id, "upload", target.channel_id) if announced == 0 else None,
                 )
             except discord.HTTPException:
                 LOGGER.exception(
@@ -7371,6 +7730,11 @@ class NewsCog(commands.Cog):
         batch_tasks: list[asyncio.Task[list[discord.File]]] | None = None,
         image_delivery: str = IMAGE_DELIVERY_EMBEDS,
     ) -> discord.Message:
+        kind = "hampang" if post.author_username.lower() == HAMPANG_X_USERNAME.lower() else "news"
+        guild = getattr(channel, "guild", None)
+        language = self._notification_language(guild.id, kind, channel.id) if guild else "koreana"
+        client = self.hampang_x_source if kind == "hampang" else self.x_source
+        post = await self._localize_twitter_post(post, client=client, language=language)
         embed_image_urls, file_image_urls = _twitter_image_urls_for_delivery(
             post,
             attach_photos=attach_photos,
@@ -7403,6 +7767,7 @@ class NewsCog(commands.Cog):
         private: bool,
         attach_photos: bool = True,
     ) -> list[discord.Message | None]:
+        post = await self._localize_twitter_post(post, language=self._interaction_language(interaction))
         sent_messages: list[discord.Message | None] = []
         image_delivery = self._interaction_image_delivery(interaction)
         embed_image_urls, file_image_urls = _twitter_image_urls_for_delivery(
@@ -7745,6 +8110,89 @@ class NewsCog(commands.Cog):
             embed=embed,
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @app_commands.command(name="알림개별상태", description="알림별 실제 채널·역할·언어 설정을 확인해요.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    async def notification_preferences_status(self, interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("서버 안에서 확인해주세요.", ephemeral=True)
+            return
+        guild_id = interaction.guild_id
+        entries = [("Steam·X 소식", "news", t.channel_id) for t in self.storage.list_news_targets(guild_id)]
+        for name, kind, target in [
+            ("치지직", "chzzk", self.storage.get_chzzk_target(guild_id)),
+            ("유튜브 라이브", "youtube", self.storage.get_youtube_target(guild_id)),
+            ("유튜브 업로드", "upload", self.storage.get_youtube_upload_target(guild_id)),
+            ("햄햄팡팡", "hampang", self.storage.get_hampang_target(guild_id)),
+        ]:
+            if target is not None:
+                entries.append((name + (" (꺼짐)" if not target.enabled else ""), kind, target.channel_id))
+        settings = self.storage.get_settings(guild_id)
+        if settings.channel_id:
+            entries.append(("점검" + (" (꺼짐)" if not settings.maintenance_notifications_enabled else ""), "maintenance", settings.channel_id))
+        lines = []
+        for name, kind, channel_id in entries:
+            role_id = self._notification_role(guild_id, kind, channel_id)
+            role_text = f"<@&{role_id}>" if role_id else "멘션 없음"
+            language = _language_label(self._notification_language(guild_id, kind, channel_id))
+            lines.append(f"{name}: <#{channel_id}> · {role_text} · {language}")
+        await interaction.response.send_message("\n".join(lines) or "설정된 알림이 없어요.", ephemeral=True,
+                                                allowed_mentions=discord.AllowedMentions.none())
+
+    @app_commands.command(name="알림개별설정", description="알림 종류별 채널·역할·소식 언어를 함께 설정해요.")
+    @app_commands.allowed_installs(guilds=True, users=False)
+    @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.rename(kind="종류", channel="채널", role="역할", language="언어", ping="역할멘션")
+    @app_commands.describe(kind="설정할 알림 종류예요.", channel="이 알림을 보낼 채널이에요.",
+                           role="이 알림에만 사용할 역할이에요. 생략하면 기존 설정을 유지해요.",
+                           language="Steam/X 소식·햄팡 X 본문의 언어예요. 방송·영상 제목은 원문이에요.",
+                           ping="비허용이면 이 알림의 역할 멘션을 꺼요.")
+    @app_commands.choices(kind=[app_commands.Choice(name=name, value=value) for name, value in [
+        ("Steam·X 소식", "news"), ("치지직 라이브", "chzzk"), ("유튜브 라이브", "youtube"),
+        ("유튜브 업로드", "upload"), ("햄햄팡팡", "hampang"), ("점검", "maintenance")]],
+        language=LANGUAGE_CHOICES, ping=BOOLEAN_CHOICES)
+    async def configure_notification_preferences(
+        self, interaction: discord.Interaction, kind: app_commands.Choice[str], channel: discord.TextChannel,
+        role: discord.Role | None = None, language: app_commands.Choice[str] | None = None,
+        ping: app_commands.Choice[str] | None = None,
+    ) -> None:
+        if interaction.guild_id is None or channel.guild.id != interaction.guild_id:
+            await interaction.response.send_message("현재 서버의 채널을 골라주세요.", ephemeral=True)
+            return
+        if role is not None and (role.guild.id != interaction.guild_id or role.is_default()):
+            await interaction.response.send_message("현재 서버의 일반 역할을 골라주세요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild_id = interaction.guild_id
+        kind_value = kind.value
+        selected_language = language.value if language else self._notification_language(guild_id, kind_value, channel.id)
+        role_id = role.id if role else self._notification_role(guild_id, kind_value, channel.id)
+        if ping is not None and not _choice_bool(ping, True):
+            role_id = None
+        self.storage.ensure_guild_settings(guild_id)
+        if kind_value == "news":
+            self.storage.upsert_news_target(guild_id, channel_id=channel.id, language=selected_language)
+            self.storage.update_settings(guild_id, enabled=True)
+        elif kind_value == "maintenance":
+            self.storage.update_maintenance_notifications(guild_id, enabled=True, channel_id=channel.id)
+        else:
+            setter = {"chzzk": self.storage.upsert_chzzk_target, "youtube": self.storage.upsert_youtube_target,
+                      "upload": self.storage.upsert_youtube_upload_target, "hampang": self.storage.upsert_hampang_target}[kind_value]
+            setter(guild_id, channel_id=channel.id, enabled=True)
+        self.storage.set_notification_preferences(guild_id, kind_value, channel.id,
+                                                 role_id=role_id, language=selected_language)
+        role_text = f"<@&{role_id}>" if role_id else "없음"
+        await interaction.followup.send(
+            f"{kind.name} 알림을 설정했어요.\n채널: {channel.mention}\n역할: {role_text}\n"
+            f"소식 언어: {_language_label(selected_language)}\n"
+            "기존 메시지 수정 시에는 역할을 다시 멘션하지 않아요.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
         )
 
     @app_commands.command(name="소식채널해제", description="언어별 자동 소식 채널 등록을 해제합니다.")
@@ -8262,7 +8710,7 @@ class NewsCog(commands.Cog):
             return
 
         settings = self.storage.get_settings(interaction.guild_id)
-        role_to_send = role_id if role_id is not None else settings.role_id
+        role_to_send = role_id if role_id is not None else self._notification_role(settings.guild_id, "hampang", channel_id)
         try:
             if source == HAMPANG_SOURCE_X and isinstance(item, TwitterPost):
                 message = await self._send_twitter_post_to_channel(
@@ -8956,12 +9404,12 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="치지직 알림",
-            value=_format_chzzk_target(chzzk_target, settings.role_id),
+            value=_format_chzzk_target(chzzk_target, self._notification_role(settings.guild_id, "chzzk", chzzk_target.channel_id) if chzzk_target else None),
             inline=False,
         )
         embed.add_field(
             name="유튜브 알림",
-            value=_format_youtube_target(youtube_target, settings.role_id),
+            value=_format_youtube_target(youtube_target, self._notification_role(settings.guild_id, "youtube", youtube_target.channel_id) if youtube_target else None),
             inline=False,
         )
         await interaction.response.send_message(
@@ -9930,22 +10378,22 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="치지직 알림",
-            value=_format_chzzk_target(chzzk_target, settings.role_id),
+            value=_format_chzzk_target(chzzk_target, self._notification_role(settings.guild_id, "chzzk", chzzk_target.channel_id) if chzzk_target else None),
             inline=False,
         )
         embed.add_field(
             name="유튜브 알림",
-            value=_format_youtube_target(youtube_target, settings.role_id),
+            value=_format_youtube_target(youtube_target, self._notification_role(settings.guild_id, "youtube", youtube_target.channel_id) if youtube_target else None),
             inline=False,
         )
         embed.add_field(
             name="유튜브 일반 영상 업로드 알림",
-            value=_format_youtube_upload_target(youtube_upload_target, settings.role_id),
+            value=_format_youtube_upload_target(youtube_upload_target, self._notification_role(settings.guild_id, "upload", youtube_upload_target.channel_id) if youtube_upload_target else None),
             inline=False,
         )
         embed.add_field(
             name="햄햄팡팡 소식",
-            value=_format_hampang_target(hampang_target, settings.role_id),
+            value=_format_hampang_target(hampang_target, self._notification_role(settings.guild_id, "hampang", hampang_target.channel_id) if hampang_target else None),
             inline=False,
         )
 
@@ -10340,12 +10788,12 @@ class NewsCog(commands.Cog):
         )
         embed.add_field(
             name="치지직 알림",
-            value=_format_chzzk_target(chzzk_target, settings.role_id),
+            value=_format_chzzk_target(chzzk_target, self._notification_role(settings.guild_id, "chzzk", chzzk_target.channel_id) if chzzk_target else None),
             inline=False,
         )
         embed.add_field(
             name="유튜브 알림",
-            value=_format_youtube_target(youtube_target, settings.role_id),
+            value=_format_youtube_target(youtube_target, self._notification_role(settings.guild_id, "youtube", youtube_target.channel_id) if youtube_target else None),
             inline=False,
         )
         embed.add_field(
@@ -10447,6 +10895,14 @@ async def main() -> None:
             config.database_path,
         )
     storage = SQLiteStorage(config.database_path)
+    if test_mode:
+        _configure_test_mode_notifications(storage)
+        LOGGER.info(
+            "테스트 모드 알림 DB를 자동 설정했습니다 "
+            "(guild_id=%s, channel_id=%s).",
+            TEST_MODE_GUILD_ID,
+            TEST_MODE_CHANNEL_ID,
+        )
     session: aiohttp.ClientSession | None = None
     bot: LimpiBot | None = None
     bot_task: asyncio.Task[None] | None = None

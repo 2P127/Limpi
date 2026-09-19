@@ -43,5 +43,9 @@ alwaysApply: false
 
 X 글에 Steam 링크가 있으면 `_defer_linked_twitter_for_steam`으로 **30분** 보류하고 Steam 소식을 우선한다. 이 정책과 `prefer_steam_*` raw 필드를 바꾸면 관련 테스트를 같이 고친다.
 
-Steam 링크 없이 YouTube/트윗 ID/본문이 같은 소식은 `_news_posts_without_later_content_duplicates`로 **먼저 올라온 글만** 자동 전송한다. `youtu.be`와 `watch?v=`는 같은 영상으로 본다.
+Steam 링크 없이 YouTube/트윗 ID가 같은 소식, 또는 Steam↔X 사이 비슷한 제목/본문은
+`_news_posts_without_later_content_duplicates`로 **먼저 올라온 글만** 자동 전송한다.
+`youtu.be`와 `watch?v=`는 같은 영상으로 본다. **같은 소스끼리**(Steam↔Steam, X↔X)는
+제목/본문 유사만으로 묶지 않는다. 동시에 올라온 서로 다른 Steam 공지가 공통 서문으로
+한쪽만 나가는 사고를 막기 위함이다.
 ---

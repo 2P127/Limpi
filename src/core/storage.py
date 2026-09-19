@@ -434,6 +434,7 @@ class SQLiteStorage:
     _MIGRATIONS: list[tuple[int, str]] = [
         (1, "clear_stale_news_update_queue"),
         (2, "drop_missed_news_recovery_column"),
+        (3, "notification_preferences"),
     ]
 
     def _run_migrations(self) -> None:
@@ -476,6 +477,33 @@ class SQLiteStorage:
                         name,
                     )
                     break
+
+    def _migration_003(self) -> None:
+        self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS notification_preferences (
+                guild_id INTEGER NOT NULL, kind TEXT NOT NULL, channel_id INTEGER NOT NULL,
+                role_id INTEGER, language TEXT,
+                PRIMARY KEY (guild_id, kind, channel_id)
+            )
+        """)
+
+    def set_notification_preferences(self, guild_id: int, kind: str, channel_id: int,
+                                     *, role_id: int | None, language: str | None = None) -> None:
+        with self._lock:
+            self._connection.execute("""
+                INSERT INTO notification_preferences VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, kind, channel_id) DO UPDATE SET
+                    role_id=excluded.role_id, language=excluded.language
+            """, (guild_id, kind, channel_id, role_id, language))
+            self._connection.commit()
+
+    def get_notification_preferences(self, guild_id: int, kind: str, channel_id: int) -> dict | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT role_id, language FROM notification_preferences WHERE guild_id=? AND kind=? AND channel_id=?",
+                (guild_id, kind, channel_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def _migration_001(self) -> None:
         cursor = self._connection.execute(
@@ -2856,6 +2884,7 @@ class SQLiteStorage:
 
     def delete_guild_data(self, guild_id: int) -> None:
         with self._lock:
+            self._connection.execute("DELETE FROM notification_preferences WHERE guild_id=?", (guild_id,))
             target_rows = self._connection.execute(
                 "SELECT target_id FROM guild_news_targets WHERE guild_id = ?",
                 (guild_id,),

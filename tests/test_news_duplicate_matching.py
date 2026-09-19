@@ -361,6 +361,70 @@ class NewsContentDuplicateTests(unittest.TestCase):
         self.assertEqual({post.post_id for post in selected}, {steam.post_id, other.post_id})
         self.assertEqual(skipped, [])
 
+    def test_same_time_distinct_steam_posts_are_not_collapsed_by_boilerplate(
+        self,
+    ) -> None:
+        published_at = datetime(2026, 9, 17, 9, 0, tzinfo=timezone.utc)
+        boilerplate = (
+            "안녕하세요. 프로젝트문입니다.\n\n"
+            "림버스 컴퍼니를 이용해 주시는 관리자 여러분께 감사드립니다.\n"
+        )
+        maintenance = NewsPost(
+            post_id="steam:koreana:111000111222333444",
+            source_user="Limbus Company Steam News",
+            url="https://store.steampowered.com/news/app/1973530/view/111000111222333444",
+            title="정기 점검 안내",
+            text=f"{boilerplate}점검 시간 안내입니다.",
+            created_at=published_at,
+            image_urls=[],
+            raw={"language": "koreana", "event_gid": "111000111222333444"},
+        )
+        ego_notice = NewsPost(
+            post_id="steam:koreana:222000111222333444",
+            source_user="Limbus Company Steam News",
+            url="https://store.steampowered.com/news/app/1973530/view/222000111222333444",
+            title="신규 E.G.O 추출 안내",
+            text=f"{boilerplate}신규 E.G.O가 추가됩니다.",
+            created_at=published_at,
+            image_urls=[],
+            raw={"language": "koreana", "event_gid": "222000111222333444"},
+        )
+
+        selected, skipped = _news_posts_without_later_content_duplicates(
+            [maintenance, ego_notice],
+            [],
+        )
+
+        self.assertEqual(
+            {post.post_id for post in selected},
+            {maintenance.post_id, ego_notice.post_id},
+        )
+        self.assertEqual(skipped, [])
+
+    def test_cross_source_similar_titles_still_collapse_without_shared_links(self) -> None:
+        title = "2026.09.17 (KST) 정기 업데이트 안내"
+        steam = steam_post(
+            title=title,
+            text=f"{title}\n점검 후 접속해 주세요.",
+            created_at=datetime(2026, 9, 17, 9, 0, tzinfo=timezone.utc),
+        )
+        tweet = twitter_as_news(
+            twitter_post(
+                title=f"[X(구 트위터)] {title}",
+                text=title,
+                created_at=datetime(2026, 9, 17, 9, 1, tzinfo=timezone.utc),
+                post_id="1904444444444444444",
+            )
+        )
+
+        selected, skipped = _news_posts_without_later_content_duplicates(
+            [steam, tweet],
+            [],
+        )
+
+        self.assertEqual([post.post_id for post in selected], [steam.post_id])
+        self.assertEqual([post.post_id for post in skipped], [tweet.post_id])
+
     def test_duplicate_rule_applies_to_any_shared_video_not_a_specific_title(self) -> None:
         first_event_steam = linked_steam_post(
             post_id="111000111222333444",
